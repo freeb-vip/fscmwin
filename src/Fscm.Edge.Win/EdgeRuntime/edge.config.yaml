@@ -1,0 +1,49 @@
+﻿runtime:
+  mode: edge
+
+database:
+  type: sqlite
+  sqlite_path: data/edge.db
+  run_migrations: false
+
+server:
+  port: "8089"
+  frontend_url: "http://localhost"
+
+log:
+  db_level: error
+
+edge:
+  node_id: ""
+  node_name: "FSCM Edge Node"
+  center_url: "https://fscm.freeb.vip"
+  api_token: ""
+  admin_token: ""
+  namespace_id: 0
+  lan_base_url: ""
+  heartbeat_seconds: 15
+  cache_mode: "standard"
+  cache_max_entries: 5000
+  cache_max_memory_mb: 256
+  cache_max_object_mb: 5
+  cache_stale_if_error: true
+  cache_max_stale_hours: 24
+  cache:
+    whitelist:
+      - /api/products
+      - /api/skus
+      - /api/case-specs
+      - /api/purchase-orders
+  default_printer: ""
+  sku_qr_prefix: "T"
+  print_template: "label_60x40mm"
+  print_width_mm: 60
+  print_height_mm: 40
+  print_orientation: "portrait"
+  print_mode: "fit"
+  print_copies: 1
+  capabilities:
+    - proxy
+    - adaptive_cache
+    - catalog_cache
+    - local_print

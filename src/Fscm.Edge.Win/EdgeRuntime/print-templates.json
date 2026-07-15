@@ -1,0 +1,44 @@
+[
+  {
+    "Id": "label_60x40mm",
+    "Name": "\u6807\u7b7e 60 x 40 mm",
+    "Type": "label",
+    "Printer": "",
+    "WidthMillimeters": 60,
+    "HeightMillimeters": 40,
+    "Orientation": "portrait",
+    "Mode": "fit",
+    "Copies": 1,
+    "OffsetXMillimeters": 0,
+    "SkuQrPrefix": "T",
+    "MaxDisplayLength": 16
+  },
+  {
+    "Id": "shipping_100x150mm",
+    "Name": "\u9762\u5355 100 x 150 mm",
+    "Type": "shipping",
+    "Printer": "",
+    "WidthMillimeters": 100,
+    "HeightMillimeters": 150,
+    "Orientation": "portrait",
+    "Mode": "fit",
+    "Copies": 1,
+    "OffsetXMillimeters": 0,
+    "SkuQrPrefix": "T",
+    "MaxDisplayLength": 16
+  },
+  {
+    "Id": "custom",
+    "Name": "\u81ea\u5b9a\u4e49",
+    "Type": "custom",
+    "Printer": "",
+    "WidthMillimeters": 60,
+    "HeightMillimeters": 40,
+    "Orientation": "portrait",
+    "Mode": "fit",
+    "Copies": 1,
+    "OffsetXMillimeters": 0,
+    "SkuQrPrefix": "T",
+    "MaxDisplayLength": 16
+  }
+]

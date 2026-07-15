@@ -75,6 +75,10 @@ project.lock.json
 project.fragment.lock.json
 artifacts/
 
+# Go build caches kept inside the workspace on restricted Windows hosts
+.gocache*/
+.gomodcache/
+
 # StyleCop
 StyleCopReport.xml
 
@@ -362,3 +366,6 @@ MigrationBackup/
 
 # Ionide (cross platform F# VS Code tools) working folder
 .ionide/
+
+fscm/
+
