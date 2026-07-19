@@ -29,6 +29,12 @@ type cacheYAMLConfig struct {
 	Whitelist     []string `yaml:"whitelist"`
 }
 
+type MediaCacheConfig struct {
+	Path        string `yaml:"path"`
+	MaxDiskMB   int64  `yaml:"max_disk_mb"`
+	MaxObjectMB int64  `yaml:"max_object_mb"`
+}
+
 type Config struct {
 	Port             string
 	NodeID           string
@@ -41,6 +47,7 @@ type Config struct {
 	HeartbeatSeconds int
 	PrintPollSeconds int
 	Cache            CacheConfig
+	MediaCache       MediaCacheConfig
 	DefaultPrinter   string
 	PrintTemplate    string
 	PrintWidthMM     float64
@@ -60,30 +67,31 @@ type yamlConfig struct {
 		Port string `yaml:"port"`
 	} `yaml:"server"`
 	Edge struct {
-		NodeID           string          `yaml:"node_id"`
-		NodeName         string          `yaml:"node_name"`
-		LANBaseURL       string          `yaml:"lan_base_url"`
-		CenterURL        string          `yaml:"center_url"`
-		APIToken         string          `yaml:"api_token"`
-		AdminToken       string          `yaml:"admin_token"`
-		NamespaceID      uint            `yaml:"namespace_id"`
-		HeartbeatSeconds int             `yaml:"heartbeat_seconds"`
-		PrintPollSeconds int             `yaml:"print_poll_seconds"`
-		Cache            cacheYAMLConfig `yaml:"cache"`
-		CacheMode        string          `yaml:"cache_mode"`
-		CacheMaxEntries  int             `yaml:"cache_max_entries"`
-		CacheMaxMemoryMB int64           `yaml:"cache_max_memory_mb"`
-		CacheMaxObjectMB int64           `yaml:"cache_max_object_mb"`
-		CacheStale       *bool           `yaml:"cache_stale_if_error"`
-		CacheMaxStale    int             `yaml:"cache_max_stale_hours"`
-		DefaultPrinter   string          `yaml:"default_printer"`
-		PrintTemplate    string          `yaml:"print_template"`
-		PrintWidthMM     float64         `yaml:"print_width_mm"`
-		PrintHeightMM    float64         `yaml:"print_height_mm"`
-		PrintOrientation string          `yaml:"print_orientation"`
-		PrintMode        string          `yaml:"print_mode"`
-		PrintCopies      int             `yaml:"print_copies"`
-		SkuQRPrefix      string          `yaml:"sku_qr_prefix"`
+		NodeID           string           `yaml:"node_id"`
+		NodeName         string           `yaml:"node_name"`
+		LANBaseURL       string           `yaml:"lan_base_url"`
+		CenterURL        string           `yaml:"center_url"`
+		APIToken         string           `yaml:"api_token"`
+		AdminToken       string           `yaml:"admin_token"`
+		NamespaceID      uint             `yaml:"namespace_id"`
+		HeartbeatSeconds int              `yaml:"heartbeat_seconds"`
+		PrintPollSeconds int              `yaml:"print_poll_seconds"`
+		Cache            cacheYAMLConfig  `yaml:"cache"`
+		MediaCache       MediaCacheConfig `yaml:"media_cache"`
+		CacheMode        string           `yaml:"cache_mode"`
+		CacheMaxEntries  int              `yaml:"cache_max_entries"`
+		CacheMaxMemoryMB int64            `yaml:"cache_max_memory_mb"`
+		CacheMaxObjectMB int64            `yaml:"cache_max_object_mb"`
+		CacheStale       *bool            `yaml:"cache_stale_if_error"`
+		CacheMaxStale    int              `yaml:"cache_max_stale_hours"`
+		DefaultPrinter   string           `yaml:"default_printer"`
+		PrintTemplate    string           `yaml:"print_template"`
+		PrintWidthMM     float64          `yaml:"print_width_mm"`
+		PrintHeightMM    float64          `yaml:"print_height_mm"`
+		PrintOrientation string           `yaml:"print_orientation"`
+		PrintMode        string           `yaml:"print_mode"`
+		PrintCopies      int              `yaml:"print_copies"`
+		SkuQRPrefix      string           `yaml:"sku_qr_prefix"`
 	} `yaml:"edge"`
 }
 
@@ -96,6 +104,7 @@ func Load(path string) (*Config, error) {
 			StaleIfError: true, MaxStaleHours: 24,
 			Whitelist: []string{"/api/products", "/api/skus", "/api/case-specs", "/api/purchase-orders"},
 		},
+		MediaCache:    MediaCacheConfig{MaxDiskMB: 2048, MaxObjectMB: 10},
 		PrintTemplate: "label_60x40mm", PrintWidthMM: 60, PrintHeightMM: 40,
 		PrintOrientation: "portrait", PrintMode: "fit", PrintCopies: 1,
 		SkuQRPrefix: "T",
@@ -123,6 +132,13 @@ func Load(path string) (*Config, error) {
 			cfg.PrintPollSeconds = raw.Edge.PrintPollSeconds
 		}
 		applyCache(&cfg.Cache, raw.Edge)
+		cfg.MediaCache = raw.Edge.MediaCache
+		if cfg.MediaCache.MaxDiskMB <= 0 {
+			cfg.MediaCache.MaxDiskMB = 2048
+		}
+		if cfg.MediaCache.MaxObjectMB <= 0 {
+			cfg.MediaCache.MaxObjectMB = 10
+		}
 		cfg.PrintTemplate = first(raw.Edge.PrintTemplate, cfg.PrintTemplate)
 		if raw.Edge.PrintWidthMM > 0 {
 			cfg.PrintWidthMM = raw.Edge.PrintWidthMM
@@ -142,36 +158,42 @@ func Load(path string) (*Config, error) {
 		cfg.JobsPath = filepath.Join(filepath.Dir(path), cfg.JobsPath)
 	}
 	applyEnv(cfg)
+	if strings.TrimSpace(cfg.MediaCache.Path) == "" {
+		cfg.MediaCache.Path = filepath.Join(filepath.Dir(cfg.JobsPath), "media-cache")
+	} else if !filepath.IsAbs(cfg.MediaCache.Path) {
+		cfg.MediaCache.Path = filepath.Join(filepath.Dir(path), cfg.MediaCache.Path)
+	}
 	cfg.CenterURL = strings.TrimRight(strings.TrimSpace(cfg.CenterURL), "/")
 	cfg.Cache.Mode = normalizeCacheMode(cfg.Cache.Mode)
 	return cfg, nil
 }
 
 func applyCache(dst *CacheConfig, edge struct {
-	NodeID           string          `yaml:"node_id"`
-	NodeName         string          `yaml:"node_name"`
-	LANBaseURL       string          `yaml:"lan_base_url"`
-	CenterURL        string          `yaml:"center_url"`
-	APIToken         string          `yaml:"api_token"`
-	AdminToken       string          `yaml:"admin_token"`
-	NamespaceID      uint            `yaml:"namespace_id"`
-	HeartbeatSeconds int             `yaml:"heartbeat_seconds"`
-	PrintPollSeconds int             `yaml:"print_poll_seconds"`
-	Cache            cacheYAMLConfig `yaml:"cache"`
-	CacheMode        string          `yaml:"cache_mode"`
-	CacheMaxEntries  int             `yaml:"cache_max_entries"`
-	CacheMaxMemoryMB int64           `yaml:"cache_max_memory_mb"`
-	CacheMaxObjectMB int64           `yaml:"cache_max_object_mb"`
-	CacheStale       *bool           `yaml:"cache_stale_if_error"`
-	CacheMaxStale    int             `yaml:"cache_max_stale_hours"`
-	DefaultPrinter   string          `yaml:"default_printer"`
-	PrintTemplate    string          `yaml:"print_template"`
-	PrintWidthMM     float64         `yaml:"print_width_mm"`
-	PrintHeightMM    float64         `yaml:"print_height_mm"`
-	PrintOrientation string          `yaml:"print_orientation"`
-	PrintMode        string          `yaml:"print_mode"`
-	PrintCopies      int             `yaml:"print_copies"`
-	SkuQRPrefix      string          `yaml:"sku_qr_prefix"`
+	NodeID           string           `yaml:"node_id"`
+	NodeName         string           `yaml:"node_name"`
+	LANBaseURL       string           `yaml:"lan_base_url"`
+	CenterURL        string           `yaml:"center_url"`
+	APIToken         string           `yaml:"api_token"`
+	AdminToken       string           `yaml:"admin_token"`
+	NamespaceID      uint             `yaml:"namespace_id"`
+	HeartbeatSeconds int              `yaml:"heartbeat_seconds"`
+	PrintPollSeconds int              `yaml:"print_poll_seconds"`
+	Cache            cacheYAMLConfig  `yaml:"cache"`
+	MediaCache       MediaCacheConfig `yaml:"media_cache"`
+	CacheMode        string           `yaml:"cache_mode"`
+	CacheMaxEntries  int              `yaml:"cache_max_entries"`
+	CacheMaxMemoryMB int64            `yaml:"cache_max_memory_mb"`
+	CacheMaxObjectMB int64            `yaml:"cache_max_object_mb"`
+	CacheStale       *bool            `yaml:"cache_stale_if_error"`
+	CacheMaxStale    int              `yaml:"cache_max_stale_hours"`
+	DefaultPrinter   string           `yaml:"default_printer"`
+	PrintTemplate    string           `yaml:"print_template"`
+	PrintWidthMM     float64          `yaml:"print_width_mm"`
+	PrintHeightMM    float64          `yaml:"print_height_mm"`
+	PrintOrientation string           `yaml:"print_orientation"`
+	PrintMode        string           `yaml:"print_mode"`
+	PrintCopies      int              `yaml:"print_copies"`
+	SkuQRPrefix      string           `yaml:"sku_qr_prefix"`
 }) {
 	if edge.Cache.Mode != "" {
 		dst.Mode = edge.Cache.Mode
@@ -226,6 +248,14 @@ func applyEnv(cfg *Config) {
 	}
 	if value := os.Getenv("EDGE_CACHE_MODE"); value != "" {
 		cfg.Cache.Mode = value
+	}
+	if value := os.Getenv("EDGE_MEDIA_CACHE_PATH"); value != "" {
+		cfg.MediaCache.Path = value
+	}
+	if value := os.Getenv("EDGE_MEDIA_CACHE_MAX_DISK_MB"); value != "" {
+		if parsed, err := strconv.ParseInt(value, 10, 64); err == nil && parsed > 0 {
+			cfg.MediaCache.MaxDiskMB = parsed
+		}
 	}
 	if value := os.Getenv("EDGE_NAMESPACE_ID"); value != "" {
 		if parsed, err := strconv.ParseUint(value, 10, 32); err == nil {

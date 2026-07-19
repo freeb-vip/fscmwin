@@ -21,6 +21,7 @@ namespace Fscm.Edge.Win.Services;
 
 public sealed class EdgeRuntimeManager : IDisposable
 {
+    private const int PrintTemplatesSchemaVersion = 10;
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -40,6 +41,8 @@ public sealed class EdgeRuntimeManager : IDisposable
     public string ManifestPath => Path.Combine(RuntimeDirectory, "edge-runtime-manifest.json");
 
     public string PrintTemplatesPath => Path.Combine(RuntimeDirectory, "print-templates.json");
+
+    private string PrintTemplatesVersionPath => Path.Combine(RuntimeDirectory, "data", "print-templates.version");
 
     public string LogDirectory => Path.Combine(RuntimeDirectory, "logs");
 
@@ -70,8 +73,19 @@ public sealed class EdgeRuntimeManager : IDisposable
 
         try
         {
-            return JsonSerializer.Deserialize<List<PrintTemplateProfile>>(File.ReadAllText(PrintTemplatesPath), JsonOptions)
+            var templates = JsonSerializer.Deserialize<List<PrintTemplateProfile>>(File.ReadAllText(PrintTemplatesPath), JsonOptions)
                 ?? [];
+            int sourceVersion = ReadPrintTemplatesSchemaVersion();
+            if (PrintTemplatePolicy.MigrateBuiltInTemplates(templates, sourceVersion))
+            {
+                SavePrintTemplates(templates);
+            }
+            else if (sourceVersion < PrintTemplatesSchemaVersion)
+            {
+                WritePrintTemplatesSchemaVersion();
+            }
+
+            return templates;
         }
         catch (JsonException)
         {
@@ -84,16 +98,26 @@ public sealed class EdgeRuntimeManager : IDisposable
         EnsureDefaultConfig();
         var content = JsonSerializer.Serialize(templates, new JsonSerializerOptions(JsonOptions) { WriteIndented = true });
         File.WriteAllText(PrintTemplatesPath, content);
+        WritePrintTemplatesSchemaVersion();
     }
 
     private static IReadOnlyList<PrintTemplateProfile> DefaultPrintTemplates()
     {
-        return
-        [
-            new() { Id = "label_60x40mm", Name = "标签 60 x 40 mm", Type = "label", WidthMillimeters = 60, HeightMillimeters = 40, Orientation = "portrait", SkuQrPrefix = "T", MaxDisplayLength = 16 },
-            new() { Id = "shipping_100x150mm", Name = "面单 100 x 150 mm", Type = "shipping", WidthMillimeters = 100, HeightMillimeters = 150, Orientation = "portrait", SkuQrPrefix = "T", MaxDisplayLength = 16 },
-            new() { Id = "custom", Name = "自定义", Type = "custom", WidthMillimeters = 60, HeightMillimeters = 40, Orientation = "portrait", SkuQrPrefix = "T", MaxDisplayLength = 16 },
-        ];
+        return PrintTemplatePolicy.CreateDefaultTemplates();
+    }
+
+    private int ReadPrintTemplatesSchemaVersion()
+    {
+        return File.Exists(PrintTemplatesVersionPath) &&
+            int.TryParse(File.ReadAllText(PrintTemplatesVersionPath), out int version)
+            ? version
+            : 1;
+    }
+
+    private void WritePrintTemplatesSchemaVersion()
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(PrintTemplatesVersionPath)!);
+        File.WriteAllText(PrintTemplatesVersionPath, PrintTemplatesSchemaVersion.ToString(CultureInfo.InvariantCulture));
     }
 
     public async Task<EdgeRuntimeStatus> GetStatusAsync()
@@ -241,15 +265,23 @@ public sealed class EdgeRuntimeManager : IDisposable
         var inventory = new
         {
             printers,
-            templates = templates.Select(template => new
+            templates = PrintTemplatePolicy.OrderLabelTemplates(templates)
+                .Concat(templates.Where(template => !PrintTemplatePolicy.IsLabel(template)))
+                .Select(template => new
             {
                 code = template.Id,
+                number = template.TemplateNumber,
                 name = template.Name,
+                type = template.Type,
                 printer_name = template.Printer,
                 width_mm = template.WidthMillimeters,
                 height_mm = template.HeightMillimeters,
                 orientation = template.Orientation,
-                version = "1",
+                layout_style = PrintTemplatePolicy.NormalizeLayoutStyle(template.LayoutStyle),
+                text_font_size_pt = PrintTemplatePolicy.GetTextFontSizePoints(template),
+                max_display_length = template.MaxDisplayLength > 0 ? template.MaxDisplayLength : 16,
+                label_qr_prefix = template.LabelQrPrefix,
+                version = PrintTemplatePolicy.GetTemplateVersion(template),
                 available = !string.IsNullOrWhiteSpace(template.Printer),
             }).ToList(),
         };
@@ -534,23 +566,310 @@ public sealed class EdgeRuntimeManager : IDisposable
 
     public async Task<IReadOnlyList<ProductSummary>> GetProductsAsync(string keyword)
     {
-        var local = await GetLocalCatalogListAsync<ProductSummary>("/edge/catalog/products/search", keyword).ConfigureAwait(false);
-        return local.Ready ? local.Items : await GetCenterListAsync<ProductSummary>("/api/products", keyword, "&match_mode=prefix").ConfigureAwait(false);
+        return (await GetProductsPageAsync(keyword, 1, 100).ConfigureAwait(false)).Items;
     }
 
     public async Task<IReadOnlyList<SkuSummary>> GetSkusAsync(string keyword, uint? productId = null)
     {
-        var path = productId is null
+        return (await GetSkusPageAsync(keyword, 1, 100, productId).ConfigureAwait(false)).Items;
+    }
+
+    public async Task<CatalogSearchResult<ProductSummary>> GetProductsPageAsync(string keyword, int page, int pageSize)
+    {
+        page = Math.Max(1, page);
+        pageSize = Math.Clamp(pageSize, 1, 100);
+        var local = await GetLocalCatalogPageAsync<ProductSummary>("/edge/catalog/products/search", keyword, page, pageSize).ConfigureAwait(false);
+        if (local.Succeeded && local.Result.Items.Count > 0)
+        {
+            return local.Result;
+        }
+
+        var center = await GetCenterCatalogPageAsync<ProductSummary>("/api/products", keyword, page, pageSize, "&match_mode=prefix").ConfigureAwait(false);
+        if (center.Succeeded)
+        {
+            var cached = await CacheCatalogItemsAsync("/edge/catalog/products/cache", center.Result.Items).ConfigureAwait(false);
+            return WithCatalogMessage(center.Result, cached);
+        }
+
+        return CatalogFallback(local, "本地和中心均未返回产品数据。");
+    }
+
+    public async Task<CatalogSearchResult<SkuSummary>> GetSkusPageAsync(string keyword, int page, int pageSize, uint? productId = null)
+    {
+        page = Math.Max(1, page);
+        pageSize = Math.Clamp(pageSize, 1, 100);
+        var localPath = productId is null
             ? "/edge/catalog/skus/search"
             : $"/edge/catalog/skus/search?product_id={productId.Value}";
-        var local = await GetLocalCatalogListAsync<SkuSummary>(path, keyword).ConfigureAwait(false);
-        if (local.Ready)
+        var local = await GetLocalCatalogPageAsync<SkuSummary>(localPath, keyword, page, pageSize).ConfigureAwait(false);
+        if (local.Succeeded && local.Result.Items.Count > 0)
         {
-            return local.Items;
+            return local.Result;
         }
 
         var suffix = productId is null ? "&match_mode=prefix" : $"&product_id={productId.Value}&match_mode=prefix";
-        return await GetCenterListAsync<SkuSummary>("/api/skus", keyword, suffix).ConfigureAwait(false);
+        var center = await GetCenterCatalogPageAsync<SkuSummary>("/api/skus", keyword, page, pageSize, suffix).ConfigureAwait(false);
+        if (center.Succeeded)
+        {
+            var cached = await CacheCatalogItemsAsync("/edge/catalog/skus/cache", center.Result.Items).ConfigureAwait(false);
+            return WithCatalogMessage(center.Result, cached);
+        }
+
+        return CatalogFallback(local, "本地和中心均未返回 SKU 数据。");
+    }
+
+    public async Task<BoxLabelSearchResult> GetBoxLabelsAsync(BoxLabelQuery query)
+    {
+        var local = await GetLocalBoxLabelsAsync(query).ConfigureAwait(false);
+        if (local.Succeeded && local.Result.Items.Count > 0)
+        {
+            return local.Result;
+        }
+
+        var center = await GetCenterBoxLabelsAsync(query).ConfigureAwait(false);
+        if (center.Succeeded)
+        {
+            var cached = await CacheBoxLabelsAsync(center.Result.Items).ConfigureAwait(false);
+            return new BoxLabelSearchResult
+            {
+                Items = center.Result.Items,
+                Total = center.Result.Total,
+                Source = "center",
+                Message = cached ? "本地无匹配数据，已从中心查询并同步到本地。" : "本地无匹配数据，当前显示中心结果；本地目录尚未就绪。",
+            };
+        }
+
+        return new BoxLabelSearchResult
+        {
+            Items = local.Result.Items,
+            Total = local.Result.Total,
+            Source = local.Succeeded ? "local" : string.Empty,
+            Message = string.IsNullOrWhiteSpace(LastCenterQueryMessage) ? "本地和中心均未返回箱唛数据。" : LastCenterQueryMessage,
+        };
+    }
+
+    private async Task<(BoxLabelSearchResult Result, bool Succeeded)> GetLocalBoxLabelsAsync(BoxLabelQuery query)
+    {
+        try
+        {
+            var values = BuildBoxLabelQueryValues(query);
+            using var request = CreateLocalAdminRequest(HttpMethod.Get, "/edge/catalog/box-labels/search?" + string.Join("&", values));
+            using var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                return (new BoxLabelSearchResult(), false);
+            }
+
+            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
+            var root = document.RootElement;
+#pragma warning disable IDISP004
+            var items = root.TryGetProperty("items", out var array) && array.ValueKind == JsonValueKind.Array
+                ? array.EnumerateArray().Select(item => item.Deserialize<BoxLabelSummary>(JsonOptions)).Where(item => item is not null).Select(item => item!).ToList()
+                : [];
+#pragma warning restore IDISP004
+            var total = root.TryGetProperty("total", out var totalValue) ? totalValue.GetInt64() : items.Count;
+            return (new BoxLabelSearchResult { Items = items, Total = total, Source = "local" }, true);
+        }
+        catch
+        {
+            return (new BoxLabelSearchResult(), false);
+        }
+    }
+
+    public async Task<BoxLabelSummary?> GetBoxLabelAsync(uint id)
+    {
+        var local = await GetLocalBoxLabelAsync(id).ConfigureAwait(false);
+        if (local is not null)
+        {
+            return local;
+        }
+
+        var center = await GetCenterBoxLabelAsync(id).ConfigureAwait(false);
+        if (center is not null)
+        {
+            await CacheBoxLabelsAsync([center]).ConfigureAwait(false);
+        }
+
+        return center;
+    }
+
+    private async Task<BoxLabelSummary?> GetLocalBoxLabelAsync(uint id)
+    {
+        try
+        {
+            using var request = CreateLocalAdminRequest(HttpMethod.Get, $"/edge/catalog/box-labels/{id}");
+            using var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
+            return document.RootElement.TryGetProperty("item", out var item) ? item.Deserialize<BoxLabelSummary>(JsonOptions) : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private async Task<(BoxLabelSearchResult Result, bool Succeeded)> GetCenterBoxLabelsAsync(BoxLabelQuery query)
+    {
+        LastCenterQueryMessage = string.Empty;
+        try
+        {
+            var settings = LoadEdgeSettings();
+            if (settings.NamespaceId == 0)
+            {
+                var detectedNamespaceId = await DetectNamespaceIdAsync(settings).ConfigureAwait(false);
+                if (detectedNamespaceId > 0)
+                {
+                    settings.NamespaceId = detectedNamespaceId;
+                    SaveEdgeSettings(settings);
+                }
+            }
+
+            using var request = CreateLocalAuthorizedRequest(HttpMethod.Get, "/api/box-labels?" + string.Join("&", BuildBoxLabelQueryValues(query)), settings);
+            using var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
+            var responseBody = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                LastCenterQueryMessage = $"中心箱唛查询失败：{(int)response.StatusCode} {response.ReasonPhrase}。{ExtractErrorMessage(responseBody)}";
+                return (new BoxLabelSearchResult(), false);
+            }
+
+            using var document = JsonDocument.Parse(responseBody);
+            var root = document.RootElement;
+            var payload = root.TryGetProperty("data", out var envelopeData) && envelopeData.ValueKind == JsonValueKind.Object
+                ? envelopeData
+                : root;
+            if (!payload.TryGetProperty("data", out var array) || array.ValueKind != JsonValueKind.Array)
+            {
+                LastCenterQueryMessage = "中心箱唛响应不包含分页列表。";
+                return (new BoxLabelSearchResult(), false);
+            }
+
+#pragma warning disable IDISP004
+            var items = array.EnumerateArray().Select(item => item.Deserialize<BoxLabelSummary>(JsonOptions)).Where(item => item is not null).Select(item => item!).ToList();
+#pragma warning restore IDISP004
+            var total = payload.TryGetProperty("total", out var totalValue) ? totalValue.GetInt64() : items.Count;
+            return (new BoxLabelSearchResult { Items = items, Total = total, Source = "center" }, true);
+        }
+        catch (Exception ex)
+        {
+            LastCenterQueryMessage = $"中心箱唛查询异常：{ex.Message}";
+            return (new BoxLabelSearchResult(), false);
+        }
+    }
+
+    private async Task<BoxLabelSummary?> GetCenterBoxLabelAsync(uint id)
+    {
+        try
+        {
+            var settings = LoadEdgeSettings();
+            using var request = CreateLocalAuthorizedRequest(HttpMethod.Get, $"/api/box-labels/{id}", settings);
+            using var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                return null;
+            }
+
+            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
+            return document.RootElement.TryGetProperty("data", out var item) && item.ValueKind == JsonValueKind.Object
+                ? item.Deserialize<BoxLabelSummary>(JsonOptions)
+                : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private async Task<bool> CacheBoxLabelsAsync(IReadOnlyList<BoxLabelSummary> items)
+    {
+        if (items.Count == 0)
+        {
+            return true;
+        }
+
+        try
+        {
+            using var request = CreateLocalAdminRequest(HttpMethod.Post, "/edge/catalog/box-labels/cache");
+            request.Content = JsonContent.Create(new { items });
+            using var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
+            return response.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static List<string> BuildBoxLabelQueryValues(BoxLabelQuery query)
+    {
+        var values = new List<string>
+        {
+            $"keyword={Uri.EscapeDataString(query.Keyword.Trim())}",
+            $"page={Math.Max(1, query.Page)}",
+            $"page_size={Math.Clamp(query.PageSize, 1, 100)}",
+        };
+        AddQueryValue(values, "product_id", query.ProductId);
+        AddQueryValue(values, "sku_id", query.SkuId);
+        AddQueryValue(values, "consolidation_order_id", query.ConsolidationOrderId);
+        AddQueryValue(values, "consolidation_order_code", query.ConsolidationOrderCode);
+        AddQueryValue(values, "status_group", query.StatusGroup);
+        AddQueryValue(values, "receiving_status", query.ReceivingStatus);
+        return values;
+    }
+
+    public Task<IReadOnlyList<ConsolidationOrderSummary>> GetConsolidationOrdersAsync(string keyword)
+    {
+        return GetCenterListAsync<ConsolidationOrderSummary>("/api/consolidation-orders", keyword, "&page_size=20");
+    }
+
+    public async Task<bool> SubmitBoxMarkPrintJobAsync(string templateId, IReadOnlyList<BoxLabelSummary> labels, int copies)
+    {
+        var marks = labels.Where(label => label.PrintSnapshot is not null).Select(label => label.PrintSnapshot!).ToList();
+        if (marks.Count == 0 || marks.Count > 100)
+        {
+            return false;
+        }
+
+        try
+        {
+            var idempotencyKey = $"box-mark-{Guid.NewGuid():N}";
+            var payload = new
+            {
+                template_id = templateId,
+                source = "windows-box-label-management",
+                job_id = idempotencyKey,
+                idempotency_key = idempotencyKey,
+                kind = "manufacturer_box_mark",
+                copies = Math.Clamp(copies, 1, 100),
+                box_marks = marks,
+                payload_snapshot = new { document_version = "manufacturer_box_mark.v1", items = marks },
+            };
+            using var request = CreateLocalAdminRequest(HttpMethod.Post, "/edge/print-jobs");
+            request.Content = JsonContent.Create(payload);
+            using var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
+            return response.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void AddQueryValue(List<string> values, string key, uint? value)
+    {
+        if (value is > 0)
+        {
+            values.Add($"{key}={value.Value}");
+        }
+    }
+
+    private static void AddQueryValue(List<string> values, string key, string value)
+    {
+        if (!string.IsNullOrWhiteSpace(value))
+        {
+            values.Add($"{key}={Uri.EscapeDataString(value.Trim())}");
+        }
     }
 
     public async Task<EdgeCatalogStatus?> GetCatalogStatusAsync()
@@ -582,38 +901,160 @@ public sealed class EdgeRuntimeManager : IDisposable
         }
     }
 
-    private async Task<(IReadOnlyList<T> Items, bool Ready)> GetLocalCatalogListAsync<T>(string path, string keyword)
+    private async Task<(CatalogSearchResult<T> Result, bool Succeeded)> GetLocalCatalogPageAsync<T>(string path, string keyword, int page, int pageSize)
     {
         LastCenterQueryMessage = string.Empty;
         try
         {
             var separator = path.Contains('?') ? "&" : "?";
-            using var request = CreateLocalAdminRequest(HttpMethod.Get, path + separator + "keyword=" + Uri.EscapeDataString(keyword.Trim()));
+            var query = $"keyword={Uri.EscapeDataString(keyword.Trim())}&page={page}&page_size={pageSize}";
+            using var request = CreateLocalAdminRequest(HttpMethod.Get, path + separator + query);
             using var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
             {
-                return ([], false);
+                return (new CatalogSearchResult<T> { Page = page, PageSize = pageSize }, false);
             }
 
             using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
             var root = document.RootElement;
-            var ready = root.TryGetProperty("catalog", out var catalog)
-                && catalog.TryGetProperty("ready", out var readyValue)
-                && readyValue.ValueKind == JsonValueKind.True;
             if (!root.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array)
             {
-                return ([], ready);
+                return (new CatalogSearchResult<T> { Page = page, PageSize = pageSize, Source = "local" }, true);
             }
 
 #pragma warning disable IDISP004
-            var result = items.EnumerateArray().Select(item => item.Deserialize<T>(JsonOptions)).Where(item => item is not null).Select(item => item!).ToList();
+            var result = DeserializeCatalogItems<T>(items);
 #pragma warning restore IDISP004
-            return (result, ready);
+            var total = root.TryGetProperty("total", out var totalValue) && totalValue.TryGetInt64(out var parsedTotal) ? parsedTotal : result.Count;
+            return (new CatalogSearchResult<T> { Items = result, Total = total, Page = page, PageSize = pageSize, Source = "local" }, true);
         }
         catch
         {
-            return ([], false);
+            return (new CatalogSearchResult<T> { Page = page, PageSize = pageSize }, false);
         }
+    }
+
+    private async Task<(CatalogSearchResult<T> Result, bool Succeeded)> GetCenterCatalogPageAsync<T>(string path, string keyword, int page, int pageSize, string suffix)
+    {
+        LastCenterQueryMessage = string.Empty;
+        try
+        {
+            var settings = LoadEdgeSettings();
+            if (settings.NamespaceId == 0)
+            {
+                var detectedNamespaceId = await DetectNamespaceIdAsync(settings).ConfigureAwait(false);
+                if (detectedNamespaceId > 0)
+                {
+                    settings.NamespaceId = detectedNamespaceId;
+                    SaveEdgeSettings(settings);
+                }
+            }
+
+            var query = $"?keyword={Uri.EscapeDataString(keyword.Trim())}&page={page}&pageSize={pageSize}{suffix}";
+            using var request = CreateLocalAuthorizedRequest(HttpMethod.Get, path + query, settings);
+            using var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
+            var responseBody = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                LastCenterQueryMessage = $"中心查询失败：{(int)response.StatusCode} {response.ReasonPhrase}。{ExtractErrorMessage(responseBody)}";
+                return (new CatalogSearchResult<T> { Page = page, PageSize = pageSize }, false);
+            }
+
+            using var document = JsonDocument.Parse(responseBody);
+            var root = document.RootElement;
+            var payload = root.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Object ? data : root;
+            var items = payload.TryGetProperty("items", out var nestedItems) && nestedItems.ValueKind == JsonValueKind.Array
+                ? nestedItems
+                : payload.TryGetProperty("data", out var nestedData) && nestedData.ValueKind == JsonValueKind.Array
+                    ? nestedData
+                    : root.TryGetProperty("data", out var rootData) && rootData.ValueKind == JsonValueKind.Array
+                        ? rootData
+                        : root.ValueKind == JsonValueKind.Array ? root : default;
+            if (items.ValueKind != JsonValueKind.Array)
+            {
+                LastCenterQueryMessage = "中心返回的数据格式不包含分页列表。";
+                return (new CatalogSearchResult<T> { Page = page, PageSize = pageSize }, false);
+            }
+
+#pragma warning disable IDISP004
+            var result = DeserializeCatalogItems<T>(items);
+#pragma warning restore IDISP004
+            var total = payload.TryGetProperty("total", out var totalValue) && totalValue.TryGetInt64(out var parsedTotal) ? parsedTotal : result.Count;
+            return (new CatalogSearchResult<T> { Items = result, Total = total, Page = page, PageSize = pageSize, Source = "center" }, true);
+        }
+        catch (Exception ex)
+        {
+            LastCenterQueryMessage = $"中心查询异常：{ex.Message}";
+            return (new CatalogSearchResult<T> { Page = page, PageSize = pageSize }, false);
+        }
+    }
+
+    private static List<T> DeserializeCatalogItems<T>(JsonElement items)
+    {
+        var result = new List<T>();
+#pragma warning disable IDISP004
+        foreach (var element in items.EnumerateArray())
+        {
+            var item = element.Deserialize<T>(JsonOptions);
+            if (item is null)
+            {
+                continue;
+            }
+            if (item is SkuSummary sku && string.IsNullOrWhiteSpace(sku.ProductCode)
+                && element.TryGetProperty("product", out var product) && product.ValueKind == JsonValueKind.Object
+                && product.TryGetProperty("code", out var productCode))
+            {
+                sku.ProductCode = productCode.GetString() ?? string.Empty;
+            }
+            result.Add(item);
+        }
+#pragma warning restore IDISP004
+        return result;
+    }
+
+    private async Task<bool> CacheCatalogItemsAsync<T>(string path, IReadOnlyList<T> items)
+    {
+        if (items.Count == 0)
+        {
+            return true;
+        }
+        try
+        {
+            using var request = CreateLocalAdminRequest(HttpMethod.Post, path);
+            request.Content = JsonContent.Create(new { items });
+            using var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
+            return response.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private CatalogSearchResult<T> CatalogFallback<T>((CatalogSearchResult<T> Result, bool Succeeded) local, string emptyMessage)
+    {
+        return new CatalogSearchResult<T>
+        {
+            Items = local.Result.Items,
+            Total = local.Result.Total,
+            Page = local.Result.Page,
+            PageSize = local.Result.PageSize,
+            Source = local.Succeeded ? "local" : string.Empty,
+            Message = string.IsNullOrWhiteSpace(LastCenterQueryMessage) ? emptyMessage : LastCenterQueryMessage,
+        };
+    }
+
+    private static CatalogSearchResult<T> WithCatalogMessage<T>(CatalogSearchResult<T> result, bool cached)
+    {
+        return new CatalogSearchResult<T>
+        {
+            Items = result.Items,
+            Total = result.Total,
+            Page = result.Page,
+            PageSize = result.PageSize,
+            Source = result.Source,
+            Message = cached ? "本地无匹配数据，已从中心查询并同步到本地。" : "本地无匹配数据，当前显示中心结果；本地目录尚未就绪。",
+        };
     }
 
     public async Task<bool> SubmitSkuPrintJobAsync(string templateId, IReadOnlyList<SkuSummary> skus)
@@ -995,6 +1436,10 @@ edge:
       - /api/skus
       - /api/case-specs
       - /api/purchase-orders
+  media_cache:
+    path: "data/media-cache"
+    max_disk_mb: 2048
+    max_object_mb: 10
   default_printer: ""
   sku_qr_prefix: "T"
   print_template: "label_60x40mm"
@@ -1133,6 +1578,14 @@ edge:
                 _ = double.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var offsetX);
                 settings.PrintOffsetXMillimeters = offsetX;
                 break;
+            case "print_offset_y_mm":
+                _ = double.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var offsetY);
+                settings.PrintOffsetYMillimeters = offsetY;
+                break;
+            case "print_safety_inset_mm":
+                _ = double.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var safetyInset);
+                settings.PrintSafetyInsetMillimeters = safetyInset;
+                break;
             case "print_mode":
                 settings.PrintMode = value;
                 break;
@@ -1161,9 +1614,13 @@ edge:
         settings.PrintOrientation = string.Equals(settings.PrintOrientation, "landscape", StringComparison.OrdinalIgnoreCase)
             ? "landscape"
             : "portrait";
-        settings.PrintMode = settings.PrintMode is "actual_size" or "fill" ? settings.PrintMode : "fit";
+        settings.PrintMode = "fit";
         settings.PrintCopies = Math.Clamp(settings.PrintCopies, 1, 99);
-        settings.PrintOffsetXMillimeters = Math.Clamp(settings.PrintOffsetXMillimeters, -50, 50);
+        settings.PrintOffsetXMillimeters = Math.Clamp(settings.PrintOffsetXMillimeters, -5, 5);
+        settings.PrintOffsetYMillimeters = Math.Clamp(settings.PrintOffsetYMillimeters, -5, 5);
+        settings.PrintSafetyInsetMillimeters = settings.PrintSafetyInsetMillimeters > 0
+            ? Math.Clamp(settings.PrintSafetyInsetMillimeters, 0.5, 5)
+            : PrintPageContextFactory.DefaultSafetyInsetMillimeters;
     }
 
     private static IReadOnlyList<string> BuildEdgeBlock(EdgeSettings settings)
@@ -1198,6 +1655,10 @@ edge:
         lines.Add("      - /api/skus");
         lines.Add("      - /api/case-specs");
         lines.Add("      - /api/purchase-orders");
+        lines.Add("  media_cache:");
+        lines.Add("    path: \"data/media-cache\"");
+        lines.Add("    max_disk_mb: 2048");
+        lines.Add("    max_object_mb: 10");
         lines.Add($"  default_printer: \"{EscapeYamlValue(settings.DefaultPrinter)}\"");
         lines.Add($"  sku_qr_prefix: \"{EscapeYamlValue(settings.SkuQrPrefix)}\"");
         lines.Add($"  print_template: \"{EscapeYamlValue(settings.PrintTemplate)}\"");
@@ -1205,6 +1666,8 @@ edge:
         lines.Add($"  print_height_mm: {settings.PrintHeightMillimeters.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
         lines.Add($"  print_orientation: \"{EscapeYamlValue(settings.PrintOrientation)}\"");
         lines.Add($"  print_offset_x_mm: {settings.PrintOffsetXMillimeters.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
+        lines.Add($"  print_offset_y_mm: {settings.PrintOffsetYMillimeters.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
+        lines.Add($"  print_safety_inset_mm: {settings.PrintSafetyInsetMillimeters.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
         lines.Add($"  print_mode: \"{EscapeYamlValue(settings.PrintMode)}\"");
         lines.Add($"  print_copies: {settings.PrintCopies}");
         lines.Add("  capabilities:");

@@ -35,3 +35,31 @@ func TestLoadCanDisableNestedStaleFallback(t *testing.T) {
 		t.Fatal("nested stale_if_error=false was ignored")
 	}
 }
+
+func TestLoadMediaCacheDefaultsAndOverrides(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "edge.yaml")
+	content := []byte("database:\n  sqlite_path: data/edge.db\nedge:\n  media_cache:\n    path: cached-images\n    max_disk_mb: 512\n    max_object_mb: 6\n")
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MediaCache.Path != filepath.Join(directory, "cached-images") || cfg.MediaCache.MaxDiskMB != 512 || cfg.MediaCache.MaxObjectMB != 6 {
+		t.Fatalf("unexpected media cache config: %#v", cfg.MediaCache)
+	}
+
+	defaultPath := filepath.Join(directory, "default.yaml")
+	if err := os.WriteFile(defaultPath, []byte("edge: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defaults, err := Load(defaultPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaults.MediaCache.MaxDiskMB != 2048 || defaults.MediaCache.MaxObjectMB != 10 || filepath.Base(defaults.MediaCache.Path) != "media-cache" {
+		t.Fatalf("unexpected media cache defaults: %#v", defaults.MediaCache)
+	}
+}

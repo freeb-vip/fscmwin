@@ -40,6 +40,9 @@ edge:
   print_width_mm: 60
   print_height_mm: 40
   print_orientation: "portrait"
+  print_offset_x_mm: 0
+  print_offset_y_mm: 0
+  print_safety_inset_mm: 1.5
   print_mode: "fit"
   print_copies: 1
   capabilities:

@@ -9,6 +9,9 @@ namespace Fscm.Edge.Win.Models;
 
 public sealed class ManufacturerBoxMark
 {
+    [JsonPropertyName("box_plan_id")]
+    public uint BoxPlanId { get; set; }
+
     [JsonPropertyName("sea_mark")]
     public string SeaMark { get; set; } = string.Empty;
 

@@ -2,7 +2,7 @@
   x:Class="Fscm.Edge.Win.PrintPreviewWindow"
   xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
   xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-  Title="打印预览"
+  Title="标签打印预览"
   Width="900"
   Height="680"
   MinWidth="720"
@@ -31,40 +31,19 @@
     </Grid.RowDefinitions>
 
     <StackPanel Margin="28,24,28,12">
-      <TextBlock FontSize="22" FontWeight="SemiBold" Foreground="#0F172A" Text="打印预览" />
+      <TextBlock x:Name="PreviewTitleText" FontSize="22" FontWeight="SemiBold" Foreground="#0F172A" Text="标签打印预览" />
       <TextBlock x:Name="PreviewDescriptionText" Margin="0,6,0,0" Foreground="#64748B" />
     </StackPanel>
 
-    <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
-      <Grid>
-        <Border
-          x:Name="PreviewPaper"
-          HorizontalAlignment="Center"
-          VerticalAlignment="Center"
-          Background="White"
-          BorderBrush="#94A3B8"
-          BorderThickness="1"
-          Effect="{x:Null}">
-          <Grid Margin="18">
-            <Border BorderBrush="#2563EB" BorderThickness="1" Padding="12">
-              <StackPanel>
-                <TextBlock FontSize="24" FontWeight="Bold" Foreground="#1E293B" Text="FSCM EDGE" />
-                <TextBlock Margin="0,6,0,0" FontSize="16" Foreground="#334155" Text="本地打印配置测试" />
-                <TextBlock x:Name="PreviewSizeText" Margin="0,12,0,0" FontSize="12" Foreground="#64748B" TextWrapping="Wrap" />
-                <Border Margin="0,12,0,0" Height="1" Background="#CBD5E1" />
-                <TextBlock x:Name="PreviewPrinterText" Margin="0,10,0,0" FontSize="11" Foreground="#64748B" TextWrapping="Wrap" />
-              </StackPanel>
-            </Border>
-          </Grid>
-        </Border>
-      </Grid>
-    </ScrollViewer>
+    <Border Grid.Row="1" Margin="28,0" Background="White" BorderBrush="#CBD5E1" BorderThickness="1">
+      <DocumentViewer x:Name="PreviewViewer" Background="#E2E8F0" />
+    </Border>
 
     <DockPanel Grid.Row="2" Margin="28,12,28,24">
       <TextBlock x:Name="PreviewHintText" VerticalAlignment="Center" Foreground="#64748B" TextWrapping="Wrap" />
       <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
-        <Button Click="OnCancelClick" Content="返回修改" />
-        <Button Margin="10,0,0,0" Click="OnConfirmPrintClick" Content="确认打印" Style="{StaticResource PrimaryButtonStyle}" />
+        <Button x:Name="CancelButton" Click="OnCancelClick" Content="返回修改" />
+        <Button x:Name="ConfirmPrintButton" Margin="10,0,0,0" Click="OnConfirmPrintClick" Content="确认打印" Style="{StaticResource PrimaryButtonStyle}" />
       </StackPanel>
     </DockPanel>
   </Grid>

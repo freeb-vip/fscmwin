@@ -11,5 +11,11 @@ public sealed class LocalPrinter
 
     public bool IsDefault { get; init; }
 
-    public string DisplayName => IsDefault ? $"{Name} (Windows 默认)" : Name;
+    public bool IsAvailable { get; init; }
+
+    public string StatusCode { get; init; } = "unknown";
+
+    public string StatusText { get; init; } = "状态未知";
+
+    public string DisplayName => $"{Name}{(IsDefault ? " (Windows 默认)" : string.Empty)} · {StatusText}";
 }

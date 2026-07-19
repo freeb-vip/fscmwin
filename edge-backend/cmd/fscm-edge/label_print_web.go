@@ -1,10 +1,15 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
+	"sort"
 	"strings"
 
 	"fscm-edge/internal/printing"
+	"fscm-edge/internal/registry"
 
 	"github.com/gin-gonic/gin"
 )
@@ -48,18 +53,196 @@ func availableLabelTemplates(templates []printing.Template, availability *printe
 			available = append(available, template)
 		}
 	}
+	sort.SliceStable(available, func(left, right int) bool {
+		return labelTemplatePriority(available[left]) < labelTemplatePriority(available[right])
+	})
 	return available
 }
 
 func createWebLabelJob(c *gin.Context, service *printing.Service, availability *printerAvailability) {
-	createManualTextJob(c, service, availability, false)
+	createManualTextJob(c, service, availability)
 }
 
-func createCompatibleManualTextJob(c *gin.Context, service *printing.Service, availability *printerAvailability) {
-	createManualTextJob(c, service, availability, true)
+type directPrintRequest struct {
+	Source          string          `json:"source"`
+	TemplateCode    string          `json:"template_code"`
+	Copies          int             `json:"copies"`
+	Type            string          `json:"type"`
+	IdempotencyKey  string          `json:"idempotency_key"`
+	PayloadSnapshot json.RawMessage `json:"payload_snapshot"`
 }
 
-func createManualTextJob(c *gin.Context, service *printing.Service, availability *printerAvailability, compatibilityResponse bool) {
+type directSKULabelPayload struct {
+	Type            string `json:"type"`
+	SKUID           uint   `json:"sku_id"`
+	SKUCode         string `json:"sku_code"`
+	QRPayload       string `json:"qr_payload"`
+	TemplateVersion string `json:"template_version"`
+}
+
+type directCustomLabelPayload struct {
+	Type            string `json:"type"`
+	LabelContent    string `json:"label_content"`
+	Text            string `json:"text"`
+	QRPayload       string `json:"qr_payload"`
+	TemplateVersion string `json:"template_version"`
+}
+
+type directBoxMarkPayload struct {
+	Kind            string             `json:"kind"`
+	Type            string             `json:"type"`
+	DocumentVersion string             `json:"document_version"`
+	Items           []printing.BoxMark `json:"items"`
+}
+
+type directPrintAuthorizer func(context.Context, string) error
+
+func createDirectPrintJob(c *gin.Context, service *printing.Service, availability *printerAvailability, authorize directPrintAuthorizer) {
+	authorization := strings.TrimSpace(c.GetHeader("Authorization"))
+	if authorization == "" {
+		writeDirectPrintError(c, http.StatusUnauthorized, "DIRECT_PRINT_UNAUTHORIZED", "Authorization is required.")
+		return
+	}
+	if authorize == nil {
+		writeDirectPrintError(c, http.StatusServiceUnavailable, "DIRECT_PRINT_AUTH_UNAVAILABLE", "Direct print authorization is unavailable.")
+		return
+	}
+	if err := authorize(c.Request.Context(), authorization); err != nil {
+		if errors.Is(err, registry.ErrMobilePrintUnauthorized) || errors.Is(err, registry.ErrMobilePrintNodeMissing) {
+			writeDirectPrintError(c, http.StatusForbidden, "DIRECT_PRINT_FORBIDDEN", "The mobile user cannot print through this edge node.")
+		} else {
+			writeDirectPrintError(c, http.StatusServiceUnavailable, "DIRECT_PRINT_AUTH_UNAVAILABLE", "The center service could not authorize direct printing.")
+		}
+		return
+	}
+	var request directPrintRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		writeDirectPrintError(c, http.StatusBadRequest, "INVALID_DIRECT_PRINT_REQUEST", "Invalid direct print request.")
+		return
+	}
+
+	request.TemplateCode = strings.TrimSpace(request.TemplateCode)
+	request.IdempotencyKey = strings.TrimSpace(request.IdempotencyKey)
+	if request.TemplateCode == "" {
+		writeDirectPrintError(c, http.StatusBadRequest, "LABEL_TEMPLATE_REQUIRED", "template_code is required.")
+		return
+	}
+	if request.IdempotencyKey == "" {
+		writeDirectPrintError(c, http.StatusBadRequest, "IDEMPOTENCY_KEY_REQUIRED", "idempotency_key is required.")
+		return
+	}
+	if request.Copies < 1 || request.Copies > 100 {
+		writeDirectPrintError(c, http.StatusBadRequest, "INVALID_LABEL_COPIES", "copies must be between 1 and 100.")
+		return
+	}
+	if len(request.PayloadSnapshot) == 0 || string(request.PayloadSnapshot) == "null" {
+		writeDirectPrintError(c, http.StatusBadRequest, "PRINT_PAYLOAD_REQUIRED", "payload_snapshot is required.")
+		return
+	}
+
+	var envelope struct {
+		Type            string `json:"type"`
+		Kind            string `json:"kind"`
+		TemplateVersion string `json:"template_version"`
+	}
+	if err := json.Unmarshal(request.PayloadSnapshot, &envelope); err != nil {
+		writeDirectPrintError(c, http.StatusBadRequest, "INVALID_PRINT_PAYLOAD", "payload_snapshot must be valid JSON.")
+		return
+	}
+	jobType := strings.ToLower(firstNonEmpty(request.Type, envelope.Type, envelope.Kind))
+	var selected *printing.Template
+	for _, template := range service.Templates() {
+		if template.ID != request.TemplateCode || strings.TrimSpace(template.Printer) == "" || !availability.Has(template.Printer) {
+			continue
+		}
+		if jobType == "manufacturer_box_mark" {
+			if strings.EqualFold(strings.TrimSpace(template.Type), "manufacturer_box_mark") {
+				selected = &template
+				break
+			}
+		} else if strings.EqualFold(strings.TrimSpace(template.Type), "label") {
+			selected = &template
+			break
+		}
+	}
+	if selected == nil {
+		writeDirectPrintError(c, http.StatusConflict, "LABEL_TEMPLATE_UNAVAILABLE", "The selected print template or printer is unavailable.")
+		return
+	}
+	if strings.TrimSpace(envelope.TemplateVersion) != "" && envelope.TemplateVersion != templateVersion(*selected) {
+		writeDirectPrintError(c, http.StatusConflict, "LABEL_TEMPLATE_CHANGED", "The selected print template has changed.")
+		return
+	}
+	printRequest := printing.Request{
+		IdempotencyKey:  request.IdempotencyKey,
+		Source:          firstNonEmpty(request.Source, "mobile-app"),
+		TemplateID:      selected.ID,
+		Copies:          request.Copies,
+		PayloadSnapshot: append(json.RawMessage(nil), request.PayloadSnapshot...),
+	}
+
+	switch jobType {
+	case "sku_label", "sku_qr":
+		var payload directSKULabelPayload
+		if err := json.Unmarshal(request.PayloadSnapshot, &payload); err != nil || strings.TrimSpace(payload.SKUCode) == "" || strings.TrimSpace(payload.QRPayload) == "" {
+			writeDirectPrintError(c, http.StatusBadRequest, "INVALID_SKU_LABEL_PAYLOAD", "sku_code and qr_payload are required.")
+			return
+		}
+		printRequest.Kind = "sku_qr"
+		printRequest.Items = []printing.Item{{
+			SKUID: payload.SKUID, SKUCode: strings.TrimSpace(payload.SKUCode),
+			QRCodeContent: strings.TrimSpace(payload.QRPayload), Quantity: request.Copies,
+		}}
+	case "custom_label":
+		var payload directCustomLabelPayload
+		if err := json.Unmarshal(request.PayloadSnapshot, &payload); err != nil {
+			writeDirectPrintError(c, http.StatusBadRequest, "INVALID_CUSTOM_LABEL_PAYLOAD", "Invalid custom label payload.")
+			return
+		}
+		text := strings.TrimSpace(firstNonEmpty(payload.LabelContent, payload.Text))
+		qrPayload := strings.TrimSpace(firstNonEmpty(payload.QRPayload, text))
+		if text == "" || len([]rune(text)) > 2000 || qrPayload == "" {
+			writeDirectPrintError(c, http.StatusBadRequest, "INVALID_CUSTOM_LABEL_PAYLOAD", "label_content and qr_payload are required.")
+			return
+		}
+		printRequest.Kind = "custom_label"
+		printRequest.Text = text
+		printRequest.QRCodeContent = qrPayload
+		printRequest.Items = []printing.Item{{SKUCode: text, QRCodeContent: qrPayload, Quantity: request.Copies}}
+	case "manufacturer_box_mark":
+		var payload directBoxMarkPayload
+		if err := json.Unmarshal(request.PayloadSnapshot, &payload); err != nil || payload.DocumentVersion != "manufacturer_box_mark.v1" || len(payload.Items) == 0 {
+			writeDirectPrintError(c, http.StatusBadRequest, "INVALID_BOX_MARK_PAYLOAD", "manufacturer_box_mark.v1 and at least one item are required.")
+			return
+		}
+		printRequest.Kind = "manufacturer_box_mark"
+		printRequest.BoxMarks = payload.Items
+		if code := validateManufacturerBoxMarkRequest(printRequest, service.Templates(), availability); code != "" {
+			writeDirectPrintError(c, http.StatusConflict, code, "The box mark template or printer is unavailable.")
+			return
+		}
+	default:
+		writeDirectPrintError(c, http.StatusBadRequest, "UNSUPPORTED_PRINT_JOB_TYPE", "Unsupported direct print job type.")
+		return
+	}
+
+	job, duplicate, err := service.Create(printRequest)
+	if err != nil {
+		if errors.Is(err, printing.ErrIdempotencyConflict) {
+			writeDirectPrintError(c, http.StatusConflict, "IDEMPOTENCY_CONFLICT", err.Error())
+			return
+		}
+		writeDirectPrintError(c, http.StatusInternalServerError, "PRINT_JOB_PERSIST_FAILED", "Failed to save print job.")
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"status": "accepted", "duplicate": duplicate, "job": job})
+}
+
+func writeDirectPrintError(c *gin.Context, status int, code, message string) {
+	c.JSON(status, gin.H{"status": "error", "code": code, "error": message, "message": message})
+}
+
+func createManualTextJob(c *gin.Context, service *printing.Service, availability *printerAvailability) {
 	var request webLabelPrintRequest
 	if err := c.ShouldBindJSON(&request); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_LABEL_REQUEST", "message": "标签打印参数无效。"})
@@ -109,10 +292,6 @@ func createManualTextJob(c *gin.Context, service *printing.Service, availability
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": "PRINT_JOB_PERSIST_FAILED", "message": "打印历史保存失败。"})
-		return
-	}
-	if compatibilityResponse {
-		c.JSON(http.StatusAccepted, gin.H{"code": 0, "msg": "打印任务已进入本地队列", "data": job})
 		return
 	}
 	c.JSON(http.StatusAccepted, gin.H{"status": "accepted", "duplicate": duplicate, "job": job})

@@ -7,9 +7,13 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Printing;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Documents;
+using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using Fscm.Edge.Win.Models;
@@ -32,17 +36,30 @@ namespace Fscm.Edge.Win;
     Justification = "The WPF window owns the tray icon and runtime manager; both are disposed during explicit tray exit.")]
 public partial class MainWindow : Window
 {
+    private const int ProductPageSize = 20;
+    private const string CopyCodeTargetTag = "CopyCodeTarget";
     private readonly EdgeRuntimeManager _runtime = new();
     private readonly AppUpdateService _updates = new();
+    private readonly StartupService _startup = new();
     private readonly LocalPrinterService _printerService = new();
     private readonly DispatcherTimer _timer;
+    private readonly SemaphoreSlim _refreshGate = new(1, 1);
     private readonly FormsNotifyIcon _notifyIcon;
     private readonly List<EdgePrintJob> _allPrintJobs = [];
     private IReadOnlyList<PrintTemplateProfile> _printTemplates = [];
     private IReadOnlyList<PrintTemplateProfile> _labelTemplates = [];
     private IReadOnlyList<PrintTemplateProfile> _availableSkuPrintTemplates = [];
+    private IReadOnlyList<LocalPrinter> _localPrinters = [];
     private IReadOnlyList<SkuSummary> _productSkus = [];
+    private IReadOnlyList<BoxLabelSummary> _boxLabels = [];
+    private int _boxLabelPage = 1;
+    private long _boxLabelTotal;
     private string _productQueryMode = "sku";
+    private int _productPage = 1;
+    private long _productTotal;
+    private int _productCurrentCount;
+    private uint? _selectedProductId;
+    private string _selectedProductCode = string.Empty;
     private string? _editingPrintTemplateId;
     private bool _loadingPrintTemplate;
     private bool _loadingLabelTemplate;
@@ -52,7 +69,7 @@ public partial class MainWindow : Window
     [
         new() { Id = "label_60x40mm", Name = "标签 60 x 40 mm", WidthMillimeters = 60, HeightMillimeters = 40 },
         new() { Id = "shipping_100x150mm", Name = "面单 100 x 150 mm", WidthMillimeters = 100, HeightMillimeters = 150 },
-        new() { Id = "label_150x100mm", Name = "标签 15 x 10 cm", WidthMillimeters = 150, HeightMillimeters = 100 },
+        new() { Id = "label_100x150mm", Name = "标签 10 x 15 cm（四联）", WidthMillimeters = 100, HeightMillimeters = 150 },
         new() { Id = "poster_600x400mm", Name = "大幅 60 x 40 cm", WidthMillimeters = 600, HeightMillimeters = 400 },
         new() { Id = "a4", Name = "A4 210 x 297 mm", WidthMillimeters = 210, HeightMillimeters = 297 },
         new() { Id = "custom", Name = "自定义尺寸" },
@@ -64,9 +81,9 @@ public partial class MainWindow : Window
     private bool _allowExit;
     private bool _isShuttingDown;
     private bool _hasShownTrayMessage;
-    private bool _refreshing;
     private bool _checkingForUpdates;
     private bool _updatePromptShown;
+    private bool _loadingStartupSetting;
 
     public MainWindow()
     {
@@ -83,6 +100,7 @@ public partial class MainWindow : Window
             RefreshPrinters();
             LoadSettingsIntoForm();
             LoadManifest();
+            LoadStartupSetting();
             await StartRuntimeAsync();
             await RefreshAllAsync();
             _timer.Start();
@@ -187,7 +205,80 @@ public partial class MainWindow : Window
 
     private async void OnRefreshClick(object sender, RoutedEventArgs e)
     {
-        await RefreshAllAsync(forceRemoteCheck: true);
+        await RefreshAllAsync(forceRemoteCheck: true, showProgress: true);
+    }
+
+    private void LoadStartupSetting()
+    {
+        _loadingStartupSetting = true;
+        try
+        {
+            LaunchAtSignInCheckBox.IsChecked = _startup.IsEnabled();
+            ApplicationControlStatusText.Text = LaunchAtSignInCheckBox.IsChecked == true
+                ? "已设置为登录 Windows 时启动 FSCM Edge。"
+                : "未设置开机启动。";
+        }
+        catch (Exception ex)
+        {
+            LaunchAtSignInCheckBox.IsChecked = false;
+            ApplicationControlStatusText.Text = $"无法读取开机启动设置：{ex.Message}";
+        }
+        finally
+        {
+            _loadingStartupSetting = false;
+        }
+    }
+
+    private void OnLaunchAtSignInChanged(object sender, RoutedEventArgs e)
+    {
+        if (_loadingStartupSetting)
+        {
+            return;
+        }
+
+        try
+        {
+            bool enabled = LaunchAtSignInCheckBox.IsChecked == true;
+            _startup.SetEnabled(enabled);
+            ApplicationControlStatusText.Text = enabled
+                ? "已设置为登录 Windows 时启动 FSCM Edge。"
+                : "已关闭开机启动。";
+        }
+        catch (Exception ex)
+        {
+            _loadingStartupSetting = true;
+            LaunchAtSignInCheckBox.IsChecked = LaunchAtSignInCheckBox.IsChecked != true;
+            _loadingStartupSetting = false;
+            ApplicationControlStatusText.Text = $"无法保存开机启动设置：{ex.Message}";
+            MessageBox.Show(ex.Message, "FSCM Edge", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private void OnRestartApplicationClick(object sender, RoutedEventArgs e)
+    {
+        if (MessageBox.Show(
+                "FSCM Edge 将停止本地边缘服务并重新启动。",
+                "重启应用",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Question) != MessageBoxResult.Yes)
+        {
+            return;
+        }
+
+        try
+        {
+            string executablePath = Environment.ProcessPath ??
+                Process.GetCurrentProcess().MainModule?.FileName ??
+                throw new InvalidOperationException("Unable to locate the FSCM Edge executable.");
+            _updates.StartApplicationAfterExit(executablePath, Process.GetCurrentProcess().Id);
+            _allowExit = true;
+            Close();
+        }
+        catch (Exception ex)
+        {
+            ApplicationControlStatusText.Text = $"无法重启应用：{ex.Message}";
+            MessageBox.Show(ex.Message, "FSCM Edge", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
     }
 
     private async void OnCheckForUpdatesClick(object sender, RoutedEventArgs e)
@@ -449,10 +540,12 @@ public partial class MainWindow : Window
         MessageBox.Show("失败任务重试入口已预留，接入真实打印执行后会调用本地 edge 重试接口。", "FSCM Edge");
     }
 
-    private void OnRefreshPrintersClick(object sender, RoutedEventArgs e)
+    private async void OnRefreshPrintersClick(object sender, RoutedEventArgs e)
     {
         var selectedPrinter = (PrinterComboBox.SelectedItem as LocalPrinter)?.Name;
-        RefreshPrinters(selectedPrinter);
+        var printers = _printerService.GetPrinters();
+        ApplyPrinterSnapshot(printers, selectedPrinter);
+        await _runtime.SyncPrintInventoryAsync(printers.Where(printer => printer.IsAvailable).Select(printer => printer.Name));
     }
 
     private async void OnPrintLabelClick(object sender, RoutedEventArgs e)
@@ -477,7 +570,8 @@ public partial class MainWindow : Window
         }
 
         NormalizeTemplateCompatibility(template);
-        var labelPrefix = LabelPrefixTextBox.Text.Trim();
+        bool locationLayout = template.LayoutStyle == PrintTemplatePolicy.LocationCodeLayoutStyle;
+        var labelPrefix = locationLayout ? string.Empty : LabelPrefixTextBox.Text.Trim();
         if (labelPrefix.Length > 20)
         {
             LabelStatusText.Text = "标签二维码前缀不能超过 20 个字符。";
@@ -492,6 +586,8 @@ public partial class MainWindow : Window
         settings.PrintMode = template.Mode;
         settings.PrintCopies = template.Copies;
         settings.PrintOffsetXMillimeters = template.OffsetXMillimeters;
+        settings.PrintOffsetYMillimeters = template.OffsetYMillimeters;
+        settings.PrintSafetyInsetMillimeters = template.SafetyInsetMillimeters;
         settings.SkuQrPrefix = template.SkuQrPrefix;
         var effectivePrinter = string.IsNullOrWhiteSpace(template.Printer) ? ResolveEffectivePrinter(settings) : template.Printer.Trim();
         if (string.IsNullOrWhiteSpace(effectivePrinter))
@@ -500,8 +596,17 @@ public partial class MainWindow : Window
             return;
         }
 
+        var printerStatus = _printerService.GetPrinter(effectivePrinter);
+        if (printerStatus is not { IsAvailable: true })
+        {
+            LabelStatusText.Text = printerStatus is null
+                ? $"打印机 {effectivePrinter} 不存在或无法读取状态。"
+                : $"打印机 {effectivePrinter} 当前不可打印：{printerStatus.StatusText}。";
+            return;
+        }
+
         settings.DefaultPrinter = effectivePrinter;
-        if (!string.Equals(template.LabelQrPrefix, labelPrefix, StringComparison.Ordinal))
+        if (!locationLayout && !string.Equals(template.LabelQrPrefix, labelPrefix, StringComparison.Ordinal))
         {
             template.LabelQrPrefix = labelPrefix;
             _runtime.SavePrintTemplates(_printTemplates);
@@ -511,12 +616,53 @@ public partial class MainWindow : Window
         LabelStatusText.Text = $"正在发送到 {effectivePrinter}...";
         try
         {
-            await RunOnStaAsync(() => new QrPrintService().PrintLabel(settings, labelPrefix + text, text, template.MaxDisplayLength));
-            LabelStatusText.Text = $"标签已发送，模板：{template.Name}。";
+            await RunOnStaAsync(() => new QrPrintService().PrintLabel(settings, labelPrefix + text, text, template));
+            LabelStatusText.Text = $"标签已发送，模板：{template.DisplayName}。";
         }
         catch (Exception ex)
         {
             LabelStatusText.Text = $"标签打印失败：{ex.Message}";
+        }
+    }
+
+    private void OnPreviewLabelClick(object sender, RoutedEventArgs e)
+    {
+        if (LabelTemplateComboBox.SelectedItem is not PrintTemplateProfile template)
+        {
+            LabelStatusText.Text = "请先选择标签模板。";
+            return;
+        }
+
+        ShowLabelTemplatePreview(template, LabelTextBox.Text.Trim());
+    }
+
+    private void ShowLabelTemplatePreview(PrintTemplateProfile template, string text)
+    {
+        NormalizeTemplateCompatibility(template);
+        text = string.IsNullOrWhiteSpace(text)
+            ? template.LayoutStyle == PrintTemplatePolicy.LocationCodeLayoutStyle ? "A-01-B-02-C3" : "SKU-001"
+            : text;
+        EdgeSettings settings = _runtime.LoadEdgeSettings();
+        ApplyTemplateToSettings(settings, template);
+        settings.DefaultPrinter = string.IsNullOrWhiteSpace(template.Printer)
+            ? ResolveEffectivePrinter(settings)
+            : template.Printer.Trim();
+        try
+        {
+            PrintPreviewWindow preview = new(
+                settings,
+                template,
+                template.LayoutStyle == PrintTemplatePolicy.LocationCodeLayoutStyle ? text : LabelPrefixTextBox.Text.Trim() + text,
+                text)
+            {
+                Owner = this,
+            };
+            preview.ShowDialog();
+            LabelStatusText.Text = $"已预览模板：{template.DisplayName}。";
+        }
+        catch (Exception ex)
+        {
+            LabelStatusText.Text = $"模板预览失败：{ex.Message}";
         }
     }
 
@@ -573,19 +719,59 @@ public partial class MainWindow : Window
             return;
         }
 
+        var printerStatus = _printerService.GetPrinter(settings.DefaultPrinter);
+        if (printerStatus is not { IsAvailable: true })
+        {
+            ShowPrintValidation(printerStatus is null
+                ? $"打印机 {settings.DefaultPrinter} 不存在或无法读取状态。"
+                : $"打印机 {settings.DefaultPrinter} 当前不可打印：{printerStatus.StatusText}。");
+            return;
+        }
+
         try
         {
             _runtime.SaveEdgeSettings(settings);
 
-            PrintPreviewWindow preview = new(settings) { Owner = this };
-            if (preview.ShowDialog() != true)
+            PrintTemplateProfile template = BuildEditedPrintTemplate(settings);
+            if (string.Equals(template.Type, "manufacturer_box_mark", StringComparison.OrdinalIgnoreCase))
+            {
+                ManufacturerBoxMark sample = ManufacturerBoxMarkPrintService.CreatePreviewSample();
+                ManufacturerBoxMarkPrintService boxMarkPrinter = new();
+                FixedDocument document = boxMarkPrinter.CreatePreviewDocument(settings, [sample], out string diagnostic);
+                PrintPreviewWindow preview = new(
+                    document,
+                    "厂家箱唛打印预览",
+                    $"{template.DisplayName} · 100 x 150 mm · 1 BOX + 2 SKU 二维码",
+                    diagnostic,
+                    showConfirmButton: true,
+                    confirmButtonText: "打印测试箱唛")
+                {
+                    Owner = this,
+                };
+                if (preview.ShowDialog() != true)
+                {
+                    PrintConfigStatusText.Text = "已取消测试打印，可返回修改厂家箱唛模板。";
+                    return;
+                }
+
+                boxMarkPrinter.Print(settings, new EdgePrintJob
+                {
+                    Id = "template-preview",
+                    Copies = settings.PrintCopies,
+                    BoxMarks = [sample],
+                });
+                PrintConfigStatusText.Text = $"厂家箱唛测试页已发送至 {settings.DefaultPrinter}。";
+                return;
+            }
+
+            PrintPreviewWindow labelPreview = new(settings, template, settings.SkuQrPrefix + "SKU-001", "SKU-001") { Owner = this };
+            if (labelPreview.ShowDialog() != true)
             {
                 PrintConfigStatusText.Text = "已取消打印，可返回修改纸张尺寸或打印机配置。";
                 return;
             }
-
-            _printerService.PrintTestPage(settings);
-            PrintConfigStatusText.Text = $"测试任务已发送至 {settings.DefaultPrinter}。请检查打印机队列和出纸效果。";
+            new QrPrintService().PrintLabel(settings, settings.SkuQrPrefix + "SKU-001", "SKU-001", template);
+            PrintConfigStatusText.Text = $"模板测试标签已发送至 {settings.DefaultPrinter}。";
         }
         catch (Exception ex)
         {
@@ -638,6 +824,9 @@ public partial class MainWindow : Window
     private async Task StartRuntimeAsync()
     {
         SetBadge(HeaderStatusPill, HeaderStatusText, "启动中", BadgeKind.Warning);
+        HeaderStatusDot.Fill = HeaderStatusText.Foreground;
+        HeaderStatusDetailText.Foreground = HeaderStatusText.Foreground;
+        HeaderStatusDetailText.Text = "正在启动本地服务";
         var status = await _runtime.StartAsync();
         ApplyRuntimeStatus(status);
         if (status.IsHealthy)
@@ -647,16 +836,27 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task RefreshAllAsync(bool forceRemoteCheck = false)
+    private async Task<bool> RefreshAllAsync(bool forceRemoteCheck = false, bool showProgress = false)
     {
-        if (_refreshing)
+        if (showProgress)
         {
-            return;
+            SetRefreshButtonState(isBusy: true, "等待刷新");
+            await _refreshGate.WaitAsync();
+        }
+        else if (!await _refreshGate.WaitAsync(0))
+        {
+            return false;
         }
 
-        _refreshing = true;
+        var succeeded = false;
+
         try
         {
+            if (showProgress)
+            {
+                SetRefreshButtonState(isBusy: true, "刷新中");
+            }
+
             if (!_settingsFormLoaded)
             {
                 LoadSettingsIntoForm();
@@ -680,16 +880,106 @@ public partial class MainWindow : Window
             }
 
             ApplyRegistrationStatus(_lastRegistration);
-            var availablePrinters = _printerService.GetPrinters();
-            await _runtime.SyncPrintInventoryAsync(availablePrinters.Select(printer => printer.Name));
-            RefreshProductPrintTemplates();
+            var printers = _printerService.GetPrinters();
+            ApplyPrinterSnapshot(printers);
+            await _runtime.SyncPrintInventoryAsync(printers.Where(printer => printer.IsAvailable).Select(printer => printer.Name));
             await RefreshTerminalsAsync();
             await RefreshPrintJobsAsync();
             await RefreshCacheStatusAsync();
+            succeeded = true;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            HeaderStatusDetailText.Text = $"状态刷新失败 · {DateTimeOffset.Now:HH:mm:ss}";
+            RefreshButton.ToolTip = ex.Message;
+            return false;
         }
         finally
         {
-            _refreshing = false;
+            _refreshGate.Release();
+            if (showProgress)
+            {
+                SetRefreshButtonState(isBusy: false, succeeded ? "已刷新" : "刷新失败");
+                _ = RestoreRefreshButtonLabelAsync();
+            }
+        }
+    }
+
+    private void OnDetectPrintPaperClick(object sender, RoutedEventArgs e)
+    {
+        if (!TryReadPrintSettings(out EdgeSettings settings))
+        {
+            return;
+        }
+
+        try
+        {
+            using LocalPrintServer server = new();
+            using PrintQueue queue = server.GetPrintQueue(settings.DefaultPrinter);
+            LocalPrinterService.EnsureQueueAvailable(queue);
+            PreparedPrintTarget target = PrintTargetService.Prepare(queue, settings);
+            PrintConfigStatusText.Text = target.Diagnostic;
+        }
+        catch (Exception ex)
+        {
+            PrintConfigStatusText.Text = $"纸张检测失败：{ex.Message}";
+            MessageBox.Show(ex.Message, "纸张检测失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private void OnOpenPrinterPreferencesClick(object sender, RoutedEventArgs e)
+    {
+        if (PrinterComboBox.SelectedItem is not LocalPrinter printer)
+        {
+            ShowPrintValidation("请先选择打印机。");
+            return;
+        }
+
+        ProcessStartInfo startInfo = new("rundll32.exe")
+        {
+            UseShellExecute = true,
+        };
+        startInfo.ArgumentList.Add("printui.dll,PrintUIEntry");
+        startInfo.ArgumentList.Add("/e");
+        startInfo.ArgumentList.Add("/n");
+        startInfo.ArgumentList.Add(printer.Name);
+        try
+        {
+            using Process? process = Process.Start(startInfo);
+            PrintConfigStatusText.Text = $"已打开 {printer.Name} 的打印首选项；关闭窗口后点击“检测纸张”刷新。";
+        }
+        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException)
+        {
+            ShowPrintValidation($"无法打开打印首选项：{ex.Message}");
+        }
+    }
+
+    private void SetRefreshButtonState(bool isBusy, string label)
+    {
+        RefreshButton.IsEnabled = !isBusy;
+        RefreshButtonText.Text = label;
+        if (isBusy)
+        {
+            var animation = new DoubleAnimation(0, 360, TimeSpan.FromMilliseconds(800))
+            {
+                RepeatBehavior = RepeatBehavior.Forever,
+            };
+            RefreshIconRotation.BeginAnimation(RotateTransform.AngleProperty, animation);
+            return;
+        }
+
+        RefreshIconRotation.BeginAnimation(RotateTransform.AngleProperty, null);
+        RefreshIconRotation.Angle = 0;
+    }
+
+    private async Task RestoreRefreshButtonLabelAsync()
+    {
+        await Task.Delay(TimeSpan.FromSeconds(1.5));
+        if (RefreshButton.IsEnabled && RefreshButtonText.Text is "已刷新" or "刷新失败")
+        {
+            RefreshButtonText.Text = "刷新状态";
+            RefreshButton.ToolTip = "重新检测运行状态";
         }
     }
 
@@ -739,12 +1029,6 @@ public partial class MainWindow : Window
                 .ToList();
             foreach (var job in queued)
             {
-                var started = await _runtime.UpdatePrintJobStatusAsync(job.Id, "printing");
-                if (started is null)
-                {
-                    continue;
-                }
-
                 try
                 {
                     var template = _printTemplates.FirstOrDefault(item =>
@@ -763,6 +1047,23 @@ public partial class MainWindow : Window
                         throw new InvalidOperationException("打印模板、打印任务和默认配置中都没有可用打印机。");
                     }
 
+                    var printerStatus = _printerService.GetPrinter(settings.DefaultPrinter);
+                    if (printerStatus is null)
+                    {
+                        throw new InvalidOperationException($"打印机 {settings.DefaultPrinter} 不存在或无法读取状态。");
+                    }
+
+                    if (!printerStatus.IsAvailable)
+                    {
+                        throw new InvalidOperationException($"打印机 {settings.DefaultPrinter} 当前不可打印：{printerStatus.StatusText}。");
+                    }
+
+                    var started = await _runtime.UpdatePrintJobStatusAsync(job.Id, "printing");
+                    if (started is null)
+                    {
+                        continue;
+                    }
+
                     settings.PrintTemplate = template.Id;
                     settings.PrintWidthMillimeters = template.WidthMillimeters;
                     settings.PrintHeightMillimeters = template.HeightMillimeters;
@@ -770,12 +1071,15 @@ public partial class MainWindow : Window
                     settings.PrintMode = template.Mode;
                     settings.PrintCopies = Math.Max(1, template.Copies);
                     settings.PrintOffsetXMillimeters = template.OffsetXMillimeters;
+                    settings.PrintOffsetYMillimeters = template.OffsetYMillimeters;
+                    settings.PrintSafetyInsetMillimeters = template.SafetyInsetMillimeters;
                     settings.SkuQrPrefix = string.IsNullOrWhiteSpace(template.SkuQrPrefix) ? settings.SkuQrPrefix : template.SkuQrPrefix;
 
                     await RunOnStaAsync(() =>
                     {
                         if (string.Equals(started.Kind, "manufacturer_box_mark", StringComparison.OrdinalIgnoreCase))
                         {
+                            settings.PrintCopies = Math.Max(1, started.Copies);
                             new ManufacturerBoxMarkPrintService().Print(settings, started);
                         }
                         else if (string.Equals(started.Kind, "manual_text", StringComparison.OrdinalIgnoreCase))
@@ -786,11 +1090,15 @@ public partial class MainWindow : Window
                             }
 
                             settings.PrintCopies = Math.Max(1, started.Copies);
-                            new QrPrintService().PrintLabel(settings, started.Text, started.Text, template.MaxDisplayLength);
+                            new QrPrintService().PrintLabel(
+                                settings,
+                                string.IsNullOrWhiteSpace(started.QrCodeContent) ? started.Text : started.QrCodeContent,
+                                started.Text,
+                                template);
                         }
                         else
                         {
-                            new QrPrintService().Print(settings, started);
+                            new QrPrintService().Print(settings, started, template);
                         }
                     });
                     await _runtime.UpdatePrintJobStatusAsync(job.Id, "completed");
@@ -864,6 +1172,7 @@ public partial class MainWindow : Window
         {
             NormalizeTemplateCompatibility(template);
         }
+        UpdateTemplatePrinterStatuses();
 
         _loadingPrintTemplate = true;
         PrintTemplatesList.ItemsSource = _printTemplates;
@@ -876,7 +1185,8 @@ public partial class MainWindow : Window
 
     private void LoadLabelTemplates()
     {
-        _labelTemplates = _printTemplates.Where(template => string.Equals(template.Type, "label", StringComparison.OrdinalIgnoreCase)).ToList();
+        var settings = _runtime.LoadEdgeSettings();
+        _labelTemplates = PrintTemplatePolicy.OrderLabelTemplates(_printTemplates, settings.PrintTemplate);
         if (_labelTemplates.Count == 0)
         {
             _labelTemplates =
@@ -884,6 +1194,7 @@ public partial class MainWindow : Window
                 new PrintTemplateProfile
                 {
                     Id = "label_60x40mm",
+                    TemplateNumber = "T01",
                     Name = "标签 60 × 40 mm",
                     Type = "label",
                     WidthMillimeters = 60,
@@ -897,10 +1208,30 @@ public partial class MainWindow : Window
             ];
         }
 
+        foreach (PrintTemplateProfile template in _labelTemplates)
+        {
+            UpdateTemplatePrinterStatus(template, settings);
+        }
+
+        var availablePrinters = AvailablePrinterNames();
+        var automaticallySelectable = _labelTemplates.Where(template =>
+        {
+            var printer = string.IsNullOrWhiteSpace(template.Printer)
+                ? ResolveEffectivePrinter(settings)
+                : template.Printer.Trim();
+            return !string.IsNullOrWhiteSpace(printer) && availablePrinters.Contains(printer);
+        });
         _loadingLabelTemplate = true;
+        LabelTemplateTiles.ItemsSource = _labelTemplates;
         LabelTemplateComboBox.ItemsSource = _labelTemplates;
-        LabelTemplateComboBox.SelectedItem = _labelTemplates.FirstOrDefault(template => template.Id == "label_60x40mm")
-            ?? _labelTemplates.FirstOrDefault();
+        LabelTemplateComboBox.SelectedItem = PrintTemplatePolicy.SelectAutomaticLabelTemplate(
+            automaticallySelectable,
+            explicitTemplateId: null,
+            defaultTemplateId: settings.PrintTemplate)
+            ?? PrintTemplatePolicy.SelectAutomaticLabelTemplate(
+                _labelTemplates,
+                explicitTemplateId: null,
+                defaultTemplateId: settings.PrintTemplate);
         _loadingLabelTemplate = false;
         ApplyLabelTemplate(LabelTemplateComboBox.SelectedItem as PrintTemplateProfile);
         RefreshProductPrintTemplates();
@@ -908,28 +1239,96 @@ public partial class MainWindow : Window
 
     private void RefreshProductPrintTemplates()
     {
-        var availablePrinters = _printerService.GetPrinters()
-            .Select(printer => printer.Name)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        _availableSkuPrintTemplates = _printTemplates
-            .Where(template => string.Equals(template.Type, "label", StringComparison.OrdinalIgnoreCase))
-            .Where(template => !string.IsNullOrWhiteSpace(template.Printer) && availablePrinters.Contains(template.Printer.Trim()))
-            .ToList();
+        UpdateTemplatePrinterStatuses();
+        PrintTemplatesList.Items.Refresh();
+        var availablePrinters = AvailablePrinterNames();
+        _availableSkuPrintTemplates = PrintTemplatePolicy.OrderLabelTemplates(
+            _printTemplates
+                .Where(template => !string.IsNullOrWhiteSpace(template.Printer) && availablePrinters.Contains(template.Printer.Trim())),
+            _runtime.LoadEdgeSettings().PrintTemplate);
 
         var currentId = (ProductPrintTemplateComboBox.SelectedItem as PrintTemplateProfile)?.Id;
         var settings = _runtime.LoadEdgeSettings();
-        var selected = _availableSkuPrintTemplates.FirstOrDefault(template => string.Equals(template.Id, currentId, StringComparison.OrdinalIgnoreCase))
-            ?? _availableSkuPrintTemplates.FirstOrDefault(template => string.Equals(template.Id, "label_60x40mm", StringComparison.OrdinalIgnoreCase))
-            ?? _availableSkuPrintTemplates.FirstOrDefault(template => string.Equals(template.Id, settings.PrintTemplate, StringComparison.OrdinalIgnoreCase))
-            ?? _availableSkuPrintTemplates.FirstOrDefault();
+        var selected = PrintTemplatePolicy.SelectAutomaticLabelTemplate(
+            _availableSkuPrintTemplates,
+            currentId,
+            settings.PrintTemplate);
 
         ProductPrintTemplateComboBox.ItemsSource = _availableSkuPrintTemplates;
         ProductPrintTemplateComboBox.SelectedItem = selected;
         ProductPrintTemplateText.Text = selected is null
             ? "没有可用标签模板"
-            : $"标签模板：{selected.Name}";
+            : $"标签模板：{selected.DisplayName}";
         ProductPrintButton.IsEnabled = selected is not null;
         ChangeProductPrintTemplateButton.IsEnabled = _availableSkuPrintTemplates.Count > 1;
+        RefreshBoxLabelPrintTemplates(availablePrinters);
+    }
+
+    private void RefreshBoxLabelPrintTemplates(IReadOnlySet<string>? availablePrinters = null)
+    {
+        availablePrinters ??= AvailablePrinterNames();
+        var currentId = (BoxLabelPrintTemplateComboBox.SelectedItem as PrintTemplateProfile)?.Id;
+        IReadOnlyList<PrintTemplateProfile> templates = PrintTemplatePolicy.OrderManufacturerBoxMarkTemplates(_printTemplates, availablePrinters);
+        BoxLabelPrintTemplateComboBox.ItemsSource = templates;
+        BoxLabelPrintTemplateComboBox.SelectedItem = templates.FirstOrDefault(template => string.Equals(template.Id, currentId, StringComparison.OrdinalIgnoreCase)) ?? templates.FirstOrDefault();
+        UpdateBoxLabelTemplateSelectionState();
+    }
+
+    private void OnBoxLabelPrintTemplateSelected(object sender, SelectionChangedEventArgs e)
+    {
+        UpdateBoxLabelTemplateSelectionState();
+    }
+
+    private void UpdateBoxLabelTemplateSelectionState()
+    {
+        if (BoxLabelPrintTemplateComboBox.SelectedItem is not PrintTemplateProfile template)
+        {
+            BoxLabelTemplateStatusText.Text = "没有厂家箱唛模板";
+            BoxLabelPrintButton.IsEnabled = false;
+            BoxLabelPreviewButton.IsEnabled = false;
+            BoxLabelEditTemplateButton.IsEnabled = false;
+            return;
+        }
+
+        BoxLabelPreviewButton.IsEnabled = true;
+        BoxLabelEditTemplateButton.IsEnabled = true;
+        if (string.IsNullOrWhiteSpace(template.Printer))
+        {
+            BoxLabelTemplateStatusText.Text = "未配置打印机，可预览或编辑";
+            BoxLabelPrintButton.IsEnabled = false;
+            return;
+        }
+
+        LocalPrinter? printer = FindPrinter(template.Printer);
+        bool available = printer is { IsAvailable: true };
+        BoxLabelTemplateStatusText.Text = available
+            ? $"可打印 · {template.Printer}"
+            : $"不可打印 · {template.Printer} · {printer?.StatusText ?? "状态未知"}";
+        BoxLabelPrintButton.IsEnabled = available;
+    }
+
+    private void OnEditSelectedBoxMarkTemplateClick(object sender, RoutedEventArgs e)
+    {
+        if (BoxLabelPrintTemplateComboBox.SelectedItem is not PrintTemplateProfile template)
+        {
+            return;
+        }
+
+        ListBoxItem? printConfigItem = NavigationList.Items
+            .OfType<ListBoxItem>()
+            .FirstOrDefault(item => string.Equals(item.Tag?.ToString(), "PrintConfig", StringComparison.Ordinal));
+        if (printConfigItem is not null)
+        {
+            NavigationList.SelectedItem = printConfigItem;
+        }
+        else
+        {
+            SetPage("PrintConfig");
+        }
+
+        PrintTemplatesList.SelectedItem = template;
+        PrintTemplatesList.ScrollIntoView(template);
+        ShowPrintTemplateEditor(template);
     }
 
     private void OnChangeProductPrintTemplateClick(object sender, RoutedEventArgs e)
@@ -952,7 +1351,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        ProductPrintTemplateText.Text = $"标签模板：{template.Name}";
+        ProductPrintTemplateText.Text = $"标签模板：{template.DisplayName}";
         ProductPrintTemplateComboBox.Visibility = Visibility.Collapsed;
         ProductPrintTemplateText.Visibility = Visibility.Visible;
     }
@@ -967,6 +1366,13 @@ public partial class MainWindow : Window
 
     private void ApplyLabelTemplate(PrintTemplateProfile? template)
     {
+        foreach (PrintTemplateProfile item in _labelTemplates)
+        {
+            item.IsSelectedForLabelPrint = template is not null &&
+                string.Equals(item.Id, template.Id, StringComparison.OrdinalIgnoreCase);
+        }
+        LabelTemplateTiles.Items.Refresh();
+
         if (template is null)
         {
             LabelTemplateSummaryText.Text = "未选择模板";
@@ -975,18 +1381,41 @@ public partial class MainWindow : Window
             LabelPaperText.Text = "-";
             LabelOrientationText.Text = "-";
             LabelPrefixTextBox.Text = string.Empty;
+            LabelPrefixTextBox.IsEnabled = true;
+            LabelPrintButton.IsEnabled = false;
+            LabelPrintButton.ToolTip = "请先选择打印模板";
             return;
         }
 
         NormalizeTemplateCompatibility(template);
         var settings = _runtime.LoadEdgeSettings();
         var printer = string.IsNullOrWhiteSpace(template.Printer) ? ResolveEffectivePrinter(settings) : template.Printer;
-        LabelTemplateSummaryText.Text = template.Name;
-        LabelModeText.Text = $"{template.WidthMillimeters:0.##} × {template.HeightMillimeters:0.##} mm · {GetOrientationText(template.Orientation)}";
-        LabelPrinterText.Text = string.IsNullOrWhiteSpace(printer) ? "默认打印机：未配置" : $"当前打印机：{printer}";
+        var printerStatus = FindPrinter(printer);
+        LabelTemplateSummaryText.Text = template.DisplayName;
+        string layoutText = GetLayoutStyleText(template.LayoutStyle);
+        LabelModeText.Text = $"{template.WidthMillimeters:0.##} × {template.HeightMillimeters:0.##} mm · {GetOrientationText(template.Orientation)} · {layoutText}";
+        LabelPrinterText.Text = string.IsNullOrWhiteSpace(printer)
+            ? "默认打印机：未配置"
+            : $"当前打印机：{printer} · {printerStatus?.StatusText ?? "状态未知"}";
         LabelPaperText.Text = $"{template.WidthMillimeters:0.##} × {template.HeightMillimeters:0.##} mm";
         LabelOrientationText.Text = GetOrientationText(template.Orientation);
         LabelPrefixTextBox.Text = template.LabelQrPrefix;
+        bool locationLayout = template.LayoutStyle == PrintTemplatePolicy.LocationCodeLayoutStyle;
+        LabelPrefixTextBox.IsEnabled = !locationLayout;
+        if (locationLayout)
+        {
+            LabelPrefixTextBox.Text = string.Empty;
+        }
+        LabelPrintButton.IsEnabled = printerStatus is { IsAvailable: true };
+        LabelPrintButton.ToolTip = printerStatus is { IsAvailable: true }
+            ? "打印当前标签"
+            : $"打印机当前不可打印：{printerStatus?.StatusText ?? "状态未知"}";
+        if (printerStatus is not { IsAvailable: true })
+        {
+            LabelStatusText.Text = string.IsNullOrWhiteSpace(printer)
+                ? "尚未配置打印机。"
+                : $"打印机 {printer} 当前不可打印：{printerStatus?.StatusText ?? "状态未知"}。";
+        }
     }
 
     private static string GetOrientationText(string orientation)
@@ -999,15 +1428,110 @@ public partial class MainWindow : Window
         template.Type = NormalizeTemplateType(template);
         template.MaxDisplayLength = template.MaxDisplayLength > 0 ? template.MaxDisplayLength : 16;
         template.Copies = Math.Clamp(template.Copies, 1, 99);
-        template.Mode = template.Mode is "actual_size" or "fill" ? template.Mode : "fit";
-        template.Orientation = string.Equals(template.Orientation, "landscape", StringComparison.OrdinalIgnoreCase) ? "landscape" : "portrait";
+        template.Mode = "fit";
+        template.OffsetXMillimeters = Math.Clamp(template.OffsetXMillimeters, -5, 5);
+        template.OffsetYMillimeters = Math.Clamp(template.OffsetYMillimeters, -5, 5);
+        template.SafetyInsetMillimeters = template.SafetyInsetMillimeters > 0
+            ? Math.Clamp(template.SafetyInsetMillimeters, 0.5, 5)
+            : PrintPageContextFactory.DefaultSafetyInsetMillimeters;
+        template.LayoutStyle = PrintTemplatePolicy.NormalizeLayoutStyle(template.LayoutStyle);
+        template.Orientation = PrintTemplatePolicy.GetAutomaticOrientation(template.LayoutStyle);
+        template.TextFontSizePoints = PrintTemplatePolicy.GetTextFontSizePoints(template);
+    }
+
+    private static string GetLayoutStyleText(string layoutStyle)
+    {
+        return PrintTemplatePolicy.NormalizeLayoutStyle(layoutStyle) switch
+        {
+            PrintTemplatePolicy.HorizontalLayoutStyle => "左右排版",
+            PrintTemplatePolicy.LocationCodeLayoutStyle => "库位码四码排版",
+            _ => "上下排版",
+        };
+    }
+
+    private PrintTemplateProfile? SelectLabelTemplateFromTile(object sender)
+    {
+        if (sender is not FrameworkElement { DataContext: PrintTemplateProfile template })
+        {
+            return null;
+        }
+
+        _loadingLabelTemplate = true;
+        LabelTemplateComboBox.SelectedItem = template;
+        _loadingLabelTemplate = false;
+        ApplyLabelTemplate(template);
+        return template;
+    }
+
+    private void OnSelectLabelTemplateTileClick(object sender, MouseButtonEventArgs e)
+    {
+        SelectLabelTemplateFromTile(sender);
+    }
+
+    private void OnPrintLabelTemplateTileClick(object sender, RoutedEventArgs e)
+    {
+        if (SelectLabelTemplateFromTile(sender) is not null)
+        {
+            OnPrintLabelClick(sender, e);
+        }
+    }
+
+    private void OnPreviewLabelTemplateTileClick(object sender, RoutedEventArgs e)
+    {
+        PrintTemplateProfile? template = SelectLabelTemplateFromTile(sender);
+        if (template is not null)
+        {
+            ShowLabelTemplatePreview(template, LabelTextBox.Text.Trim());
+        }
+    }
+
+    private void OnEditLabelTemplateTileClick(object sender, RoutedEventArgs e)
+    {
+        PrintTemplateProfile? template = SelectLabelTemplateFromTile(sender);
+        if (template is null)
+        {
+            return;
+        }
+
+        ListBoxItem? printConfigItem = NavigationList.Items
+            .OfType<ListBoxItem>()
+            .FirstOrDefault(item => string.Equals(item.Tag?.ToString(), "PrintConfig", StringComparison.Ordinal));
+        if (printConfigItem is not null)
+        {
+            NavigationList.SelectedItem = printConfigItem;
+        }
+        else
+        {
+            SetPage("PrintConfig");
+        }
+
+        PrintTemplatesList.SelectedItem = template;
+        PrintTemplatesList.ScrollIntoView(template);
+        ShowPrintTemplateEditor(template);
+    }
+
+    private static void ApplyTemplateToSettings(EdgeSettings settings, PrintTemplateProfile template)
+    {
+        settings.PrintTemplate = template.Id;
+        settings.PrintWidthMillimeters = template.WidthMillimeters;
+        settings.PrintHeightMillimeters = template.HeightMillimeters;
+        settings.PrintOrientation = template.Orientation;
+        settings.PrintMode = template.Mode;
+        settings.PrintCopies = template.Copies;
+        settings.PrintOffsetXMillimeters = template.OffsetXMillimeters;
+        settings.PrintOffsetYMillimeters = template.OffsetYMillimeters;
+        settings.PrintSafetyInsetMillimeters = template.SafetyInsetMillimeters;
+        settings.SkuQrPrefix = template.SkuQrPrefix;
     }
 
     private static string NormalizeTemplateType(PrintTemplateProfile template)
     {
         // Earlier builds persisted the built-in profiles as "custom". Migrate
         // those stable IDs once, without inferring a purpose from paper size.
-        if (string.Equals(template.Id, "label_60x40mm", StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(template.Id, "label_60x40mm", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(template.Id, "label_60x40mm_horizontal", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(template.Id, "location_100x150mm_landscape", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(template.Id, "label_100x150mm", StringComparison.OrdinalIgnoreCase))
         {
             return "label";
         }
@@ -1033,8 +1557,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        ApplyPrintTemplateToEditor(template);
-        PrintConfigStatusText.Text = $"已选择模板：{template.Name}。点击操作列中的编辑才会展开配置。";
+        PrintConfigStatusText.Text = $"已选择模板：{template.DisplayName}。点击操作列中的“编辑”进入配置页面。";
     }
 
     private void ApplyPrintTemplateToEditor(PrintTemplateProfile template)
@@ -1044,12 +1567,64 @@ public partial class MainWindow : Window
             printer => string.Equals(printer.Name, template.Printer, StringComparison.OrdinalIgnoreCase));
         PrintWidthTextBox.Text = FormatMillimeters(template.WidthMillimeters);
         PrintHeightTextBox.Text = FormatMillimeters(template.HeightMillimeters);
-        PrintOrientationComboBox.SelectedValue = template.Orientation;
         PrintTemplateTypeComboBox.SelectedValue = template.Type;
         SkuQrPrefixTextBox.Text = string.IsNullOrWhiteSpace(template.SkuQrPrefix) ? "T" : template.SkuQrPrefix;
         PrintOffsetXTextBox.Text = template.OffsetXMillimeters.ToString("0.##", CultureInfo.InvariantCulture);
-        PrintModeComboBox.SelectedValue = template.Mode;
+        PrintOffsetYTextBox.Text = template.OffsetYMillimeters.ToString("0.##", CultureInfo.InvariantCulture);
+        PrintSafetyInsetTextBox.Text = template.SafetyInsetMillimeters.ToString("0.##", CultureInfo.InvariantCulture);
         PrintCopiesTextBox.Text = template.Copies.ToString(CultureInfo.InvariantCulture);
+        PrintLayoutStyleComboBox.SelectedValue = template.LayoutStyle;
+    }
+
+    private PrintTemplateProfile BuildEditedPrintTemplate(EdgeSettings settings)
+    {
+        PrintTemplateProfile? existing = !string.IsNullOrWhiteSpace(_editingPrintTemplateId)
+            ? _printTemplates.FirstOrDefault(template => string.Equals(template.Id, _editingPrintTemplateId, StringComparison.OrdinalIgnoreCase))
+            : null;
+        string layoutStyle = GetSelectedLayoutStyle();
+        return new PrintTemplateProfile
+        {
+            Id = existing?.Id ?? settings.PrintTemplate,
+            Name = string.IsNullOrWhiteSpace(PrintTemplateNameTextBox.Text) ? existing?.Name ?? "标签预览" : PrintTemplateNameTextBox.Text.Trim(),
+            Type = GetSelectedTemplateType(existing?.Type),
+            Printer = settings.DefaultPrinter,
+            WidthMillimeters = settings.PrintWidthMillimeters,
+            HeightMillimeters = settings.PrintHeightMillimeters,
+            Orientation = PrintTemplatePolicy.GetAutomaticOrientation(layoutStyle),
+            Mode = "fit",
+            Copies = settings.PrintCopies,
+            OffsetXMillimeters = settings.PrintOffsetXMillimeters,
+            OffsetYMillimeters = settings.PrintOffsetYMillimeters,
+            SafetyInsetMillimeters = settings.PrintSafetyInsetMillimeters,
+            SkuQrPrefix = settings.SkuQrPrefix,
+            LabelQrPrefix = layoutStyle == PrintTemplatePolicy.LocationCodeLayoutStyle ? string.Empty : existing?.LabelQrPrefix ?? string.Empty,
+            LayoutStyle = layoutStyle,
+            TextFontSizePoints = ResolveTemplateFontSize(settings, existing, layoutStyle),
+            MaxDisplayLength = existing is { MaxDisplayLength: > 0 } ? existing.MaxDisplayLength : 16,
+        };
+    }
+
+    private string GetSelectedLayoutStyle()
+    {
+        return PrintTemplatePolicy.NormalizeLayoutStyle(PrintLayoutStyleComboBox.SelectedValue as string);
+    }
+
+    private static double ResolveTemplateFontSize(EdgeSettings settings, PrintTemplateProfile? existing, string layoutStyle)
+    {
+        if (layoutStyle == PrintTemplatePolicy.LocationCodeLayoutStyle)
+        {
+            return PrintTemplatePolicy.LocationCodeFontSizePoints;
+        }
+        bool is60x40 = Math.Abs(settings.PrintWidthMillimeters - 60) <= 0.1 &&
+            Math.Abs(settings.PrintHeightMillimeters - 40) <= 0.1;
+        if (is60x40)
+        {
+            return layoutStyle == PrintTemplatePolicy.HorizontalLayoutStyle
+                ? PrintTemplatePolicy.Horizontal60x40FontSizePoints
+                : PrintTemplatePolicy.Stacked60x40FontSizePoints;
+        }
+
+        return existing is { TextFontSizePoints: > 0 } ? existing.TextFontSizePoints : 10;
     }
 
     private void OnSavePrintTemplateClick(object sender, RoutedEventArgs e)
@@ -1071,22 +1646,10 @@ public partial class MainWindow : Window
         var existing = !string.IsNullOrWhiteSpace(_editingPrintTemplateId)
             ? _printTemplates.FirstOrDefault(template => string.Equals(template.Id, _editingPrintTemplateId, StringComparison.OrdinalIgnoreCase))
             : null;
-        var profile = new PrintTemplateProfile
-        {
-            Id = existing?.Id ?? $"template_{Guid.NewGuid():N}",
-            Name = name,
-            Type = GetSelectedTemplateType(existing?.Type),
-            Printer = settings.DefaultPrinter,
-            WidthMillimeters = settings.PrintWidthMillimeters,
-            HeightMillimeters = settings.PrintHeightMillimeters,
-            Orientation = settings.PrintOrientation,
-            Mode = settings.PrintMode,
-            Copies = settings.PrintCopies,
-            OffsetXMillimeters = settings.PrintOffsetXMillimeters,
-            SkuQrPrefix = settings.SkuQrPrefix,
-            LabelQrPrefix = existing?.LabelQrPrefix ?? string.Empty,
-            MaxDisplayLength = existing?.MaxDisplayLength > 0 ? existing.MaxDisplayLength : 16,
-        };
+        PrintTemplateProfile profile = BuildEditedPrintTemplate(settings);
+        profile.Id = existing?.Id ?? $"template_{Guid.NewGuid():N}";
+        profile.TemplateNumber = existing?.TemplateNumber ?? PrintTemplatePolicy.NextTemplateNumber(_printTemplates);
+        profile.Name = name;
 
         var templates = _printTemplates
             .Where(template => !string.Equals(template.Id, profile.Id, StringComparison.OrdinalIgnoreCase))
@@ -1096,10 +1659,9 @@ public partial class MainWindow : Window
         _printTemplates = templates;
         PrintTemplatesList.ItemsSource = _printTemplates;
         PrintTemplatesList.SelectedItem = profile;
-        _editingPrintTemplateId = profile.Id;
-        PrintTemplateIdTextBox.Text = profile.Id;
         LoadLabelTemplates();
-        PrintConfigStatusText.Text = $"模板“{name}”已保存，可供手机终端选择。";
+        ShowPrintTemplateList(profile.Id);
+        PrintConfigStatusText.Text = $"模板“{profile.DisplayName}”已保存，可供手机终端选择。";
     }
 
     private void OnNewPrintTemplateClick(object sender, RoutedEventArgs e)
@@ -1109,13 +1671,13 @@ public partial class MainWindow : Window
 
     private void OnCancelPrintTemplateEditClick(object sender, RoutedEventArgs e)
     {
-        _editingPrintTemplateId = null;
-        PrintTemplateEditorCard.Visibility = Visibility.Collapsed;
-        PrintConfigStatusText.Text = "已关闭模板编辑。";
+        ShowPrintTemplateList(_editingPrintTemplateId);
+        PrintConfigStatusText.Text = "已返回模板列表，未保存的修改已放弃。";
     }
 
     private void ShowPrintTemplateEditor(PrintTemplateProfile? template)
     {
+        PrintTemplateListPanel.Visibility = Visibility.Collapsed;
         PrintTemplateEditorCard.Visibility = Visibility.Visible;
         _loadingPrintTemplate = true;
         try
@@ -1127,15 +1689,17 @@ public partial class MainWindow : Window
                 PrintTemplateEditorTitleText.Text = "添加打印模板";
                 PrintTemplateEditorSubtitleText.Text = "填写模板名称、打印机、尺寸、方向和二维码参数。";
                 PrintTemplateNameTextBox.Text = "新建打印模板";
+                PrintTemplateNumberTextBox.Text = PrintTemplatePolicy.NextTemplateNumber(_printTemplates);
                 PrintTemplateIdTextBox.Text = "保存后自动生成";
                 PrintTemplateTypeComboBox.SelectedValue = "label";
                 PrintWidthTextBox.Text = "60";
                 PrintHeightTextBox.Text = "40";
-                PrintOrientationComboBox.SelectedValue = "portrait";
-                PrintModeComboBox.SelectedValue = "fit";
                 PrintCopiesTextBox.Text = "1";
                 PrintOffsetXTextBox.Text = "0";
+                PrintOffsetYTextBox.Text = "0";
+                PrintSafetyInsetTextBox.Text = PrintPageContextFactory.DefaultSafetyInsetMillimeters.ToString("0.##", CultureInfo.InvariantCulture);
                 SkuQrPrefixTextBox.Text = "T";
+                PrintLayoutStyleComboBox.SelectedValue = PrintTemplatePolicy.StackedLayoutStyle;
             }
             else
             {
@@ -1143,8 +1707,9 @@ public partial class MainWindow : Window
                 _editingPrintTemplateId = template.Id;
                 PrintTemplatesList.SelectedItem = template;
                 PrintTemplateEditorTitleText.Text = "编辑打印模板";
-                PrintTemplateEditorSubtitleText.Text = $"模板 ID：{template.Id}";
+                PrintTemplateEditorSubtitleText.Text = $"模板编号：{template.TemplateNumber} · 模板 ID：{template.Id}";
                 PrintTemplateNameTextBox.Text = template.Name;
+                PrintTemplateNumberTextBox.Text = template.TemplateNumber;
                 PrintTemplateIdTextBox.Text = template.Id;
                 ApplyPrintTemplateToEditor(template);
             }
@@ -1156,7 +1721,37 @@ public partial class MainWindow : Window
 
         PrintConfigStatusText.Text = template is null
             ? "已准备新模板，填写参数后点击保存模板。"
-            : $"正在编辑模板：{template.Name}。保存后保持原 ID。";
+            : $"正在编辑模板：{template.DisplayName}。保存后保持原编号和 ID。";
+    }
+
+    private void ShowPrintTemplateList(string? selectedTemplateId = null)
+    {
+        _editingPrintTemplateId = null;
+        PrintTemplateEditorCard.Visibility = Visibility.Collapsed;
+        PrintTemplateListPanel.Visibility = Visibility.Visible;
+
+        if (string.IsNullOrWhiteSpace(selectedTemplateId))
+        {
+            return;
+        }
+
+        PrintTemplateProfile? selected = _printTemplates.FirstOrDefault(template =>
+            string.Equals(template.Id, selectedTemplateId, StringComparison.OrdinalIgnoreCase));
+        if (selected is null)
+        {
+            return;
+        }
+
+        _loadingPrintTemplate = true;
+        try
+        {
+            PrintTemplatesList.SelectedItem = selected;
+            PrintTemplatesList.ScrollIntoView(selected);
+        }
+        finally
+        {
+            _loadingPrintTemplate = false;
+        }
     }
 
     private string GetSelectedTemplateType(string? fallback)
@@ -1204,6 +1799,7 @@ public partial class MainWindow : Window
         var copy = new PrintTemplateProfile
         {
             Id = $"template_{Guid.NewGuid():N}",
+            TemplateNumber = PrintTemplatePolicy.NextTemplateNumber(_printTemplates),
             Name = $"{source.Name} - 副本",
             Type = source.Type,
             Printer = source.Printer,
@@ -1213,8 +1809,12 @@ public partial class MainWindow : Window
             Mode = source.Mode,
             Copies = source.Copies,
             OffsetXMillimeters = source.OffsetXMillimeters,
+            OffsetYMillimeters = source.OffsetYMillimeters,
+            SafetyInsetMillimeters = source.SafetyInsetMillimeters,
             SkuQrPrefix = source.SkuQrPrefix,
             LabelQrPrefix = source.LabelQrPrefix,
+            LayoutStyle = source.LayoutStyle,
+            TextFontSizePoints = source.TextFontSizePoints,
             MaxDisplayLength = source.MaxDisplayLength,
         };
         _printTemplates = _printTemplates.Append(copy).ToList();
@@ -1223,7 +1823,7 @@ public partial class MainWindow : Window
         PrintTemplatesList.SelectedItem = copy;
         LoadLabelTemplates();
         ShowPrintTemplateEditor(copy);
-        PrintConfigStatusText.Text = $"模板已复制，新模板 ID：{copy.Id}";
+        PrintConfigStatusText.Text = $"模板已复制，新模板编号：{copy.TemplateNumber}。";
     }
 
     private void OnDeletePrintTemplateClick(object sender, RoutedEventArgs e)
@@ -1241,7 +1841,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (MessageBox.Show($"确定删除模板“{template.Name}”吗？", "删除打印模板", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
+        if (MessageBox.Show($"确定删除模板“{template.DisplayName}”吗？", "删除打印模板", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
         {
             return;
         }
@@ -1259,8 +1859,7 @@ public partial class MainWindow : Window
         PrintTemplatesList.SelectedIndex = 0;
         if (string.Equals(_editingPrintTemplateId, template.Id, StringComparison.OrdinalIgnoreCase))
         {
-            _editingPrintTemplateId = null;
-            PrintTemplateEditorCard.Visibility = Visibility.Collapsed;
+            ShowPrintTemplateList();
         }
 
         LoadLabelTemplates();
@@ -1280,7 +1879,7 @@ public partial class MainWindow : Window
         settings.PrintTemplate = template.Id;
         _runtime.SaveEdgeSettings(settings);
         LoadLabelTemplates();
-        PrintConfigStatusText.Text = $"已将“{template.Name}”设为默认模板。";
+        PrintConfigStatusText.Text = $"已将“{template.DisplayName}”设为默认模板。";
     }
 
     private async void OnSearchProductsClick(object sender, RoutedEventArgs e)
@@ -1295,12 +1894,10 @@ public partial class MainWindow : Window
             return;
         }
 
-        SetProductQueryMode("sku");
-        ProductQueryTextBox.Text = product.Code;
-        ProductStatusText.Text = "正在查询产品 SKU...";
-        _productSkus = await _runtime.GetSkusAsync(string.Empty, product.Id);
-        SkusGrid.ItemsSource = _productSkus;
-        ProductStatusText.Text = $"已加载 {_productSkus.Count} 个 SKU。";
+        _selectedProductId = product.Id;
+        _selectedProductCode = product.Code;
+        ProductQueryTextBox.Text = string.Empty;
+        await QuerySkusAsync(string.Empty, 1, product.Id);
     }
 
     private async void OnSearchSkusClick(object sender, RoutedEventArgs e)
@@ -1308,25 +1905,109 @@ public partial class MainWindow : Window
         await QuerySkusAsync(SkuKeywordTextBox.Text);
     }
 
-    private void OnSkuModeClick(object sender, RoutedEventArgs e)
+    private async void OnSkuModeClick(object sender, RoutedEventArgs e)
     {
-        SetProductQueryMode("sku");
+        _selectedProductId = null;
+        _selectedProductCode = string.Empty;
+        await QuerySkusAsync(ProductQueryTextBox.Text, 1);
     }
 
-    private void OnProductModeClick(object sender, RoutedEventArgs e)
+    private void OnSkuGridPreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
-        SetProductQueryMode("product");
+        if (IsGridInteractiveTarget(e.OriginalSource as DependencyObject))
+        {
+            return;
+        }
+
+        var row = FindVisualAncestor<DataGridRow>(e.OriginalSource as DependencyObject);
+        if (row?.Item is not SkuSummary sku)
+        {
+            return;
+        }
+
+        sku.IsSelected = !sku.IsSelected;
+        row.IsSelected = sku.IsSelected;
+        row.Focus();
+        e.Handled = true;
+    }
+
+    private void OnCopySkuCodePreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (e.ClickCount == 1 && sender is FrameworkElement { DataContext: SkuSummary sku })
+        {
+            CopyCodeToClipboard(sku.Code, "SKU 编码", ProductStatusText);
+        }
+
+        e.Handled = true;
+    }
+
+    private static T? FindVisualAncestor<T>(DependencyObject? source)
+        where T : DependencyObject
+    {
+        while (source is not null)
+        {
+            if (source is T match)
+            {
+                return match;
+            }
+
+            source = VisualTreeHelper.GetParent(source);
+        }
+
+        return null;
+    }
+
+    private static bool IsGridInteractiveTarget(DependencyObject? source)
+    {
+        while (source is not null)
+        {
+            if (source is CheckBox or Button || source is FrameworkElement { Tag: CopyCodeTargetTag })
+            {
+                return true;
+            }
+
+            source = VisualTreeHelper.GetParent(source);
+        }
+
+        return false;
+    }
+
+    private static void CopyCodeToClipboard(string? value, string description, TextBlock statusText)
+    {
+        var code = value?.Trim();
+        if (string.IsNullOrEmpty(code))
+        {
+            statusText.Text = $"{description}为空，无法复制。";
+            return;
+        }
+
+        try
+        {
+            Clipboard.SetText(code);
+            statusText.Text = $"已复制{description}：{code}";
+        }
+        catch (Exception)
+        {
+            statusText.Text = $"复制{description}失败，请稍后重试。";
+        }
+    }
+
+    private async void OnProductModeClick(object sender, RoutedEventArgs e)
+    {
+        _selectedProductId = null;
+        _selectedProductCode = string.Empty;
+        await QueryProductsAsync(ProductQueryTextBox.Text, 1);
     }
 
     private async void OnQueryCurrentProductModeClick(object sender, RoutedEventArgs e)
     {
         if (_productQueryMode == "product")
         {
-            await QueryProductsAsync(ProductQueryTextBox.Text);
+            await QueryProductsAsync(ProductQueryTextBox.Text, 1);
         }
         else
         {
-            await QuerySkusAsync(ProductQueryTextBox.Text);
+            await QuerySkusAsync(ProductQueryTextBox.Text, 1, _selectedProductId);
         }
     }
 
@@ -1344,30 +2025,99 @@ public partial class MainWindow : Window
         ProductStatusText.Text = isProduct ? "产品模式：查询产品后可查看其 SKU" : "SKU 模式：选择 SKU 后可直接创建二维码打印任务";
     }
 
-    private async Task QueryProductsAsync(string keyword)
+    private async Task QueryProductsAsync(string keyword, int page = 1)
     {
         SetProductQueryMode("product");
         ProductQueryTextBox.Text = keyword;
+        _selectedProductId = null;
+        _selectedProductCode = string.Empty;
         ProductStatusText.Text = "正在查询产品...";
-        var products = await _runtime.GetProductsAsync(keyword);
-        ProductsGrid.ItemsSource = products;
-        ProductStatusText.Text = products.Count > 0
-            ? "产品查询完成。选择产品可进一步查看 SKU。"
-            : (_runtime.LastCenterQueryMessage.Length > 0 ? _runtime.LastCenterQueryMessage : "没有查询到产品。");
+        SetProductQueryEnabled(false);
+        var result = await _runtime.GetProductsPageAsync(keyword, page, ProductPageSize);
+        SetProductQueryEnabled(true);
+        if (result.Items.Count == 0 && page > 1)
+        {
+            ProductStatusText.Text = string.IsNullOrWhiteSpace(result.Message) ? "没有更多产品。" : result.Message;
+            UpdateProductPagination(page - 1, result.Total, 0);
+            return;
+        }
+        ProductsGrid.ItemsSource = result.Items;
+        UpdateProductPagination(page, result.Total, result.Items.Count);
+        ProductStatusText.Text = result.Items.Count > 0
+            ? BuildProductResultMessage(result, "产品查询完成。选择产品可进一步查看 SKU。")
+            : (string.IsNullOrWhiteSpace(result.Message) ? "没有查询到产品。" : result.Message);
         await RefreshCatalogStatusAsync();
     }
 
-    private async Task QuerySkusAsync(string keyword)
+    private async Task QuerySkusAsync(string keyword, int page = 1, uint? productId = null)
     {
         SetProductQueryMode("sku");
+        _selectedProductId = productId;
+        if (productId is null)
+        {
+            _selectedProductCode = string.Empty;
+        }
         ProductQueryTextBox.Text = keyword;
         ProductStatusText.Text = "正在查询 SKU...";
-        _productSkus = await _runtime.GetSkusAsync(keyword);
+        SetProductQueryEnabled(false);
+        var result = await _runtime.GetSkusPageAsync(keyword, page, ProductPageSize, productId);
+        SetProductQueryEnabled(true);
+        if (result.Items.Count == 0 && page > 1)
+        {
+            ProductStatusText.Text = string.IsNullOrWhiteSpace(result.Message) ? "没有更多 SKU。" : result.Message;
+            UpdateProductPagination(page - 1, result.Total, 0);
+            return;
+        }
+        _productSkus = result.Items;
         SkusGrid.ItemsSource = _productSkus;
+        UpdateProductPagination(page, result.Total, result.Items.Count);
+        var scope = productId is null ? string.Empty : $"产品 {_selectedProductCode} 下";
         ProductStatusText.Text = _productSkus.Count > 0
-            ? $"已加载 {_productSkus.Count} 个 SKU，可勾选后打印二维码。"
-            : (_runtime.LastCenterQueryMessage.Length > 0 ? _runtime.LastCenterQueryMessage : "没有查询到 SKU。");
+            ? BuildProductResultMessage(result, $"已加载{scope} {_productSkus.Count} 个 SKU，可勾选后打印二维码。")
+            : (string.IsNullOrWhiteSpace(result.Message) ? $"没有查询到{scope} SKU。" : result.Message);
         await RefreshCatalogStatusAsync();
+    }
+
+    private static string BuildProductResultMessage<T>(CatalogSearchResult<T> result, string localMessage)
+    {
+        return string.Equals(result.Source, "center", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(result.Message)
+            ? result.Message
+            : localMessage;
+    }
+
+    private void SetProductQueryEnabled(bool enabled)
+    {
+        ProductQueryButton.IsEnabled = enabled;
+        ProductPreviousPageButton.IsEnabled = enabled && _productPage > 1;
+        ProductNextPageButton.IsEnabled = enabled && (_productPage * ProductPageSize < _productTotal || _productCurrentCount == ProductPageSize);
+    }
+
+    private void UpdateProductPagination(int page, long total, int currentCount)
+    {
+        _productPage = Math.Max(1, page);
+        _productTotal = Math.Max(0, total);
+        _productCurrentCount = Math.Max(0, currentCount);
+        var pages = Math.Max(1L, (_productTotal + ProductPageSize - 1) / ProductPageSize);
+        ProductPageText.Text = _productTotal > 0 ? $"第 {_productPage} / {pages} 页（{_productTotal} 条）" : $"第 {_productPage} 页";
+        ProductPreviousPageButton.IsEnabled = _productPage > 1;
+        ProductNextPageButton.IsEnabled = _productPage * ProductPageSize < _productTotal || _productCurrentCount == ProductPageSize;
+    }
+
+    private async void OnPreviousProductPageClick(object sender, RoutedEventArgs e)
+    {
+        await LoadProductModePageAsync(Math.Max(1, _productPage - 1));
+    }
+
+    private async void OnNextProductPageClick(object sender, RoutedEventArgs e)
+    {
+        await LoadProductModePageAsync(_productPage + 1);
+    }
+
+    private Task LoadProductModePageAsync(int page)
+    {
+        return _productQueryMode == "product"
+            ? QueryProductsAsync(ProductQueryTextBox.Text, page)
+            : QuerySkusAsync(ProductQueryTextBox.Text, page, _selectedProductId);
     }
 
     private async void OnRefreshCatalogClick(object sender, RoutedEventArgs e)
@@ -1394,6 +2144,12 @@ public partial class MainWindow : Window
         CatalogStatusText.Text = status.LastFullSyncAt is null
             ? $"本地目录版本 {status.Revision}。"
             : $"本地目录版本 {status.Revision}，全量同步 {status.LastFullSyncAt.Value.LocalDateTime:g}。";
+        if (BoxLabelCatalogStatusText is not null && BoxLabelsGrid.ItemsSource is null)
+        {
+            BoxLabelCatalogStatusText.Text = status.BoxLabelsReady
+                ? $"已离线同步 {status.BoxLabelCount} 个箱唛"
+                : "箱唛历史数据正在首次同步";
+        }
     }
 
     private void OnSaveQrPrefixClick(object sender, RoutedEventArgs e)
@@ -1423,6 +2179,20 @@ public partial class MainWindow : Window
         if (ProductPrintTemplateComboBox.SelectedItem is not PrintTemplateProfile template || !_availableSkuPrintTemplates.Any(item => string.Equals(item.Id, template.Id, StringComparison.OrdinalIgnoreCase)))
         {
             MessageBox.Show("没有可用的标签模板。请在打印配置中检查打印机是否在线。", "产品管理", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        var printerStatus = _printerService.GetPrinter(template.Printer);
+        if (printerStatus is not { IsAvailable: true })
+        {
+            MessageBox.Show(
+                printerStatus is null
+                    ? $"打印机 {template.Printer} 不存在或无法读取状态。"
+                    : $"打印机 {template.Printer} 当前不可打印：{printerStatus.StatusText}。",
+                "产品管理",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            RefreshPrinters();
             return;
         }
 
@@ -1470,23 +2240,71 @@ public partial class MainWindow : Window
 
     private void RefreshPrinters(string? selectedPrinter = null)
     {
-        var printers = _printerService.GetPrinters();
+        ApplyPrinterSnapshot(_printerService.GetPrinters(), selectedPrinter);
+    }
+
+    private void ApplyPrinterSnapshot(IReadOnlyList<LocalPrinter> printers, string? selectedPrinter = null)
+    {
+        var currentPrinter = selectedPrinter ?? (PrinterComboBox.SelectedItem as LocalPrinter)?.Name;
+        _localPrinters = printers;
         PrinterComboBox.ItemsSource = printers;
 
-        var configuredPrinter = selectedPrinter ?? ResolveEffectivePrinter(_runtime.LoadEdgeSettings());
+        var configuredPrinter = currentPrinter ?? ResolveEffectivePrinter(_runtime.LoadEdgeSettings());
         PrinterComboBox.SelectedItem = printers.FirstOrDefault(printer => string.Equals(printer.Name, configuredPrinter, StringComparison.OrdinalIgnoreCase))
             ?? printers.FirstOrDefault(printer => printer.IsDefault);
 
         PrintConfigStatusText.Text = printers.Count == 0
-            ? "未发现可用的 Windows 打印机。请检查打印机安装、连接和当前用户权限。"
-            : $"已识别 {printers.Count} 台本地或已连接打印机。";
+            ? "未发现 Windows 打印机。请检查打印机安装和当前用户权限。"
+            : $"已识别 {printers.Count} 台打印机，可打印 {printers.Count(printer => printer.IsAvailable)} 台，不可打印 {printers.Count(printer => !printer.IsAvailable)} 台。";
         if (LabelPrinterText is not null)
         {
+            var configuredStatus = FindPrinter(configuredPrinter);
             LabelPrinterText.Text = string.IsNullOrWhiteSpace(configuredPrinter)
                 ? "默认打印机：未配置"
-                : $"默认打印机：{configuredPrinter}";
+                : $"默认打印机：{configuredPrinter} · {configuredStatus?.StatusText ?? "状态未知"}";
         }
+
+        UpdateTemplatePrinterStatuses();
+        PrintTemplatesList.Items.Refresh();
         RefreshProductPrintTemplates();
+        ApplyLabelTemplate(LabelTemplateComboBox.SelectedItem as PrintTemplateProfile);
+    }
+
+    private IReadOnlySet<string> AvailablePrinterNames()
+    {
+        return LocalPrinterService.AvailablePrinterNames(_localPrinters);
+    }
+
+    private LocalPrinter? FindPrinter(string? printerName)
+    {
+        if (string.IsNullOrWhiteSpace(printerName))
+        {
+            return null;
+        }
+
+        return _localPrinters.FirstOrDefault(printer =>
+            string.Equals(printer.Name, printerName.Trim(), StringComparison.OrdinalIgnoreCase));
+    }
+
+    private void UpdateTemplatePrinterStatuses()
+    {
+        var settings = _runtime.LoadEdgeSettings();
+        foreach (var template in _printTemplates)
+        {
+            UpdateTemplatePrinterStatus(template, settings);
+        }
+        LabelTemplateTiles.Items.Refresh();
+    }
+
+    private void UpdateTemplatePrinterStatus(PrintTemplateProfile template, EdgeSettings settings)
+    {
+        bool usesDefault = string.IsNullOrWhiteSpace(template.Printer);
+        string printerName = usesDefault ? ResolveEffectivePrinter(settings) : template.Printer.Trim();
+        LocalPrinter? printer = FindPrinter(printerName);
+        template.IsPrinterAvailable = printer is { IsAvailable: true };
+        template.PrinterStatusText = string.IsNullOrWhiteSpace(printerName)
+            ? "未配置"
+            : $"{(usesDefault ? "默认 · " : string.Empty)}{printer?.StatusText ?? "状态未知"}";
     }
 
     private void LoadPrintSettingsIntoForm(EdgeSettings settings)
@@ -1510,9 +2328,9 @@ public partial class MainWindow : Window
             ?? PrintSizePresets.First(preset => preset.Id == "custom");
         PrintWidthTextBox.Text = FormatMillimeters(settings.PrintWidthMillimeters);
         PrintHeightTextBox.Text = FormatMillimeters(settings.PrintHeightMillimeters);
-        PrintOrientationComboBox.SelectedValue = settings.PrintOrientation;
         PrintOffsetXTextBox.Text = settings.PrintOffsetXMillimeters.ToString("0.##", CultureInfo.InvariantCulture);
-        PrintModeComboBox.SelectedValue = settings.PrintMode;
+        PrintOffsetYTextBox.Text = settings.PrintOffsetYMillimeters.ToString("0.##", CultureInfo.InvariantCulture);
+        PrintSafetyInsetTextBox.Text = settings.PrintSafetyInsetMillimeters.ToString("0.##", CultureInfo.InvariantCulture);
         PrintCopiesTextBox.Text = settings.PrintCopies.ToString(CultureInfo.InvariantCulture);
     }
 
@@ -1551,9 +2369,21 @@ public partial class MainWindow : Window
             return false;
         }
 
-        if (!double.TryParse(PrintOffsetXTextBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var offsetX) || offsetX is < -50 or > 50)
+        if (!double.TryParse(PrintOffsetXTextBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var offsetX) || offsetX is < -5 or > 5)
         {
-            ShowPrintValidation("水平校准必须是 -50 到 50 之间的毫米数。正数向右移动。");
+            ShowPrintValidation("水平校准必须是 -5 到 5 之间的毫米数。正数向右移动。");
+            return false;
+        }
+
+        if (!double.TryParse(PrintOffsetYTextBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var offsetY) || offsetY is < -5 or > 5)
+        {
+            ShowPrintValidation("纵向校准必须是 -5 到 5 之间的毫米数。正数向下移动。");
+            return false;
+        }
+
+        if (!double.TryParse(PrintSafetyInsetTextBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var safetyInset) || safetyInset is < 0.5 or > 5)
+        {
+            ShowPrintValidation("安全边距必须是 0.5 到 5 之间的毫米数。");
             return false;
         }
 
@@ -1561,9 +2391,11 @@ public partial class MainWindow : Window
         settings.PrintTemplate = (PrintSizePresetComboBox.SelectedItem as PrintSizePreset)?.Id ?? "custom";
         settings.PrintWidthMillimeters = width;
         settings.PrintHeightMillimeters = height;
-        settings.PrintOrientation = PrintOrientationComboBox.SelectedValue?.ToString() ?? "portrait";
+        settings.PrintOrientation = PrintTemplatePolicy.GetAutomaticOrientation(GetSelectedLayoutStyle());
         settings.PrintOffsetXMillimeters = offsetX;
-        settings.PrintMode = PrintModeComboBox.SelectedValue?.ToString() ?? "fit";
+        settings.PrintOffsetYMillimeters = offsetY;
+        settings.PrintSafetyInsetMillimeters = safetyInset;
+        settings.PrintMode = "fit";
         settings.PrintCopies = copies;
         return true;
     }
@@ -1597,6 +2429,281 @@ public partial class MainWindow : Window
         var url = GetLabelPrintUrl();
         Clipboard.SetText(url);
         LocalStatusMessageText.Text = "Web 标签打印地址已复制到剪贴板。";
+    }
+
+    private async void OnSearchBoxLabelProductsClick(object sender, RoutedEventArgs e)
+    {
+        var products = await _runtime.GetProductsAsync(BoxLabelProductComboBox.Text);
+        BoxLabelProductComboBox.ItemsSource = products;
+        BoxLabelProductComboBox.IsDropDownOpen = products.Count > 0;
+        BoxLabelCatalogStatusText.Text = products.Count > 0 ? $"找到 {products.Count} 个产品" : "没有找到产品";
+    }
+
+    private async void OnBoxLabelProductChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (BoxLabelProductComboBox.SelectedItem is not ProductSummary product)
+        {
+            return;
+        }
+
+        var skus = await _runtime.GetSkusAsync(string.Empty, product.Id);
+        BoxLabelSkuComboBox.ItemsSource = skus;
+        BoxLabelSkuComboBox.SelectedItem = null;
+        BoxLabelSkuComboBox.Text = string.Empty;
+    }
+
+    private async void OnSearchBoxLabelSkusClick(object sender, RoutedEventArgs e)
+    {
+        var productId = SelectedBoxLabelProductId();
+        var skus = await _runtime.GetSkusAsync(BoxLabelSkuComboBox.Text, productId);
+        BoxLabelSkuComboBox.ItemsSource = skus;
+        BoxLabelSkuComboBox.IsDropDownOpen = skus.Count > 0;
+        BoxLabelCatalogStatusText.Text = skus.Count > 0 ? $"找到 {skus.Count} 个 SKU" : "没有找到 SKU";
+    }
+
+    private async void OnSearchConsolidationOrdersClick(object sender, RoutedEventArgs e)
+    {
+        var keyword = BoxLabelConsolidationComboBox.Text.Trim();
+        if (keyword.Length < 2)
+        {
+            BoxLabelCatalogStatusText.Text = "至少输入 2 个字符再在线查询集运订单。";
+            return;
+        }
+
+        var orders = await _runtime.GetConsolidationOrdersAsync(keyword);
+        BoxLabelConsolidationComboBox.ItemsSource = orders;
+        BoxLabelConsolidationComboBox.IsDropDownOpen = orders.Count > 0;
+        BoxLabelCatalogStatusText.Text = orders.Count > 0 ? $"在线找到 {orders.Count} 个集运订单" : "中心没有返回匹配的集运订单，可按输入编码查询本地数据";
+    }
+
+    private async void OnQueryBoxLabelsClick(object sender, RoutedEventArgs e)
+    {
+        await LoadBoxLabelsAsync(1);
+    }
+
+    private async void OnResetBoxLabelsClick(object sender, RoutedEventArgs e)
+    {
+        BoxLabelKeywordTextBox.Clear();
+        BoxLabelProductComboBox.ItemsSource = null;
+        BoxLabelProductComboBox.Text = string.Empty;
+        BoxLabelSkuComboBox.ItemsSource = null;
+        BoxLabelSkuComboBox.Text = string.Empty;
+        BoxLabelConsolidationComboBox.ItemsSource = null;
+        BoxLabelConsolidationComboBox.Text = string.Empty;
+        BoxLabelStatusComboBox.SelectedIndex = 0;
+        BoxLabelReceivingComboBox.SelectedIndex = 0;
+        await LoadBoxLabelsAsync(1);
+    }
+
+    private async Task LoadBoxLabelsAsync(int page)
+    {
+        _boxLabelPage = Math.Max(1, page);
+        BoxLabelCatalogStatusText.Text = "正在查询本地箱唛...";
+        var selectedOrder = BoxLabelConsolidationComboBox.SelectedItem as ConsolidationOrderSummary;
+        var result = await _runtime.GetBoxLabelsAsync(new BoxLabelQuery
+        {
+            Keyword = BoxLabelKeywordTextBox.Text,
+            ProductId = SelectedBoxLabelProductId(),
+            SkuId = SelectedBoxLabelSkuId(),
+            ConsolidationOrderId = selectedOrder?.Id,
+            ConsolidationOrderCode = selectedOrder?.Code ?? BoxLabelConsolidationComboBox.Text,
+            StatusGroup = BoxLabelStatusComboBox.SelectedValue?.ToString() ?? string.Empty,
+            ReceivingStatus = BoxLabelReceivingComboBox.SelectedValue?.ToString() ?? string.Empty,
+            Page = _boxLabelPage,
+            PageSize = 20,
+        });
+        _boxLabels = result.Items;
+        _boxLabelTotal = result.Total;
+        BoxLabelsGrid.ItemsSource = _boxLabels;
+        BoxLabelResultText.Text = $"共 {_boxLabelTotal} 个箱唛，本页 {_boxLabels.Count} 个";
+        var totalPages = Math.Max(1, (int)Math.Ceiling(_boxLabelTotal / 20d));
+        BoxLabelPageText.Text = $"第 {_boxLabelPage} / {totalPages} 页";
+        PreviousBoxLabelPageButton.IsEnabled = _boxLabelPage > 1;
+        NextBoxLabelPageButton.IsEnabled = _boxLabelPage < totalPages;
+        BoxLabelCatalogStatusText.Text = !string.IsNullOrWhiteSpace(result.Message)
+            ? result.Message
+            : result.Source == "center"
+                ? "数据来源：中心后端"
+                : _boxLabels.Count > 0
+                    ? "数据来源：本地离线目录"
+                    : "没有匹配的箱唛";
+        BoxLabelDetailPanel.DataContext = null;
+        await RefreshCatalogStatusAsync();
+    }
+
+    private uint? SelectedBoxLabelProductId()
+    {
+        return BoxLabelProductComboBox.SelectedItem is ProductSummary product &&
+            string.Equals(BoxLabelProductComboBox.Text.Trim(), product.Code, StringComparison.OrdinalIgnoreCase)
+            ? product.Id
+            : null;
+    }
+
+    private uint? SelectedBoxLabelSkuId()
+    {
+        return BoxLabelSkuComboBox.SelectedItem is SkuSummary sku &&
+            string.Equals(BoxLabelSkuComboBox.Text.Trim(), sku.Code, StringComparison.OrdinalIgnoreCase)
+            ? sku.Id
+            : null;
+    }
+
+    private async void OnPreviousBoxLabelPageClick(object sender, RoutedEventArgs e)
+    {
+        if (_boxLabelPage > 1)
+        {
+            await LoadBoxLabelsAsync(_boxLabelPage - 1);
+        }
+    }
+
+    private async void OnNextBoxLabelPageClick(object sender, RoutedEventArgs e)
+    {
+        if (_boxLabelPage * 20 < _boxLabelTotal)
+        {
+            await LoadBoxLabelsAsync(_boxLabelPage + 1);
+        }
+    }
+
+    private void OnBoxLabelGridPreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (IsGridInteractiveTarget(e.OriginalSource as DependencyObject))
+        {
+            return;
+        }
+
+        var row = FindVisualAncestor<DataGridRow>(e.OriginalSource as DependencyObject);
+        if (row?.Item is not BoxLabelSummary boxLabel)
+        {
+            return;
+        }
+
+        boxLabel.IsSelected = !boxLabel.IsSelected;
+        row.IsSelected = boxLabel.IsSelected;
+        row.Focus();
+        e.Handled = true;
+    }
+
+    private void OnCopyBoxLabelCodePreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (e.ClickCount == 1 && sender is FrameworkElement { DataContext: BoxLabelSummary boxLabel })
+        {
+            CopyCodeToClipboard(boxLabel.LabelCode, "箱唛码", BoxLabelCatalogStatusText);
+        }
+
+        e.Handled = true;
+    }
+
+    private async void OnBoxLabelSelected(object sender, SelectionChangedEventArgs e)
+    {
+        if (BoxLabelsGrid.SelectedItem is not BoxLabelSummary selected)
+        {
+            return;
+        }
+
+        BoxLabelDetailPanel.DataContext = await _runtime.GetBoxLabelAsync(selected.Id) ?? selected;
+    }
+
+    private void OnPreviewSelectedBoxLabelsClick(object sender, RoutedEventArgs e)
+    {
+        List<BoxLabelSummary> selected = _boxLabels.Where(label => label.IsSelected).ToList();
+        if (selected.Count == 0 && BoxLabelsGrid.SelectedItem is BoxLabelSummary current)
+        {
+            selected.Add(current);
+        }
+
+        if (selected.Count == 0)
+        {
+            MessageBox.Show("请先勾选或高亮要预览的箱唛。", "箱唛管理", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+        if (selected.Count > 100 || selected.Any(label => label.PrintSnapshot is null))
+        {
+            MessageBox.Show("单次最多预览 100 个箱唛，且箱唛必须包含完整打印快照。", "箱唛管理", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+        if (BoxLabelPrintTemplateComboBox.SelectedItem is not PrintTemplateProfile template)
+        {
+            MessageBox.Show("没有 100 × 150 mm 厂家箱唛模板，请先在打印配置中创建。", "箱唛管理", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        try
+        {
+            EdgeSettings settings = _runtime.LoadEdgeSettings();
+            ApplyTemplateToSettings(settings, template);
+            settings.DefaultPrinter = template.Printer;
+            List<ManufacturerBoxMark> marks = selected.Select(label => label.PrintSnapshot!).ToList();
+            FixedDocument document = new ManufacturerBoxMarkPrintService().CreatePreviewDocument(settings, marks, out string diagnostic);
+            PrintPreviewWindow preview = new(
+                document,
+                "厂家箱唛真实数据预览",
+                $"{template.DisplayName} · {marks.Count} 个箱唛 · 100 x 150 mm · 每页 1 BOX + 2 SKU 二维码",
+                diagnostic,
+                showConfirmButton: false)
+            {
+                Owner = this,
+            };
+            preview.ShowDialog();
+            BoxLabelCatalogStatusText.Text = $"已预览 {marks.Count} 个箱唛，未提交打印任务。";
+        }
+        catch (Exception ex)
+        {
+            BoxLabelCatalogStatusText.Text = $"箱唛预览失败：{ex.Message}";
+            MessageBox.Show(ex.Message, "箱唛预览失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private async void OnPrintSelectedBoxLabelsClick(object sender, RoutedEventArgs e)
+    {
+        var selected = _boxLabels.Where(label => label.IsSelected).ToList();
+        if (selected.Count == 0)
+        {
+            MessageBox.Show("请先勾选要打印的箱唛。", "箱唛管理", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        if (selected.Count > 100 || selected.Any(label => !label.Printable || label.PrintSnapshot is null))
+        {
+            MessageBox.Show("单次最多打印 100 个箱唛，且作废、短装、已收货、破损或异常箱唛不能打印。", "箱唛管理", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        if (BoxLabelPrintTemplateComboBox.SelectedItem is not PrintTemplateProfile template)
+        {
+            MessageBox.Show("没有 100 × 150 mm 厂家箱唛模板，请先在打印配置中创建。", "箱唛管理", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(template.Printer))
+        {
+            MessageBox.Show("当前厂家箱唛模板未配置打印机，请点击模板旁的编辑按钮完成配置。", "箱唛管理", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        var printerStatus = _printerService.GetPrinter(template.Printer);
+        if (printerStatus is not { IsAvailable: true })
+        {
+            MessageBox.Show(
+                printerStatus is null
+                    ? $"打印机 {template.Printer} 不存在或无法读取状态。"
+                    : $"打印机 {template.Printer} 当前不可打印：{printerStatus.StatusText}。",
+                "箱唛管理",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            RefreshPrinters();
+            return;
+        }
+
+        if (!int.TryParse(BoxLabelCopiesTextBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var copies) || copies is < 1 or > 100)
+        {
+            MessageBox.Show("打印份数必须是 1 到 100 的整数。", "箱唛管理", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        var accepted = await _runtime.SubmitBoxMarkPrintJobAsync(template.Id, selected, copies);
+        BoxLabelCatalogStatusText.Text = accepted ? $"已创建 {selected.Count} 个箱唛的本地打印任务" : "打印任务创建失败，请检查模板和打印机状态";
+        if (accepted)
+        {
+            await RefreshPrintJobsAsync();
+        }
     }
 
     private string GetLabelPrintUrl()
@@ -1638,10 +2745,20 @@ public partial class MainWindow : Window
     private void ApplyRuntimeStatus(EdgeRuntimeStatus status)
     {
         var badge = status.IsHealthy ? BadgeKind.Success : status.IsRunning ? BadgeKind.Warning : BadgeKind.Error;
-        var text = status.IsHealthy ? "可用" : status.IsRunning ? "启动中" : "不可用";
-        SetBadge(HeaderStatusPill, HeaderStatusText, text, badge);
-        SetBadge(LocalStatusBadge, LocalStatusText, text, badge);
-        LocalStatusMessageText.Text = status.Message;
+        var headerText = status.IsHealthy ? "运行正常" : status.IsRunning ? "服务启动中" : "服务不可用";
+        var localText = status.IsHealthy ? "健康运行" : status.IsRunning ? "启动中" : "不可用";
+        SetBadge(HeaderStatusPill, HeaderStatusText, headerText, badge);
+        HeaderStatusDot.Fill = HeaderStatusText.Foreground;
+        HeaderStatusDetailText.Foreground = HeaderStatusText.Foreground;
+        HeaderStatusDetailText.Text = status.IsHealthy
+            ? $"健康检测通过 · {DateTimeOffset.Now:HH:mm:ss}"
+            : status.IsRunning
+                ? $"等待健康响应 · 端口 {status.Port}"
+                : $"健康检测失败 · {DateTimeOffset.Now:HH:mm:ss}";
+        SetBadge(LocalStatusBadge, LocalStatusText, localText, badge);
+        LocalStatusMessageText.Text = status.IsHealthy
+            ? $"本地服务已通过健康检查，端口 {status.Port} 正常响应。"
+            : status.Message;
 
         AdvancedPortText.Text = status.Port.ToString();
         AdvancedProcessText.Text = status.ProcessId?.ToString() ?? "-";
@@ -1710,6 +2827,7 @@ public partial class MainWindow : Window
         PrintPage.Visibility = tag is "Print" or "PrintConfig" ? Visibility.Visible : Visibility.Collapsed;
         LabelPage.Visibility = tag == "LabelPrint" ? Visibility.Visible : Visibility.Collapsed;
         ProductsPage.Visibility = tag == "Products" ? Visibility.Visible : Visibility.Collapsed;
+        BoxLabelsPage.Visibility = tag == "BoxLabels" ? Visibility.Visible : Visibility.Collapsed;
         PrintJobsCard.Visibility = tag == "Print" ? Visibility.Visible : Visibility.Collapsed;
         PrintConfigCard.Visibility = tag == "PrintConfig" ? Visibility.Visible : Visibility.Collapsed;
         AdvancedPage.Visibility = tag == "Advanced" ? Visibility.Visible : Visibility.Collapsed;
@@ -1720,23 +2838,37 @@ public partial class MainWindow : Window
             "LabelPrint" => ("标签打印", "输入任意字符串，使用当前选择的通用标签模板打印二维码标签。"),
             "Print" => ("打印服务", "优先查看本地打印任务，打印机和规格在打印配置中管理。"),
             "PrintConfig" => ("打印配置", "管理打印模板、打印机、尺寸和二维码打印参数。"),
-            "Products" => ("产品管理", "查询中心产品和 SKU，选择模板后创建二维码打印任务。"),
+            "Products" => ("产品管理", "本地优先分页查询产品和 SKU，缺失数据自动从中心同步。"),
+            "BoxLabels" => ("箱唛管理", "离线查询箱唛关联单据，支持产品、SKU 和集运订单联合筛选及本地打印。"),
             "Advanced" => ("高级设置", "配置远端服务并管理边缘后端进程、运行文件和日志。"),
             _ => ("总览", "查看边缘节点最关键的运行状态。"),
         };
+
+        if (tag == "BoxLabels" && BoxLabelsGrid.ItemsSource is null)
+        {
+            _ = LoadBoxLabelsAsync(1);
+        }
+        if (tag == "Products" && SkusGrid.ItemsSource is null)
+        {
+            _selectedProductId = null;
+            _selectedProductCode = string.Empty;
+            _ = QuerySkusAsync(string.Empty, 1);
+        }
     }
 
     private static void SetBadge(Border badge, TextBlock textBlock, string text, BadgeKind kind)
     {
         textBlock.Text = text;
-        (var background, var foreground) = kind switch
+        (var background, var foreground, var border) = kind switch
         {
-            BadgeKind.Success => ("#DCFCE7", "#166534"),
-            BadgeKind.Warning => ("#FEF3C7", "#92400E"),
-            BadgeKind.Error => ("#FEE2E2", "#991B1B"),
-            _ => ("#E2E8F0", "#475569"),
+            BadgeKind.Success => ("#DCFCE7", "#14532D", "#22C55E"),
+            BadgeKind.Warning => ("#FEF3C7", "#78350F", "#F59E0B"),
+            BadgeKind.Error => ("#FEE2E2", "#7F1D1D", "#EF4444"),
+            _ => ("#E2E8F0", "#475569", "#94A3B8"),
         };
         badge.Background = BrushFrom(background);
+        badge.BorderBrush = BrushFrom(border);
+        badge.BorderThickness = new Thickness(1);
         textBlock.Foreground = BrushFrom(foreground);
     }
 

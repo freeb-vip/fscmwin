@@ -84,6 +84,26 @@
       <Setter Property="Foreground" Value="#FFFFFF" />
     </Style>
 
+    <Style x:Key="CopyCodeButtonStyle" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+      <Setter Property="MinWidth" Value="30" />
+      <Setter Property="Width" Value="30" />
+      <Setter Property="Height" Value="30" />
+      <Setter Property="Padding" Value="0" />
+    </Style>
+
+    <Style x:Key="TemplateTileActionButtonStyle" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+      <Setter Property="MinWidth" Value="32" />
+      <Setter Property="Width" Value="32" />
+      <Setter Property="Height" Value="32" />
+      <Setter Property="Padding" Value="0" />
+    </Style>
+
+    <Style x:Key="TemplateTilePrintButtonStyle" TargetType="Button" BasedOn="{StaticResource TemplateTileActionButtonStyle}">
+      <Setter Property="Background" Value="#2563EB" />
+      <Setter Property="BorderBrush" Value="#2563EB" />
+      <Setter Property="Foreground" Value="#FFFFFF" />
+    </Style>
+
     <Style TargetType="TextBox">
       <Setter Property="Height" Value="36" />
       <Setter Property="Padding" Value="10,6" />
@@ -188,6 +208,7 @@
           SelectedIndex="0">
           <ListBoxItem Tag="Home">总览</ListBoxItem>
           <ListBoxItem Tag="Products">产品管理</ListBoxItem>
+          <ListBoxItem Tag="BoxLabels">箱唛管理</ListBoxItem>
           <ListBoxItem Tag="Terminals">在线终端</ListBoxItem>
           <ListBoxItem Tag="LabelPrint">标签打印</ListBoxItem>
           <ListBoxItem Tag="Print">打印任务</ListBoxItem>
@@ -223,11 +244,66 @@
               Foreground="{StaticResource MutedTextBrush}"
               Text="查看边缘节点最关键的运行状态。" />
           </StackPanel>
-          <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" HorizontalAlignment="Right">
-            <Border x:Name="HeaderStatusPill" Style="{StaticResource StatusPillStyle}" Background="#FEF3C7" Margin="0,0,12,0">
-              <TextBlock x:Name="HeaderStatusText" FontWeight="SemiBold" Foreground="#92400E" Text="Checking" />
+          <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+            <Border
+              x:Name="HeaderStatusPill"
+              MinWidth="210"
+              Margin="0,0,12,0"
+              Padding="12,8"
+              Background="#FEF3C7"
+              BorderBrush="#F59E0B"
+              BorderThickness="1"
+              CornerRadius="6">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="Auto" />
+                  <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <Ellipse
+                  x:Name="HeaderStatusDot"
+                  Width="12"
+                  Height="12"
+                  Margin="0,0,10,0"
+                  VerticalAlignment="Center"
+                  Fill="#F59E0B" />
+                <StackPanel Grid.Column="1">
+                  <TextBlock
+                    x:Name="HeaderStatusText"
+                    FontSize="14"
+                    FontWeight="SemiBold"
+                    Foreground="#78350F"
+                    Text="正在检查运行状态" />
+                  <TextBlock
+                    x:Name="HeaderStatusDetailText"
+                    Margin="0,2,0,0"
+                    FontSize="12"
+                    Foreground="#92400E"
+                    Text="正在检测本地服务" />
+                </StackPanel>
+              </Grid>
             </Border>
-            <Button Click="OnRefreshClick" Content="刷新" Style="{StaticResource PrimaryButtonStyle}" />
+            <Button
+              x:Name="RefreshButton"
+              MinWidth="118"
+              Click="OnRefreshClick"
+              Style="{StaticResource PrimaryButtonStyle}"
+              ToolTip="重新检测运行状态">
+              <StackPanel Orientation="Horizontal">
+                <TextBlock
+                  x:Name="RefreshIconText"
+                  Margin="0,0,8,0"
+                  VerticalAlignment="Center"
+                  FontFamily="Segoe MDL2 Assets"
+                  FontSize="15"
+                  RenderTransformOrigin="0.5,0.5"
+                  Text="&#xE72C;">
+                  <TextBlock.RenderTransform>
+                    <RotateTransform x:Name="RefreshIconRotation" />
+                  </TextBlock.RenderTransform>
+                </TextBlock>
+                <TextBlock x:Name="RefreshButtonText" VerticalAlignment="Center" Text="刷新状态" />
+              </StackPanel>
+            </Button>
           </StackPanel>
         </DockPanel>
       </Border>
@@ -240,7 +316,7 @@
                 <StackPanel>
                   <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="本地服务" />
                   <Border x:Name="LocalStatusBadge" Style="{StaticResource StatusPillStyle}" Margin="0,12,0,10" Background="#FEF3C7">
-                    <TextBlock x:Name="LocalStatusText" FontWeight="SemiBold" Foreground="#92400E" Text="Checking" />
+                    <TextBlock x:Name="LocalStatusText" FontWeight="SemiBold" Foreground="#92400E" Text="检查中" />
                   </Border>
                   <TextBlock x:Name="LocalStatusMessageText" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap" />
                 </StackPanel>
@@ -489,20 +565,97 @@
 
         <ScrollViewer x:Name="LabelPage" Visibility="Collapsed" VerticalScrollBarVisibility="Auto">
           <StackPanel Margin="28">
-            <Border Style="{StaticResource CardStyle}">
-              <StackPanel>
+            <StackPanel>
                 <TextBlock FontSize="18" FontWeight="SemiBold" Text="标签打印" />
-                <TextBlock Margin="0,6,0,18" Foreground="{StaticResource MutedTextBrush}" Text="选择标签模板后打印，二维码在上方，字符串在下方。" />
-                <Grid Margin="0,0,0,16">
-                  <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="220" />
-                    <ColumnDefinition Width="*" />
-                  </Grid.ColumnDefinitions>
-                  <StackPanel Grid.Column="0" Margin="0,0,16,0">
-                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="打印模板" />
-                    <ComboBox x:Name="LabelTemplateComboBox" Margin="0,6,0,0" Height="36" DisplayMemberPath="Name" SelectionChanged="OnLabelTemplateSelected" />
-                  </StackPanel>
-                  <UniformGrid Grid.Column="1" Columns="4">
+                <TextBlock Margin="0,6,0,18" Foreground="{StaticResource MutedTextBrush}" Text="本机标签模板与打印机状态" />
+                <DockPanel Margin="0,0,0,10">
+                  <TextBlock DockPanel.Dock="Left" FontSize="16" FontWeight="SemiBold" Text="标签模板" />
+                </DockPanel>
+                <ComboBox x:Name="LabelTemplateComboBox" Visibility="Collapsed" DisplayMemberPath="DisplayName" SelectionChanged="OnLabelTemplateSelected" />
+                <ItemsControl x:Name="LabelTemplateTiles" Margin="0,0,0,16">
+                  <ItemsControl.ItemsPanel>
+                    <ItemsPanelTemplate>
+                      <UniformGrid Columns="4" />
+                    </ItemsPanelTemplate>
+                  </ItemsControl.ItemsPanel>
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                      <Border Height="190" Margin="0,0,10,10" Padding="12" CornerRadius="8" Cursor="Hand" MouseLeftButtonUp="OnSelectLabelTemplateTileClick">
+                        <Border.Style>
+                          <Style TargetType="Border">
+                            <Setter Property="Background" Value="#FFFFFF" />
+                            <Setter Property="BorderBrush" Value="#CBD5E1" />
+                            <Setter Property="BorderThickness" Value="1" />
+                            <Style.Triggers>
+                              <DataTrigger Binding="{Binding IsSelectedForLabelPrint}" Value="True">
+                                <Setter Property="Background" Value="#EFF6FF" />
+                                <Setter Property="BorderBrush" Value="#2563EB" />
+                                <Setter Property="BorderThickness" Value="2" />
+                              </DataTrigger>
+                            </Style.Triggers>
+                          </Style>
+                        </Border.Style>
+                        <Grid>
+                          <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                            <RowDefinition Height="Auto" />
+                          </Grid.RowDefinitions>
+                          <DockPanel Grid.Row="0" LastChildFill="False">
+                            <Border Width="30" Height="30" Background="#2563EB" CornerRadius="6">
+                              <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="15" Foreground="#FFFFFF" Text="&#xE749;" />
+                            </Border>
+                            <Border DockPanel.Dock="Right" Padding="7,3" Background="#DBEAFE" CornerRadius="10">
+                              <Border.Style>
+                                <Style TargetType="Border">
+                                  <Setter Property="Visibility" Value="Collapsed" />
+                                  <Style.Triggers>
+                                    <DataTrigger Binding="{Binding IsSelectedForLabelPrint}" Value="True">
+                                      <Setter Property="Visibility" Value="Visible" />
+                                    </DataTrigger>
+                                  </Style.Triggers>
+                                </Style>
+                              </Border.Style>
+                              <TextBlock FontSize="10" FontWeight="SemiBold" Foreground="#1D4ED8" Text="当前" />
+                            </Border>
+                          </DockPanel>
+                          <TextBlock Grid.Row="1" Margin="0,6,0,0" FontSize="13" FontWeight="Bold" MaxHeight="34" Text="{Binding DisplayName}" TextTrimming="CharacterEllipsis" TextWrapping="Wrap" />
+                          <TextBlock Grid.Row="2" Margin="0,3,0,0" FontSize="11" Foreground="{StaticResource MutedTextBrush}" Text="{Binding PaperDisplayText}" TextTrimming="CharacterEllipsis" />
+                          <StackPanel Grid.Row="3" Margin="0,2,0,0">
+                            <TextBlock FontSize="11" Foreground="{StaticResource MutedTextBrush}" Text="{Binding LayoutDisplayText}" TextTrimming="CharacterEllipsis" />
+                            <TextBlock Margin="0,2,0,0" FontSize="10" Foreground="{StaticResource MutedTextBrush}" Text="{Binding PrinterDisplayText}" TextTrimming="CharacterEllipsis" ToolTip="{Binding PrinterDisplayText}" />
+                            <TextBlock Margin="0,2,0,0" FontSize="10" FontWeight="SemiBold" Text="{Binding PrinterStatusText}" TextTrimming="CharacterEllipsis">
+                              <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                  <Setter Property="Foreground" Value="#166534" />
+                                  <Style.Triggers>
+                                    <DataTrigger Binding="{Binding IsPrinterAvailable}" Value="False">
+                                      <Setter Property="Foreground" Value="#991B1B" />
+                                    </DataTrigger>
+                                  </Style.Triggers>
+                                </Style>
+                              </TextBlock.Style>
+                            </TextBlock>
+                          </StackPanel>
+                          <StackPanel Grid.Row="4" HorizontalAlignment="Right" Orientation="Horizontal">
+                              <Button Margin="0,0,4,0" Click="OnPrintLabelTemplateTileClick" IsEnabled="{Binding IsPrinterAvailable}" Style="{StaticResource TemplateTilePrintButtonStyle}" ToolTip="使用此模板打印当前内容">
+                                <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="15" Text="&#xE749;" />
+                              </Button>
+                              <Button Margin="0,0,4,0" Click="OnPreviewLabelTemplateTileClick" Style="{StaticResource TemplateTileActionButtonStyle}" ToolTip="预览此模板">
+                                <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="15" Text="&#xE890;" />
+                              </Button>
+                              <Button Click="OnEditLabelTemplateTileClick" Style="{StaticResource TemplateTileActionButtonStyle}" ToolTip="编辑此模板">
+                                <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="15" Text="&#xE70F;" />
+                              </Button>
+                          </StackPanel>
+                        </Grid>
+                      </Border>
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+                <UniformGrid Margin="0,0,0,16" Columns="4">
                     <StackPanel Margin="0,0,10,0">
                       <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="打印机" />
                       <TextBlock x:Name="LabelPrinterText" Margin="0,5,0,0" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
@@ -519,8 +672,7 @@
                       <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="二维码前缀" />
                       <TextBox x:Name="LabelPrefixTextBox" Margin="0,5,0,0" Height="32" MaxLength="20" ToolTip="标签二维码前缀；留空表示不添加前缀" />
                     </StackPanel>
-                  </UniformGrid>
-                </Grid>
+                </UniformGrid>
                 <Grid Margin="0,0,0,16">
                   <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
@@ -542,10 +694,12 @@
                   <StackPanel DockPanel.Dock="Left">
                     <TextBlock x:Name="LabelStatusText" Margin="0,5,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap" />
                   </StackPanel>
-                  <Button DockPanel.Dock="Right" Click="OnPrintLabelClick" Content="打印标签" Style="{StaticResource PrimaryButtonStyle}" />
+                  <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                    <Button Click="OnPreviewLabelClick" Content="预览标签" />
+                    <Button x:Name="LabelPrintButton" Margin="8,0,0,0" Click="OnPrintLabelClick" Content="打印标签" Style="{StaticResource PrimaryButtonStyle}" />
+                  </StackPanel>
                 </DockPanel>
-              </StackPanel>
-            </Border>
+            </StackPanel>
           </StackPanel>
         </ScrollViewer>
 
@@ -617,20 +771,52 @@
                   <Button DockPanel.Dock="Right" Click="OnTogglePrintConfigClick" Content="收起配置" />
                 </DockPanel>
 
-                <DockPanel Margin="0,0,0,12">
-                  <StackPanel DockPanel.Dock="Left">
-                    <TextBlock FontSize="16" FontWeight="SemiBold" Text="打印模板列表" />
-                    <TextBlock Margin="0,5,0,0" Foreground="{StaticResource MutedTextBrush}" Text="手机终端可直接选择模板打印，模板 ID 保存后保持稳定。" />
-                  </StackPanel>
-                  <Button DockPanel.Dock="Right" Click="OnNewPrintTemplateClick" Content="添加新模板" Style="{StaticResource PrimaryButtonStyle}" />
-                </DockPanel>
+                <StackPanel x:Name="PrintTemplateListPanel">
+                  <DockPanel Margin="0,0,0,12">
+                    <StackPanel DockPanel.Dock="Left">
+                      <TextBlock FontSize="16" FontWeight="SemiBold" Text="打印模板列表" />
+                      <TextBlock Margin="0,5,0,0" Foreground="{StaticResource MutedTextBrush}" Text="选择操作列中的“编辑”进入模板配置页面，模板 ID 保存后保持稳定。" />
+                    </StackPanel>
+                    <Button DockPanel.Dock="Right" Click="OnNewPrintTemplateClick" Content="添加新模板" Style="{StaticResource PrimaryButtonStyle}" />
+                  </DockPanel>
 
-                <DataGrid x:Name="PrintTemplatesList" MinHeight="300" MaxHeight="460" SelectionChanged="OnPrintTemplateSelected">
+                  <DataGrid x:Name="PrintTemplatesList" MinHeight="300" MaxHeight="460" SelectionChanged="OnPrintTemplateSelected">
                   <DataGrid.Columns>
+                    <DataGridTextColumn Header="编号" Binding="{Binding TemplateNumber}" Width="70" />
                     <DataGridTextColumn Header="模板名称" Binding="{Binding Name}" Width="180" />
                     <DataGridTextColumn Header="模板 ID" Binding="{Binding Id}" Width="220" />
                     <DataGridTextColumn Header="类型" Binding="{Binding Type}" Width="90" />
                     <DataGridTextColumn Header="打印机" Binding="{Binding Printer}" Width="190" />
+                    <DataGridTemplateColumn Header="打印机状态" Width="140">
+                      <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate>
+                          <Border Padding="8,4" HorizontalAlignment="Left" CornerRadius="4">
+                            <Border.Style>
+                              <Style TargetType="Border">
+                                <Setter Property="Background" Value="#DCFCE7" />
+                                <Style.Triggers>
+                                  <DataTrigger Binding="{Binding IsPrinterAvailable}" Value="False">
+                                    <Setter Property="Background" Value="#FEE2E2" />
+                                  </DataTrigger>
+                                </Style.Triggers>
+                              </Style>
+                            </Border.Style>
+                            <TextBlock Text="{Binding PrinterStatusText}" FontWeight="SemiBold">
+                              <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                  <Setter Property="Foreground" Value="#166534" />
+                                  <Style.Triggers>
+                                    <DataTrigger Binding="{Binding IsPrinterAvailable}" Value="False">
+                                      <Setter Property="Foreground" Value="#991B1B" />
+                                    </DataTrigger>
+                                  </Style.Triggers>
+                                </Style>
+                              </TextBlock.Style>
+                            </TextBlock>
+                          </Border>
+                        </DataTemplate>
+                      </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
                     <DataGridTextColumn Header="宽度(mm)" Binding="{Binding WidthMillimeters, StringFormat={}{0:0.##}}" Width="90" />
                     <DataGridTextColumn Header="高度(mm)" Binding="{Binding HeightMillimeters, StringFormat={}{0:0.##}}" Width="90" />
                     <DataGridTextColumn Header="方向" Binding="{Binding Orientation}" Width="90" />
@@ -650,28 +836,34 @@
                       </DataGridTemplateColumn.CellTemplate>
                     </DataGridTemplateColumn>
                   </DataGrid.Columns>
-                </DataGrid>
+                  </DataGrid>
+                </StackPanel>
 
-                <Border x:Name="PrintTemplateEditorCard" Margin="0,16,0,0" Padding="16" Background="#F8FAFC" BorderBrush="#E2E8F0" BorderThickness="1" CornerRadius="8" Visibility="Collapsed">
+                <Border x:Name="PrintTemplateEditorCard" Padding="16" Background="#F8FAFC" BorderBrush="#E2E8F0" BorderThickness="1" CornerRadius="8" Visibility="Collapsed">
                   <StackPanel>
                     <DockPanel Margin="0,0,0,14">
                       <StackPanel DockPanel.Dock="Left">
                         <TextBlock x:Name="PrintTemplateEditorTitleText" FontSize="16" FontWeight="SemiBold" Text="添加打印模板" />
                         <TextBlock x:Name="PrintTemplateEditorSubtitleText" Margin="0,5,0,0" Foreground="{StaticResource MutedTextBrush}" Text="填写模板名称、打印机、尺寸、方向和二维码参数。" />
                       </StackPanel>
-                      <Button DockPanel.Dock="Right" Click="OnCancelPrintTemplateEditClick" Content="关闭" />
+                      <Button DockPanel.Dock="Right" Click="OnCancelPrintTemplateEditClick" Content="返回模板列表" />
                     </DockPanel>
 
                     <Grid Margin="0,0,0,14">
                       <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="90" />
                         <ColumnDefinition Width="2*" />
                         <ColumnDefinition Width="*" />
                       </Grid.ColumnDefinitions>
                       <StackPanel Grid.Column="0" Margin="0,0,12,0">
+                        <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="模板编号" />
+                        <TextBox x:Name="PrintTemplateNumberTextBox" Margin="0,6,0,0" IsReadOnly="True" Background="#EEF2F7" />
+                      </StackPanel>
+                      <StackPanel Grid.Column="1" Margin="0,0,12,0">
                         <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="模板名称" />
                         <TextBox x:Name="PrintTemplateNameTextBox" Margin="0,6,0,0" ToolTip="输入模板名称" />
                       </StackPanel>
-                      <StackPanel Grid.Column="1">
+                      <StackPanel Grid.Column="2">
                         <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="模板 ID" />
                         <TextBox x:Name="PrintTemplateIdTextBox" Margin="0,6,0,0" IsReadOnly="True" Background="#EEF2F7" />
                       </StackPanel>
@@ -717,55 +909,52 @@
                   </StackPanel>
                 </Grid>
 
-                <Grid Margin="0,0,0,16">
-                  <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="*" />
-                  </Grid.ColumnDefinitions>
-                  <StackPanel Grid.Column="0" Margin="0,0,12,0">
-                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="纸张方向" />
-                    <ComboBox x:Name="PrintOrientationComboBox" Margin="0,6,0,0" Height="36" SelectedValuePath="Tag">
-                      <ComboBoxItem Content="横向（40 x 60 mm）" Tag="landscape" />
-                      <ComboBoxItem Content="纵向（60 x 40 mm）" Tag="portrait" />
-                    </ComboBox>
-                  </StackPanel>
-                  <StackPanel Grid.Column="1" Margin="0,0,12,0">
-                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="默认打印模式" />
-                    <ComboBox x:Name="PrintModeComboBox" Margin="0,6,0,0" Height="36" SelectedValuePath="Tag">
-                      <ComboBoxItem Content="等比适配" Tag="fit" />
-                      <ComboBoxItem Content="原始尺寸" Tag="actual_size" />
-                      <ComboBoxItem Content="填充纸张" Tag="fill" />
-                    </ComboBox>
-                  </StackPanel>
-                  <StackPanel Grid.Column="2">
-                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="份数" />
-                    <TextBox x:Name="PrintCopiesTextBox" Margin="0,6,0,0" />
-                  </StackPanel>
-                </Grid>
+                <StackPanel Margin="0,0,0,16" Width="200" HorizontalAlignment="Left">
+                  <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="份数" />
+                  <TextBox x:Name="PrintCopiesTextBox" Margin="0,6,0,0" />
+                </StackPanel>
 
                 <Grid Margin="0,0,0,16">
                   <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="220" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="*" />
                   </Grid.ColumnDefinitions>
                   <StackPanel Grid.Column="0" Margin="0,0,16,0">
                     <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="水平校准 (mm)" />
                     <TextBox x:Name="PrintOffsetXTextBox" Margin="0,6,0,0" />
                   </StackPanel>
-                  <TextBlock Grid.Column="1" Margin="0,24,0,0" Foreground="{StaticResource MutedTextBrush}" Text="正数向右移动，负数向左移动；建议先从 1.0 mm 开始测试。" TextWrapping="Wrap" />
+                  <StackPanel Grid.Column="1" Margin="0,0,16,0">
+                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="纵向校准 (mm)" />
+                    <TextBox x:Name="PrintOffsetYTextBox" Margin="0,6,0,0" />
+                  </StackPanel>
+                  <StackPanel Grid.Column="2">
+                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="安全边距 (mm)" />
+                    <TextBox x:Name="PrintSafetyInsetTextBox" Margin="0,6,0,0" />
+                  </StackPanel>
                 </Grid>
 
+                <StackPanel Margin="0,0,0,16">
+                  <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="标签排版" />
+                  <ComboBox x:Name="PrintLayoutStyleComboBox" Margin="0,6,0,0" Height="36" SelectedValuePath="Tag">
+                    <ComboBoxItem Content="上下排版（二维码在上、文字在下）" Tag="stacked" />
+                    <ComboBoxItem Content="左右排版（二维码在左、文字在右）" Tag="qr_left_text_right" />
+                    <ComboBoxItem Content="库位码（左右各上下两个二维码，中间编码）" Tag="location_code_quad_qr" />
+                  </ComboBox>
+                </StackPanel>
+
                 <DockPanel>
-                  <TextBlock x:Name="PrintConfigStatusText" VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap" />
                   <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
-                    <Button Click="OnPrintPreviewClick" Content="打印预览" />
+                    <Button Click="OnDetectPrintPaperClick" Content="检测纸张" />
+                    <Button Margin="8,0,0,0" Click="OnOpenPrinterPreferencesClick" Content="打印首选项" />
+                    <Button Margin="8,0,0,0" Click="OnPrintPreviewClick" Content="打印预览" />
                     <Button Margin="8,0,0,0" Click="OnSavePrintSettingsClick" Content="保存打印配置" Style="{StaticResource PrimaryButtonStyle}" />
                     <Button Margin="8,0,0,0" Click="OnSavePrintTemplateClick" Content="保存模板" Style="{StaticResource PrimaryButtonStyle}" />
                   </StackPanel>
                 </DockPanel>
                   </StackPanel>
                 </Border>
+                <TextBlock x:Name="PrintConfigStatusText" Margin="0,12,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap" />
               </StackPanel>
             </Border>
           </StackPanel>
@@ -778,7 +967,7 @@
                 <DockPanel>
                   <StackPanel DockPanel.Dock="Left">
                     <TextBlock FontSize="18" FontWeight="SemiBold" Text="产品管理" />
-                    <TextBlock Margin="0,6,0,14" Foreground="{StaticResource MutedTextBrush}" Text="查询中心产品和 SKU，选择模板后直接创建二维码打印任务。" />
+                    <TextBlock Margin="0,6,0,14" Foreground="{StaticResource MutedTextBrush}" Text="优先查询本地产品和 SKU，本地无结果时自动从中心同步；选择 SKU 后可直接打印。" />
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
                       <Button Click="OnRefreshCatalogClick" Content="刷新目录" />
                       <TextBlock x:Name="CatalogStatusText" Margin="10,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" Text="本地目录等待同步" />
@@ -786,7 +975,7 @@
                   </StackPanel>
                   <StackPanel x:Name="ProductPrintActionsPanel" DockPanel.Dock="Right" Orientation="Horizontal">
                     <TextBlock x:Name="ProductPrintTemplateText" MaxWidth="145" VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" TextTrimming="CharacterEllipsis" />
-                    <ComboBox x:Name="ProductPrintTemplateComboBox" Width="190" Height="36" Margin="8,0,0,0" Visibility="Collapsed" DisplayMemberPath="Name" SelectionChanged="OnProductPrintTemplateSelectionChanged" />
+                    <ComboBox x:Name="ProductPrintTemplateComboBox" Width="220" Height="36" Margin="8,0,0,0" Visibility="Collapsed" DisplayMemberPath="DisplayName" SelectionChanged="OnProductPrintTemplateSelectionChanged" />
                     <Button x:Name="ChangeProductPrintTemplateButton" Margin="8,0,0,0" Click="OnChangeProductPrintTemplateClick" Content="更换模板" />
                     <Button x:Name="ProductPrintButton" Margin="8,0,0,0" Click="OnPrintSelectedSkusClick" Content="打印标签" Style="{StaticResource PrimaryButtonStyle}" />
                   </StackPanel>
@@ -828,10 +1017,33 @@
                       <DataGridTextColumn Header="品牌" Binding="{Binding Brand}" Width="110" />
                     </DataGrid.Columns>
                   </DataGrid>
-                  <DataGrid x:Name="SkusGrid" Grid.Column="0" Grid.ColumnSpan="2" Height="560" Margin="0" AutoGenerateColumns="False" GridLinesVisibility="None">
+                  <DataGrid x:Name="SkusGrid" Grid.Column="0" Grid.ColumnSpan="2" Height="560" Margin="0" AutoGenerateColumns="False" GridLinesVisibility="None" PreviewMouseLeftButtonDown="OnSkuGridPreviewMouseLeftButtonDown" SelectionMode="Extended" SelectionUnit="FullRow">
                     <DataGrid.Columns>
                       <DataGridCheckBoxColumn Header="选择" Binding="{Binding IsSelected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Width="55" />
-                      <DataGridTextColumn Header="SKU 编码" Binding="{Binding Code}" Width="180" />
+                      <DataGridTemplateColumn Header="SKU 编码" Width="180">
+                        <DataGridTemplateColumn.CellTemplate>
+                          <DataTemplate>
+                            <Border
+                              Tag="CopyCodeTarget"
+                              Background="Transparent"
+                              Cursor="Hand"
+                              ToolTip="单击或双击编码可复制"
+                              PreviewMouseLeftButtonDown="OnCopySkuCodePreviewMouseLeftButtonDown">
+                              <DockPanel>
+                                <Button
+                                  DockPanel.Dock="Right"
+                                  Margin="6,0,0,0"
+                                  Style="{StaticResource CopyCodeButtonStyle}"
+                                  ToolTip="复制 SKU 编码"
+                                  Focusable="False">
+                                  <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="14" Text="&#xE8C8;" />
+                                </Button>
+                                <TextBlock VerticalAlignment="Center" Text="{Binding Code}" TextTrimming="CharacterEllipsis" />
+                              </DockPanel>
+                            </Border>
+                          </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                      </DataGridTemplateColumn>
                       <DataGridTextColumn Header="SKU 名称" Binding="{Binding Name}" Width="*" />
                       <DataGridTextColumn Header="规格" Binding="{Binding Spec}" Width="150" />
                       <DataGridTextColumn Header="产品" Binding="{Binding ProductCode}" Width="150" />
@@ -839,8 +1051,12 @@
                   </DataGrid>
                 </Grid>
                 <DockPanel Margin="0,14,0,0">
-                  <TextBlock x:Name="ProductStatusText" VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" Text="等待查询中心数据" />
+                  <TextBlock x:Name="ProductStatusText" MaxWidth="430" VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" Text="正在加载本地 SKU" TextWrapping="Wrap" />
                   <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                    <Button x:Name="ProductPreviousPageButton" MinWidth="64" Click="OnPreviousProductPageClick" Content="上一页" IsEnabled="False" />
+                    <TextBlock x:Name="ProductPageText" MinWidth="150" Margin="10,0" VerticalAlignment="Center" TextAlignment="Center" Foreground="{StaticResource MutedTextBrush}" Text="第 1 页" />
+                    <Button x:Name="ProductNextPageButton" MinWidth="64" Click="OnNextProductPageClick" Content="下一页" IsEnabled="False" />
+                    <Border Width="1" Height="24" Margin="14,0" Background="#E2E8F0" />
                     <TextBlock VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" Text="二维码前缀" />
                     <TextBox x:Name="SkuQrPrefixTextBox" Width="76" Margin="8,0,0,0" Text="T" />
                     <Button Margin="8,0,0,0" Click="OnSaveQrPrefixClick" Content="保存" />
@@ -851,8 +1067,197 @@
           </StackPanel>
         </ScrollViewer>
 
+        <ScrollViewer x:Name="BoxLabelsPage" Visibility="Collapsed" VerticalScrollBarVisibility="Auto">
+          <StackPanel Margin="28">
+            <Border Style="{StaticResource CardStyle}">
+              <StackPanel>
+                <DockPanel Margin="0,0,0,14">
+                  <StackPanel DockPanel.Dock="Left">
+                    <TextBlock FontSize="18" FontWeight="SemiBold" Text="箱唛查询" />
+                    <TextBlock Margin="0,6,0,0" Foreground="{StaticResource MutedTextBrush}" Text="本地查询箱唛、产品和 SKU；集运订单候选项从中心在线获取。" />
+                  </StackPanel>
+                  <Button DockPanel.Dock="Right" Click="OnRefreshCatalogClick" Content="同步本地数据" />
+                </DockPanel>
+
+                <Grid Margin="0,0,0,10">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="2*" />
+                    <ColumnDefinition Width="2*" />
+                    <ColumnDefinition Width="2*" />
+                    <ColumnDefinition Width="2*" />
+                  </Grid.ColumnDefinitions>
+                  <StackPanel Grid.Column="0" Margin="0,0,10,0">
+                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="箱唛 / 箱号 / 厂家订单" />
+                    <TextBox x:Name="BoxLabelKeywordTextBox" Height="36" Margin="0,6,0,0" VerticalContentAlignment="Center" />
+                  </StackPanel>
+                  <StackPanel Grid.Column="1" Margin="0,0,10,0">
+                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="产品" />
+                    <Grid Margin="0,6,0,0">
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                      <ComboBox x:Name="BoxLabelProductComboBox" Height="36" IsEditable="True" DisplayMemberPath="Code" SelectionChanged="OnBoxLabelProductChanged" />
+                      <Button Grid.Column="1" Margin="6,0,0,0" Click="OnSearchBoxLabelProductsClick" Content="查找" />
+                    </Grid>
+                  </StackPanel>
+                  <StackPanel Grid.Column="2" Margin="0,0,10,0">
+                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="SKU" />
+                    <Grid Margin="0,6,0,0">
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                      <ComboBox x:Name="BoxLabelSkuComboBox" Height="36" IsEditable="True" DisplayMemberPath="Code" />
+                      <Button Grid.Column="1" Margin="6,0,0,0" Click="OnSearchBoxLabelSkusClick" Content="查找" />
+                    </Grid>
+                  </StackPanel>
+                  <StackPanel Grid.Column="3">
+                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="集运订单号" />
+                    <Grid Margin="0,6,0,0">
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                      <ComboBox x:Name="BoxLabelConsolidationComboBox" Height="36" IsEditable="True" DisplayMemberPath="DisplayName" />
+                      <Button Grid.Column="1" Margin="6,0,0,0" Click="OnSearchConsolidationOrdersClick" Content="在线" />
+                    </Grid>
+                  </StackPanel>
+                </Grid>
+
+                <DockPanel>
+                  <StackPanel DockPanel.Dock="Left" Orientation="Horizontal">
+                    <ComboBox x:Name="BoxLabelStatusComboBox" Width="140" Height="36" SelectedValuePath="Tag" SelectedIndex="0">
+                      <ComboBoxItem Content="全部箱唛状态" Tag="" />
+                      <ComboBoxItem Content="正常" Tag="normal" />
+                      <ComboBoxItem Content="已作废" Tag="voided" />
+                      <ComboBoxItem Content="短装" Tag="shorted" />
+                      <ComboBoxItem Content="已收货" Tag="received" />
+                      <ComboBoxItem Content="破损" Tag="damaged" />
+                      <ComboBoxItem Content="异常" Tag="exception" />
+                    </ComboBox>
+                    <ComboBox x:Name="BoxLabelReceivingComboBox" Width="140" Height="36" Margin="8,0,0,0" SelectedValuePath="Tag" SelectedIndex="0">
+                      <ComboBoxItem Content="全部收货状态" Tag="" />
+                      <ComboBoxItem Content="待收货" Tag="pending" />
+                      <ComboBoxItem Content="扫码中" Tag="scanning" />
+                      <ComboBoxItem Content="已收货" Tag="received" />
+                      <ComboBoxItem Content="破损" Tag="damaged" />
+                    </ComboBox>
+                    <Button Margin="8,0,0,0" Click="OnQueryBoxLabelsClick" Content="查询" Style="{StaticResource PrimaryButtonStyle}" />
+                    <Button Margin="8,0,0,0" Click="OnResetBoxLabelsClick" Content="重置" />
+                  </StackPanel>
+                  <TextBlock x:Name="BoxLabelCatalogStatusText" DockPanel.Dock="Right" VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" Text="等待本地箱唛同步" />
+                </DockPanel>
+              </StackPanel>
+            </Border>
+
+            <Grid Margin="0,18,0,0">
+              <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="380" /></Grid.ColumnDefinitions>
+              <Border Grid.Column="0" Style="{StaticResource CardStyle}" Margin="0,0,18,0">
+                <Grid>
+                  <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+                  <DockPanel Margin="0,0,0,14">
+                    <StackPanel DockPanel.Dock="Left">
+                      <TextBlock FontSize="17" FontWeight="SemiBold" Text="箱唛列表" />
+                      <TextBlock x:Name="BoxLabelResultText" Margin="0,5,0,0" Foreground="{StaticResource MutedTextBrush}" Text="尚未查询" />
+                    </StackPanel>
+                    <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                      <StackPanel Width="190">
+                        <ComboBox x:Name="BoxLabelPrintTemplateComboBox" Width="220" Height="36" DisplayMemberPath="DisplayName" SelectionChanged="OnBoxLabelPrintTemplateSelected" />
+                        <TextBlock x:Name="BoxLabelTemplateStatusText" Margin="2,3,0,0" FontSize="10" Foreground="{StaticResource MutedTextBrush}" Text="正在读取模板" TextTrimming="CharacterEllipsis" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+                      </StackPanel>
+                      <Button x:Name="BoxLabelEditTemplateButton" Margin="6,0,0,0" Click="OnEditSelectedBoxMarkTemplateClick" Style="{StaticResource CopyCodeButtonStyle}" ToolTip="编辑当前厂家箱唛模板">
+                        <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="15" Text="&#xE70F;" />
+                      </Button>
+                      <TextBox x:Name="BoxLabelCopiesTextBox" Width="48" Height="36" Margin="8,0,0,0" Text="1" TextAlignment="Center" VerticalContentAlignment="Center" ToolTip="打印份数" />
+                      <Button x:Name="BoxLabelPreviewButton" Margin="8,0,0,0" Click="OnPreviewSelectedBoxLabelsClick" Style="{StaticResource CopyCodeButtonStyle}" ToolTip="预览勾选或当前箱唛">
+                        <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="15" Text="&#xE890;" />
+                      </Button>
+                      <Button x:Name="BoxLabelPrintButton" Margin="8,0,0,0" Click="OnPrintSelectedBoxLabelsClick" Content="打印箱唛" Style="{StaticResource PrimaryButtonStyle}" />
+                    </StackPanel>
+                  </DockPanel>
+                  <DataGrid x:Name="BoxLabelsGrid" Grid.Row="1" Height="520" AutoGenerateColumns="False" GridLinesVisibility="None" PreviewMouseLeftButtonDown="OnBoxLabelGridPreviewMouseLeftButtonDown" SelectionChanged="OnBoxLabelSelected" SelectionMode="Extended" SelectionUnit="FullRow">
+                    <DataGrid.Columns>
+                      <DataGridCheckBoxColumn Header="选择" Binding="{Binding IsSelected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Width="50" />
+                      <DataGridTemplateColumn Header="箱唛码" Width="145">
+                        <DataGridTemplateColumn.CellTemplate>
+                          <DataTemplate>
+                            <Border
+                              Tag="CopyCodeTarget"
+                              Background="Transparent"
+                              Cursor="Hand"
+                              ToolTip="单击或双击编码可复制"
+                              PreviewMouseLeftButtonDown="OnCopyBoxLabelCodePreviewMouseLeftButtonDown">
+                              <DockPanel>
+                                <Button
+                                  DockPanel.Dock="Right"
+                                  Margin="6,0,0,0"
+                                  Style="{StaticResource CopyCodeButtonStyle}"
+                                  ToolTip="复制箱唛码"
+                                  Focusable="False">
+                                  <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="14" Text="&#xE8C8;" />
+                                </Button>
+                                <TextBlock VerticalAlignment="Center" Text="{Binding LabelCode}" TextTrimming="CharacterEllipsis" />
+                              </DockPanel>
+                            </Border>
+                          </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                      </DataGridTemplateColumn>
+                      <DataGridTextColumn Header="SKU / 混箱" Binding="{Binding SkuDisplay}" Width="220" />
+                      <DataGridTextColumn Header="厂家订单" Binding="{Binding SupplierOrder.Code}" Width="140" />
+                      <DataGridTextColumn Header="集运订单" Binding="{Binding ConsolidationDisplay}" Width="140" />
+                      <DataGridTextColumn Header="箱唛状态" Binding="{Binding StatusLabel}" Width="90" />
+                      <DataGridTextColumn Header="仓库收货" Binding="{Binding ReceivingDisplay}" Width="90" />
+                      <DataGridTextColumn Header="创建时间" Binding="{Binding CreatedAt, StringFormat=yyyy-MM-dd HH:mm}" Width="145" />
+                    </DataGrid.Columns>
+                  </DataGrid>
+                  <DockPanel Grid.Row="2" Margin="0,14,0,0">
+                    <TextBlock x:Name="BoxLabelPageText" VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" Text="第 1 页" />
+                    <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                      <Button x:Name="PreviousBoxLabelPageButton" Click="OnPreviousBoxLabelPageClick" Content="上一页" />
+                      <Button x:Name="NextBoxLabelPageButton" Margin="8,0,0,0" Click="OnNextBoxLabelPageClick" Content="下一页" />
+                    </StackPanel>
+                  </DockPanel>
+                </Grid>
+              </Border>
+
+              <Border x:Name="BoxLabelDetailPanel" Grid.Column="1" Style="{StaticResource CardStyle}">
+                <StackPanel>
+                  <TextBlock FontSize="17" FontWeight="SemiBold" Text="箱唛详情" />
+                  <TextBlock Margin="0,12,0,0" Foreground="{StaticResource MutedTextBrush}" Text="箱唛编码" />
+                  <TextBlock FontSize="18" FontWeight="SemiBold" Text="{Binding LabelCode, TargetNullValue=-}" TextWrapping="Wrap" />
+                  <UniformGrid Columns="2" Margin="0,14,0,0">
+                    <StackPanel Margin="0,0,10,12"><TextBlock Foreground="{StaticResource MutedTextBrush}" Text="箱号" /><TextBlock Text="{Binding BoxNo, TargetNullValue=-}" TextWrapping="Wrap" /></StackPanel>
+                    <StackPanel Margin="0,0,0,12"><TextBlock Foreground="{StaticResource MutedTextBrush}" Text="箱规" /><TextBlock Text="{Binding CaseSpecName, TargetNullValue=-}" TextWrapping="Wrap" /></StackPanel>
+                    <StackPanel Margin="0,0,10,12"><TextBlock Foreground="{StaticResource MutedTextBrush}" Text="厂家" /><TextBlock Text="{Binding ManufacturerName, TargetNullValue=-}" TextWrapping="Wrap" /></StackPanel>
+                    <StackPanel Margin="0,0,0,12"><TextBlock Foreground="{StaticResource MutedTextBrush}" Text="厂家订单" /><TextBlock Text="{Binding SupplierOrder.Code, TargetNullValue=-}" /></StackPanel>
+                    <StackPanel Margin="0,0,10,12"><TextBlock Foreground="{StaticResource MutedTextBrush}" Text="采购订单" /><TextBlock Text="{Binding PurchaseOrder.Code, TargetNullValue=-}" /></StackPanel>
+                    <StackPanel Margin="0,0,0,12"><TextBlock Foreground="{StaticResource MutedTextBrush}" Text="集运订单" /><TextBlock Text="{Binding ConsolidationOrder.Code, TargetNullValue=-}" /></StackPanel>
+                    <StackPanel Margin="0,0,10,12"><TextBlock Foreground="{StaticResource MutedTextBrush}" Text="集运柜" /><TextBlock Text="{Binding ConsolidationContainer, TargetNullValue=-}" /></StackPanel>
+                    <StackPanel Margin="0,0,0,12"><TextBlock Foreground="{StaticResource MutedTextBrush}" Text="集运收货单" /><TextBlock Text="{Binding CentralReceipt.Code, TargetNullValue=-}" /></StackPanel>
+                    <StackPanel Margin="0,0,10,12"><TextBlock Foreground="{StaticResource MutedTextBrush}" Text="收货会话" /><TextBlock Text="{Binding Receiving.Session.Code, TargetNullValue=-}" /></StackPanel>
+                    <StackPanel Margin="0,0,0,12"><TextBlock Foreground="{StaticResource MutedTextBrush}" Text="海外仓收货单" /><TextBlock Text="{Binding Receiving.ReceivingRecord.Code, TargetNullValue=-}" /></StackPanel>
+                    <StackPanel Margin="0,0,10,12"><TextBlock Foreground="{StaticResource MutedTextBrush}" Text="仓库" /><TextBlock Text="{Binding Receiving.WarehouseCode, TargetNullValue=-}" /></StackPanel>
+                    <StackPanel Margin="0,0,0,12"><TextBlock Foreground="{StaticResource MutedTextBrush}" Text="库位" /><TextBlock Text="{Binding Receiving.LocationCode, TargetNullValue=-}" /></StackPanel>
+                  </UniformGrid>
+                  <TextBlock Margin="0,4,0,6" FontWeight="SemiBold" Text="产品与 SKU" />
+                  <DataGrid Height="180" ItemsSource="{Binding SkuItems}" AutoGenerateColumns="False" IsReadOnly="True">
+                    <DataGrid.Columns>
+                      <DataGridTextColumn Header="产品" Binding="{Binding ProductCode}" Width="95" />
+                      <DataGridTextColumn Header="SKU" Binding="{Binding SkuCode}" Width="*" />
+                      <DataGridTextColumn Header="数量" Binding="{Binding QuantityPerBox}" Width="55" />
+                    </DataGrid.Columns>
+                  </DataGrid>
+                </StackPanel>
+              </Border>
+            </Grid>
+          </StackPanel>
+        </ScrollViewer>
+
         <ScrollViewer x:Name="AdvancedPage" Visibility="Collapsed" VerticalScrollBarVisibility="Auto">
           <StackPanel x:Name="AdvancedContentStack" Margin="28">
+            <Border Style="{StaticResource CardStyle}">
+              <DockPanel>
+                <StackPanel DockPanel.Dock="Left">
+                  <TextBlock FontSize="18" FontWeight="SemiBold" Text="应用控制" />
+                  <TextBlock x:Name="ApplicationControlStatusText" Margin="0,6,16,0" Foreground="{StaticResource MutedTextBrush}" Text="管理开机启动和应用进程。" TextWrapping="Wrap" />
+                  <CheckBox x:Name="LaunchAtSignInCheckBox" Margin="0,12,0,0" Checked="OnLaunchAtSignInChanged" Unchecked="OnLaunchAtSignInChanged" Content="登录 Windows 时启动 FSCM Edge" />
+                </StackPanel>
+                <Button DockPanel.Dock="Right" VerticalAlignment="Center" Click="OnRestartApplicationClick" Content="重启应用" />
+              </DockPanel>
+            </Border>
+
             <Border Style="{StaticResource CardStyle}">
               <DockPanel>
                 <StackPanel DockPanel.Dock="Left">

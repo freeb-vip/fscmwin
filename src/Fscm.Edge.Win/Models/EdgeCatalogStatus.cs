@@ -23,4 +23,10 @@ public sealed class EdgeCatalogStatus
 
     [JsonPropertyName("last_error")]
     public string LastError { get; set; } = string.Empty;
+
+    [JsonPropertyName("box_label_count")]
+    public long BoxLabelCount { get; set; }
+
+    [JsonPropertyName("box_labels_ready")]
+    public bool BoxLabelsReady { get; set; }
 }

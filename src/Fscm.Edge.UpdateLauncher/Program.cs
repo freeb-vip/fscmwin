@@ -11,7 +11,7 @@ internal static class Program
 {
     private static int Main(string[] args)
     {
-        if (!TryReadArguments(args, out int parentProcessId, out string? installerPath) || !File.Exists(installerPath))
+        if (!TryReadArguments(args, out int parentProcessId, out string? targetPath) || !File.Exists(targetPath))
         {
             return 2;
         }
@@ -29,31 +29,32 @@ internal static class Program
             // The parent application has already exited.
         }
 
-        using Process installer = Process.Start(new ProcessStartInfo
+        using Process target = Process.Start(new ProcessStartInfo
         {
-            FileName = installerPath,
-            WorkingDirectory = Path.GetDirectoryName(installerPath)!,
+            FileName = targetPath,
+            WorkingDirectory = Path.GetDirectoryName(targetPath)!,
             UseShellExecute = true,
-        }) ?? throw new InvalidOperationException("Unable to start the update installer.");
+        }) ?? throw new InvalidOperationException("Unable to start the requested process.");
         return 0;
     }
 
-    private static bool TryReadArguments(string[] args, out int parentProcessId, out string? installerPath)
+    private static bool TryReadArguments(string[] args, out int parentProcessId, out string? targetPath)
     {
         parentProcessId = 0;
-        installerPath = null;
+        targetPath = null;
         for (int index = 0; index < args.Length - 1; index += 2)
         {
             if (string.Equals(args[index], "--parent-pid", StringComparison.Ordinal))
             {
                 _ = int.TryParse(args[index + 1], out parentProcessId);
             }
-            else if (string.Equals(args[index], "--installer", StringComparison.Ordinal))
+            else if (string.Equals(args[index], "--installer", StringComparison.Ordinal) ||
+                string.Equals(args[index], "--restart", StringComparison.Ordinal))
             {
-                installerPath = args[index + 1];
+                targetPath = args[index + 1];
             }
         }
 
-        return parentProcessId > 0 && !string.IsNullOrWhiteSpace(installerPath);
+        return parentProcessId > 0 && !string.IsNullOrWhiteSpace(targetPath);
     }
 }

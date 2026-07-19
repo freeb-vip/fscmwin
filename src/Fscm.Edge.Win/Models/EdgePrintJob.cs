@@ -60,6 +60,9 @@ public sealed class EdgePrintJob
     [JsonPropertyName("text")]
     public string Text { get; set; } = string.Empty;
 
+    [JsonPropertyName("qr_code_content")]
+    public string QrCodeContent { get; set; } = string.Empty;
+
     [JsonPropertyName("copies")]
     public int Copies { get; set; } = 1;
 

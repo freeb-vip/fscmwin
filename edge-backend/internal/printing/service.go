@@ -2,13 +2,17 @@ package printing
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"sync"
 	"time"
 )
+
+var ErrIdempotencyConflict = errors.New("idempotency key already belongs to a different print request")
 
 type Config struct {
 	DefaultPrinter, Template, Orientation, Mode string
@@ -20,6 +24,7 @@ type Config struct {
 }
 type Template struct {
 	ID                 string  `json:"Id"`
+	TemplateNumber     string  `json:"TemplateNumber,omitempty"`
 	Name               string  `json:"Name"`
 	Printer            string  `json:"Printer"`
 	WidthMillimeters   float64 `json:"WidthMillimeters"`
@@ -30,29 +35,33 @@ type Template struct {
 	OffsetXMillimeters float64 `json:"OffsetXMillimeters"`
 	SkuQRPrefix        string  `json:"SkuQrPrefix"`
 	LabelQRPrefix      string  `json:"LabelQrPrefix,omitempty"`
+	LayoutStyle        string  `json:"LayoutStyle,omitempty"`
+	TextFontSizePoints float64 `json:"TextFontSizePoints,omitempty"`
 	Type               string  `json:"Type,omitempty"`
 	MaxDisplayLength   int     `json:"MaxDisplayLength,omitempty"`
 }
 type Job struct {
-	ID               string     `json:"id"`
-	IdempotencyKey   string     `json:"idempotency_key"`
-	Source           string     `json:"source"`
-	Printer          string     `json:"printer"`
-	TemplateID       string     `json:"template_id,omitempty"`
-	Template         string     `json:"template"`
-	Status           string     `json:"status"`
-	SubmittedAt      time.Time  `json:"submitted_at"`
-	StartedAt        *time.Time `json:"started_at,omitempty"`
-	FinishedAt       *time.Time `json:"finished_at,omitempty"`
-	Error            string     `json:"error,omitempty"`
-	Items            []Item     `json:"items,omitempty"`
-	Kind             string     `json:"kind,omitempty"`
-	Text             string     `json:"text,omitempty"`
-	QRCodeContent    string     `json:"qr_code_content,omitempty"`
-	Copies           int        `json:"copies"`
-	BoxMarks         []BoxMark  `json:"box_marks,omitempty"`
-	RemoteJobID      uint       `json:"-"`
-	RemoteLeaseToken string     `json:"-"`
+	ID                 string          `json:"id"`
+	IdempotencyKey     string          `json:"idempotency_key"`
+	Source             string          `json:"source"`
+	Printer            string          `json:"printer"`
+	TemplateID         string          `json:"template_id,omitempty"`
+	Template           string          `json:"template"`
+	Status             string          `json:"status"`
+	SubmittedAt        time.Time       `json:"submitted_at"`
+	StartedAt          *time.Time      `json:"started_at,omitempty"`
+	FinishedAt         *time.Time      `json:"finished_at,omitempty"`
+	Error              string          `json:"error,omitempty"`
+	Items              []Item          `json:"items,omitempty"`
+	Kind               string          `json:"kind,omitempty"`
+	Text               string          `json:"text,omitempty"`
+	QRCodeContent      string          `json:"qr_code_content,omitempty"`
+	PayloadSnapshot    json.RawMessage `json:"payload_snapshot,omitempty"`
+	RequestFingerprint string          `json:"request_fingerprint,omitempty"`
+	Copies             int             `json:"copies"`
+	BoxMarks           []BoxMark       `json:"box_marks,omitempty"`
+	RemoteJobID        uint            `json:"-"`
+	RemoteLeaseToken   string          `json:"-"`
 }
 type Item struct {
 	SKUID         uint   `json:"sku_id"`
@@ -76,18 +85,19 @@ type BoxMark struct {
 	InboundCode  string   `json:"inbound_code"`
 }
 type Request struct {
-	JobID          string    `json:"job_id"`
-	IdempotencyKey string    `json:"idempotency_key"`
-	Source         string    `json:"source"`
-	Printer        string    `json:"printer"`
-	Template       string    `json:"template"`
-	TemplateID     string    `json:"template_id"`
-	Items          []Item    `json:"items"`
-	Kind           string    `json:"kind"`
-	Text           string    `json:"text"`
-	QRCodeContent  string    `json:"qr_code_content"`
-	Copies         int       `json:"copies"`
-	BoxMarks       []BoxMark `json:"box_marks"`
+	JobID           string          `json:"job_id"`
+	IdempotencyKey  string          `json:"idempotency_key"`
+	Source          string          `json:"source"`
+	Printer         string          `json:"printer"`
+	Template        string          `json:"template"`
+	TemplateID      string          `json:"template_id"`
+	Items           []Item          `json:"items"`
+	Kind            string          `json:"kind"`
+	Text            string          `json:"text"`
+	QRCodeContent   string          `json:"qr_code_content"`
+	PayloadSnapshot json.RawMessage `json:"payload_snapshot"`
+	Copies          int             `json:"copies"`
+	BoxMarks        []BoxMark       `json:"box_marks"`
 }
 
 type Service struct {
@@ -266,10 +276,14 @@ func (s *Service) create(req Request, remoteJobID uint, leaseToken string) (Job,
 		}
 	}
 	key := strings.TrimSpace(req.IdempotencyKey)
+	fingerprint := fingerprintPrintRequest(req)
 	if key != "" {
 		if id, ok := s.keys[key]; ok {
 			for _, job := range s.jobs {
 				if job.ID == id {
+					if job.RequestFingerprint != "" && job.RequestFingerprint != fingerprint {
+						return Job{}, false, ErrIdempotencyConflict
+					}
 					return job, true, nil
 				}
 			}
@@ -285,7 +299,7 @@ func (s *Service) create(req Request, remoteJobID uint, leaseToken string) (Job,
 	if copies < 1 {
 		copies = 1
 	}
-	job := Job{ID: id, IdempotencyKey: key, Source: first(req.Source, "lan"), Printer: first(printer, s.cfg.DefaultPrinter), TemplateID: req.TemplateID, Template: first(template, s.cfg.Template), Status: "queued", SubmittedAt: time.Now(), RemoteJobID: remoteJobID, RemoteLeaseToken: leaseToken, Kind: req.Kind, Text: strings.TrimSpace(req.Text), QRCodeContent: strings.TrimSpace(req.QRCodeContent), Copies: copies, BoxMarks: req.BoxMarks}
+	job := Job{ID: id, IdempotencyKey: key, Source: first(req.Source, "lan"), Printer: first(printer, s.cfg.DefaultPrinter), TemplateID: req.TemplateID, Template: first(template, s.cfg.Template), Status: "queued", SubmittedAt: time.Now(), RemoteJobID: remoteJobID, RemoteLeaseToken: leaseToken, Kind: req.Kind, Text: strings.TrimSpace(req.Text), QRCodeContent: strings.TrimSpace(req.QRCodeContent), PayloadSnapshot: append(json.RawMessage(nil), req.PayloadSnapshot...), RequestFingerprint: fingerprint, Copies: copies, BoxMarks: req.BoxMarks}
 	job.Items = make([]Item, 0, len(req.Items))
 	for _, item := range req.Items {
 		item.SKUCode = strings.TrimSpace(item.SKUCode)
@@ -305,6 +319,23 @@ func (s *Service) create(req Request, remoteJobID uint, leaseToken string) (Job,
 		s.keys[key] = id
 	}
 	return job, false, nil
+}
+
+func fingerprintPrintRequest(req Request) string {
+	payload, _ := json.Marshal(struct {
+		Printer         string          `json:"printer"`
+		Template        string          `json:"template"`
+		TemplateID      string          `json:"template_id"`
+		Kind            string          `json:"kind"`
+		Text            string          `json:"text"`
+		QRCodeContent   string          `json:"qr_code_content"`
+		PayloadSnapshot json.RawMessage `json:"payload_snapshot"`
+		Copies          int             `json:"copies"`
+		Items           []Item          `json:"items"`
+		BoxMarks        []BoxMark       `json:"box_marks"`
+	}{req.Printer, req.Template, req.TemplateID, req.Kind, req.Text, req.QRCodeContent, req.PayloadSnapshot, req.Copies, req.Items, req.BoxMarks})
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
 }
 
 func (s *Service) PendingAudits(limit int) ([]Job, error) { return s.store.PendingAudits(limit) }

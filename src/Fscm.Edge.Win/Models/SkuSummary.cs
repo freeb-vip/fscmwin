@@ -3,12 +3,17 @@
 // Copyright (C) Leszek Pomianowski and WPF UI Contributors.
 // All Rights Reserved.
 
+using System.ComponentModel;
 using System.Text.Json.Serialization;
 
 namespace Fscm.Edge.Win.Models;
 
-public sealed class SkuSummary
+public sealed class SkuSummary : INotifyPropertyChanged
 {
+    private bool _isSelected;
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+
     [JsonPropertyName("id")]
     public uint Id { get; set; }
 
@@ -31,5 +36,18 @@ public sealed class SkuSummary
     public string ProductCode { get; set; } = string.Empty;
 
     [JsonIgnore]
-    public bool IsSelected { get; set; }
+    public bool IsSelected
+    {
+        get => _isSelected;
+        set
+        {
+            if (_isSelected == value)
+            {
+                return;
+            }
+
+            _isSelected = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsSelected)));
+        }
+    }
 }

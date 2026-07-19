@@ -170,6 +170,26 @@ public sealed class AppUpdateService : IDisposable
 
     public void StartUpdateLauncher(string installerPath, int parentProcessId)
     {
+        StartLauncherAfterExit(installerPath, parentProcessId, "--installer", Path.GetDirectoryName(installerPath)!);
+    }
+
+    public void StartApplicationAfterExit(string applicationPath, int parentProcessId)
+    {
+        if (!File.Exists(applicationPath))
+        {
+            throw new FileNotFoundException("FSCM Edge executable is missing.", applicationPath);
+        }
+
+        string launcherDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "FSCM Edge",
+            "Restart",
+            Guid.NewGuid().ToString("N"));
+        StartLauncherAfterExit(applicationPath, parentProcessId, "--restart", launcherDirectory);
+    }
+
+    private static void StartLauncherAfterExit(string targetPath, int parentProcessId, string targetArgument, string launcherDirectory)
+    {
         string sourceDirectory = Path.Combine(AppContext.BaseDirectory, "UpdateLauncher");
         string sourceLauncher = Path.Combine(sourceDirectory, "Fscm.Edge.UpdateLauncher.exe");
         if (!File.Exists(sourceLauncher))
@@ -177,13 +197,11 @@ public sealed class AppUpdateService : IDisposable
             throw new FileNotFoundException("Update launcher is missing from the application installation.", sourceLauncher);
         }
 
-        string launcherDirectory = Path.Combine(Path.GetDirectoryName(installerPath)!, "UpdateLauncher");
         Directory.CreateDirectory(launcherDirectory);
         foreach (string sourceFile in Directory.EnumerateFiles(sourceDirectory))
         {
             File.Copy(sourceFile, Path.Combine(launcherDirectory, Path.GetFileName(sourceFile)), overwrite: true);
         }
-
         ProcessStartInfo startInfo = new()
         {
             FileName = Path.Combine(launcherDirectory, "Fscm.Edge.UpdateLauncher.exe"),
@@ -193,8 +211,8 @@ public sealed class AppUpdateService : IDisposable
         };
         startInfo.ArgumentList.Add("--parent-pid");
         startInfo.ArgumentList.Add(parentProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture));
-        startInfo.ArgumentList.Add("--installer");
-        startInfo.ArgumentList.Add(installerPath);
+        startInfo.ArgumentList.Add(targetArgument);
+        startInfo.ArgumentList.Add(targetPath);
         using Process launcher = Process.Start(startInfo)
             ?? throw new InvalidOperationException("Unable to start the update launcher.");
     }

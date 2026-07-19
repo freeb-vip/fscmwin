@@ -5,37 +5,87 @@
 
 using System.Globalization;
 using System.Windows;
+using System.Windows.Documents;
 using Fscm.Edge.Win.Models;
+using Fscm.Edge.Win.Services;
 
 namespace Fscm.Edge.Win;
 
 public partial class PrintPreviewWindow : Window
 {
-    private const double PreviewMaxWidth = 720;
-    private const double PreviewMaxHeight = 480;
+    public PrintPreviewWindow(
+        EdgeSettings settings,
+        PrintTemplateProfile template,
+        string qrPayload,
+        string displayText)
+        : this(
+            CreateLabelPreview(settings, template, qrPayload, displayText),
+            settings,
+            template)
+    {
+    }
 
-    public PrintPreviewWindow(EdgeSettings settings)
+    private PrintPreviewWindow(
+        (FixedDocument Document, string Diagnostic) preview,
+        EdgeSettings settings,
+        PrintTemplateProfile template)
+        : this(
+            preview.Document,
+            "标签打印预览",
+            BuildLabelDescription(settings, template),
+            preview.Diagnostic,
+            showConfirmButton: true)
+    {
+    }
+
+    public PrintPreviewWindow(
+        FixedDocument document,
+        string title,
+        string description,
+        string hint,
+        bool showConfirmButton,
+        string confirmButtonText = "确认打印")
     {
         InitializeComponent();
+        Title = title;
+        PreviewTitleText.Text = title;
+        PreviewDescriptionText.Text = description;
+        PreviewHintText.Text = hint;
+        PreviewViewer.Document = document;
+        ConfirmPrintButton.Visibility = showConfirmButton ? Visibility.Visible : Visibility.Collapsed;
+        ConfirmPrintButton.Content = confirmButtonText;
+        CancelButton.Content = showConfirmButton ? "返回修改" : "关闭";
+    }
 
+    private static string BuildLabelDescription(EdgeSettings settings, PrintTemplateProfile template)
+    {
         double width = Math.Max(settings.PrintWidthMillimeters, 1);
         double height = Math.Max(settings.PrintHeightMillimeters, 1);
         bool landscape = string.Equals(settings.PrintOrientation, "landscape", StringComparison.OrdinalIgnoreCase);
-        (width, height) = OrientPageSize(width, height, landscape);
-        double scale = Math.Min(PreviewMaxWidth / width, PreviewMaxHeight / height);
-        PreviewPaper.Width = Math.Max(width * scale, 160);
-        PreviewPaper.Height = Math.Max(height * scale, 120);
-
+        (width, height) = landscape ? (height, width) : (width, height);
         string size = $"{width.ToString("0.##", CultureInfo.InvariantCulture)} x {height.ToString("0.##", CultureInfo.InvariantCulture)} mm";
-        PreviewDescriptionText.Text = $"{size} · 标签纸预览 · 内容按纸张边界缩放显示";
-        PreviewSizeText.Text = $"实际页面：{size}\n方向：{(landscape ? "横向（40 x 60 mm）" : "纵向（60 x 40 mm）")}";
-        PreviewPrinterText.Text = $"打印机：{settings.DefaultPrinter}";
-        PreviewHintText.Text = $"确认页面内容完整显示在蓝色边界内后，再点击确认打印。水平校准：{settings.PrintOffsetXMillimeters:0.##} mm";
+        string layout = PrintTemplatePolicy.NormalizeLayoutStyle(template.LayoutStyle) switch
+        {
+            PrintTemplatePolicy.HorizontalLayoutStyle => "左右排版",
+            PrintTemplatePolicy.LocationCodeLayoutStyle => "库位码四码排版",
+            _ => "上下排版",
+        };
+        return $"{template.Name} · {size} · {layout} · {PrintTemplatePolicy.GetTextFontSizePoints(template):0.##} pt";
     }
 
-    private static (double Width, double Height) OrientPageSize(double width, double height, bool landscape)
+    private static (FixedDocument Document, string Diagnostic) CreateLabelPreview(
+        EdgeSettings settings,
+        PrintTemplateProfile template,
+        string qrPayload,
+        string displayText)
     {
-        return landscape ? (height, width) : (width, height);
+        FixedDocument document = new QrPrintService().CreatePreviewDocument(
+            settings,
+            template,
+            qrPayload,
+            displayText,
+            out string diagnostic);
+        return (document, diagnostic);
     }
 
     private void OnCancelClick(object sender, RoutedEventArgs e)

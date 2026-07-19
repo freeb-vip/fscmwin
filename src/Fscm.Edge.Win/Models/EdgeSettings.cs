@@ -49,6 +49,10 @@ public sealed class EdgeSettings
 
     public double PrintOffsetXMillimeters { get; set; }
 
+    public double PrintOffsetYMillimeters { get; set; }
+
+    public double PrintSafetyInsetMillimeters { get; set; } = 1.5;
+
     public string PrintMode { get; set; } = "fit";
 
     public int PrintCopies { get; set; } = 1;

@@ -12,6 +12,11 @@ import (
 	"time"
 )
 
+var (
+	ErrMobilePrintUnauthorized = fmt.Errorf("mobile print authorization failed")
+	ErrMobilePrintNodeMissing  = fmt.Errorf("current edge node is unavailable to the mobile user")
+)
+
 type Config struct {
 	CenterURL, APIToken, NodeID, NodeName, LANBaseURL, Version, APIVersion, CacheMode string
 	NamespaceID                                                                       uint
@@ -101,12 +106,60 @@ type LocalPrintAudit struct {
 	PrinterName     string      `json:"printer_name"`
 	JobType         string      `json:"job_type"`
 	Status          string      `json:"status"`
+	LocalStatus     string      `json:"local_status,omitempty"`
 	Copies          int         `json:"copies"`
 	ContentSnapshot interface{} `json:"content_snapshot"`
 	SubmittedAt     time.Time   `json:"submitted_at"`
 	StartedAt       *time.Time  `json:"started_at,omitempty"`
 	FinishedAt      *time.Time  `json:"finished_at,omitempty"`
 	ErrorMessage    string      `json:"error_message,omitempty"`
+}
+
+func (c *Client) AuthorizeMobilePrint(ctx context.Context, authorization string) error {
+	authorization = strings.TrimSpace(authorization)
+	if authorization == "" {
+		return ErrMobilePrintUnauthorized
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(c.cfg.CenterURL, "/")+"/api/edge/nodes/available?page_size=100", nil)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Authorization", authorization)
+	request.Header.Set("X-FSCM-Client", "mobile-app")
+	if c.cfg.NamespaceID > 0 {
+		request.Header.Set("X-Namespace-ID", strconv.FormatUint(uint64(c.cfg.NamespaceID), 10))
+	}
+	response, err := c.client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		return ErrMobilePrintUnauthorized
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("mobile print authorization returned %d", response.StatusCode)
+	}
+	var envelope struct {
+		Code int `json:"code"`
+		Data struct {
+			Items []struct {
+				NodeID string `json:"node_id"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
+		return err
+	}
+	if envelope.Code != 0 {
+		return ErrMobilePrintUnauthorized
+	}
+	for _, node := range envelope.Data.Items {
+		if strings.EqualFold(strings.TrimSpace(node.NodeID), strings.TrimSpace(c.cfg.NodeID)) {
+			return nil
+		}
+	}
+	return ErrMobilePrintNodeMissing
 }
 
 func (c *Client) SyncLocalPrintAudit(ctx context.Context, audit LocalPrintAudit) error {
