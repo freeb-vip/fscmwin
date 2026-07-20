@@ -5,6 +5,11 @@
 
 using Fscm.Edge.Win.Models;
 using Fscm.Edge.Win.Services;
+using System.Runtime.ExceptionServices;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
 using Xunit;
 
 namespace Fscm.Edge.Win.UnitTests;
@@ -177,7 +182,7 @@ public sealed class PrintTemplatePolicyTests
         template.TextFontSizePoints = 18;
         template.MaxDisplayLength = 16;
 
-        Assert.Equal("bcab7f8d55da", PrintTemplatePolicy.GetTemplateVersion(template));
+        Assert.Equal("043b917861ea", PrintTemplatePolicy.GetTemplateVersion(template));
     }
 
     [Fact]
@@ -249,6 +254,28 @@ public sealed class PrintTemplatePolicyTests
         Assert.Equal(14, stacked.TextFontSizePoints);
         Assert.Equal(16, horizontal.TextFontSizePoints);
         Assert.Equal(18, otherSize.TextFontSizePoints);
+    }
+
+    [Fact]
+    public void MigrateBuiltInTemplates_V11LimitsOnlyHorizontalAndLocationLayouts()
+    {
+        PrintTemplateProfile stacked = Label("stacked", 60, 40);
+        stacked.LayoutStyle = PrintTemplatePolicy.StackedLayoutStyle;
+        stacked.MaxDisplayLength = 16;
+        PrintTemplateProfile horizontal = Label("horizontal", 80, 50);
+        horizontal.LayoutStyle = PrintTemplatePolicy.HorizontalLayoutStyle;
+        horizontal.MaxDisplayLength = 16;
+        PrintTemplateProfile location = Label("location", 100, 150);
+        location.LayoutStyle = PrintTemplatePolicy.LocationCodeLayoutStyle;
+        location.MaxDisplayLength = 16;
+        var templates = new List<PrintTemplateProfile> { stacked, horizontal, location };
+
+        bool changed = PrintTemplatePolicy.MigrateBuiltInTemplates(templates, sourceVersion: 10);
+
+        Assert.True(changed);
+        Assert.Equal(16, stacked.MaxDisplayLength);
+        Assert.Equal(12, horizontal.MaxDisplayLength);
+        Assert.Equal(12, location.MaxDisplayLength);
     }
 
     [Fact]
@@ -367,15 +394,104 @@ public sealed class PrintTemplatePolicyTests
     [Theory]
     [InlineData("A-01", 28)]
     [InlineData("ABCDEFGHIJKL", 18)]
-    public void LocationCodeFont_FitsWithinConfiguredRange(string text, double minimumExpected)
+    public void LocationCodeFont_AutoFitsAbovePreviousMinimum(string text, double minimumExpected)
     {
         double points = QrPrintService.FitLocationCodeFontSizePoints(
             text,
             76 * QrPrintService.UnitsPerMillimeter,
-            28,
-            18);
+            96 * QrPrintService.UnitsPerMillimeter);
 
-        Assert.InRange(points, minimumExpected, 28);
+        Assert.True(points >= minimumExpected);
+    }
+
+    [Theory]
+    [InlineData(PrintTemplatePolicy.HorizontalLayoutStyle, 80, 50)]
+    [InlineData(PrintTemplatePolicy.LocationCodeLayoutStyle, 100, 150)]
+    public void RestrictedLayouts_RejectThirteenUnicodeScalars(string layoutStyle, double width, double height)
+    {
+        PrintTemplateProfile template = Label("restricted", width, height);
+        template.LayoutStyle = layoutStyle;
+        string twelveEmoji = string.Concat(Enumerable.Repeat("\U0001F600", 12));
+
+        Assert.Null(PrintTemplatePolicy.GetDisplayTextValidationError(template, twelveEmoji));
+        Assert.NotNull(PrintTemplatePolicy.GetDisplayTextValidationError(template, twelveEmoji + "A"));
+    }
+
+    [Fact]
+    public void StackedLayout_DoesNotApplyTwelveCharacterValidation()
+    {
+        PrintTemplateProfile template = Label("stacked", 60, 40);
+        template.LayoutStyle = PrintTemplatePolicy.StackedLayoutStyle;
+
+        Assert.Null(PrintTemplatePolicy.GetDisplayTextValidationError(template, "ABCDEFGHIJKLM"));
+    }
+
+    [Fact]
+    public void LocationCodeContent_AutoFitsAboveOldSizeAndUnderlinesFullText()
+    {
+        RunInSta(() =>
+        {
+            PrintTemplateProfile template = Label("location", 100, 150);
+            template.LayoutStyle = PrintTemplatePolicy.LocationCodeLayoutStyle;
+            Border content = QrPrintService.CreateLabelContent(
+                new BitmapImage(),
+                "A-01",
+                146 * QrPrintService.UnitsPerMillimeter,
+                96 * QrPrintService.UnitsPerMillimeter,
+                template);
+
+            Grid grid = Assert.IsType<Grid>(content.Child);
+            TextBlock label = Assert.Single(grid.Children.OfType<TextBlock>());
+            Assert.Equal("A-01", label.Text);
+            Assert.True(label.FontSize > 28 * 96d / 72d);
+            Assert.Contains(label.TextDecorations, decoration => decoration.Location == TextDecorationLocation.Underline);
+        });
+    }
+
+    [Fact]
+    public void HorizontalContent_FitsTwelveCharactersWithoutEllipsis()
+    {
+        RunInSta(() =>
+        {
+            PrintTemplateProfile template = Label("horizontal", 60, 40);
+            template.LayoutStyle = PrintTemplatePolicy.HorizontalLayoutStyle;
+            template.TextFontSizePoints = 16;
+            Border content = QrPrintService.CreateLabelContent(
+                new BitmapImage(),
+                "ABCDEFGHIJKL",
+                56 * QrPrintService.UnitsPerMillimeter,
+                36 * QrPrintService.UnitsPerMillimeter,
+                template);
+
+            Grid grid = Assert.IsType<Grid>(content.Child);
+            TextBlock label = Assert.Single(grid.Children.OfType<TextBlock>());
+            Assert.Equal("ABCDEFGHIJKL", label.Text);
+            Assert.DoesNotContain("...", label.Text);
+            Assert.InRange(label.FontSize, 0.1, 16 * 96d / 72d);
+        });
+    }
+
+    private static void RunInSta(Action action)
+    {
+        Exception? failure = null;
+        Thread thread = new(() =>
+        {
+            try
+            {
+                action();
+            }
+            catch (Exception ex)
+            {
+                failure = ex;
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+        if (failure is not null)
+        {
+            ExceptionDispatchInfo.Capture(failure).Throw();
+        }
     }
 
     private static PrintTemplateProfile Label(string id, double width, double height)

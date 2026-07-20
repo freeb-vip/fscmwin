@@ -21,7 +21,7 @@ namespace Fscm.Edge.Win.Services;
 
 public sealed class EdgeRuntimeManager : IDisposable
 {
-    private const int PrintTemplatesSchemaVersion = 10;
+    private const int PrintTemplatesSchemaVersion = 11;
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -279,7 +279,7 @@ public sealed class EdgeRuntimeManager : IDisposable
                 orientation = template.Orientation,
                 layout_style = PrintTemplatePolicy.NormalizeLayoutStyle(template.LayoutStyle),
                 text_font_size_pt = PrintTemplatePolicy.GetTextFontSizePoints(template),
-                max_display_length = template.MaxDisplayLength > 0 ? template.MaxDisplayLength : 16,
+                max_display_length = PrintTemplatePolicy.GetMaxDisplayLength(template),
                 label_qr_prefix = template.LabelQrPrefix,
                 version = PrintTemplatePolicy.GetTemplateVersion(template),
                 available = !string.IsNullOrWhiteSpace(template.Printer),
@@ -469,6 +469,36 @@ public sealed class EdgeRuntimeManager : IDisposable
         {
             return [];
         }
+    }
+
+    public Task<EdgeTerminalCommandResult> FindTerminalAsync(string terminalId)
+    {
+        return SendTerminalCommandAsync(terminalId, stop: false);
+    }
+
+    public Task<EdgeTerminalCommandResult> StopFindingTerminalAsync(string terminalId)
+    {
+        return SendTerminalCommandAsync(terminalId, stop: true);
+    }
+
+    private async Task<EdgeTerminalCommandResult> SendTerminalCommandAsync(string terminalId, bool stop)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(terminalId);
+        var suffix = stop ? "/find/stop" : "/find";
+        var path = $"/edge/terminals/{Uri.EscapeDataString(terminalId)}{suffix}";
+        using var request = CreateLocalAdminRequest(HttpMethod.Post, path);
+        using var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
+        var payload = await response.Content.ReadFromJsonAsync<EdgeTerminalCommandResult>(JsonOptions).ConfigureAwait(false)
+            ?? new EdgeTerminalCommandResult();
+        if (!response.IsSuccessStatusCode)
+        {
+            var detail = string.IsNullOrWhiteSpace(payload.Message) ? payload.Code : payload.Message;
+            throw new InvalidOperationException(string.IsNullOrWhiteSpace(detail)
+                ? $"Terminal command failed with HTTP {(int)response.StatusCode}."
+                : detail);
+        }
+
+        return payload;
     }
 
     // The edge process owns registration and heartbeat. The desktop app only

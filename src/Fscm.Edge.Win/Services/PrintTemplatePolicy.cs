@@ -34,6 +34,7 @@ public static class PrintTemplatePolicy
     public const string StackedLayoutStyle = "stacked";
     public const string HorizontalLayoutStyle = "qr_left_text_right";
     public const string LocationCodeLayoutStyle = "location_code_quad_qr";
+    public const int RestrictedDisplayTextLength = 12;
     public const double Stacked60x40FontSizePoints = 14;
     public const double Horizontal60x40FontSizePoints = 16;
     public const double LocationCodeFontSizePoints = 28;
@@ -96,6 +97,44 @@ public static class PrintTemplatePolicy
             : StackedLayoutStyle;
     }
 
+    public static bool HasRestrictedDisplayText(PrintTemplateProfile template)
+    {
+        string layoutStyle = NormalizeLayoutStyle(template.LayoutStyle);
+        return layoutStyle is HorizontalLayoutStyle or LocationCodeLayoutStyle;
+    }
+
+    public static int GetMaxDisplayLength(PrintTemplateProfile template)
+    {
+        return HasRestrictedDisplayText(template)
+            ? RestrictedDisplayTextLength
+            : template.MaxDisplayLength > 0 ? template.MaxDisplayLength : 16;
+    }
+
+    public static string? GetDisplayTextValidationError(PrintTemplateProfile template, string? displayText)
+    {
+        string layoutStyle = NormalizeLayoutStyle(template.LayoutStyle);
+        if (layoutStyle is not (HorizontalLayoutStyle or LocationCodeLayoutStyle) ||
+            CountUnicodeScalars(displayText ?? string.Empty) <= RestrictedDisplayTextLength)
+        {
+            return null;
+        }
+
+        return layoutStyle == LocationCodeLayoutStyle
+            ? "库位码最多 12 个字符，当前内容不适配，请输入少于或等于 12 个字符。"
+            : "左右排版右侧文字最多 12 个字符，当前内容不适配，请输入少于或等于 12 个字符。";
+    }
+
+    private static int CountUnicodeScalars(string value)
+    {
+        int count = 0;
+        using var enumerator = value.EnumerateRunes().GetEnumerator();
+        while (enumerator.MoveNext())
+        {
+            count++;
+        }
+        return count;
+    }
+
     public static string GetAutomaticOrientation(string? layoutStyle)
     {
         return NormalizeLayoutStyle(layoutStyle) == LocationCodeLayoutStyle
@@ -144,7 +183,7 @@ public static class PrintTemplatePolicy
             template.LabelQrPrefix,
             NormalizeLayoutStyle(template.LayoutStyle),
             GetTextFontSizePoints(template).ToString("F2", CultureInfo.InvariantCulture),
-            (template.MaxDisplayLength > 0 ? template.MaxDisplayLength : 16).ToString(CultureInfo.InvariantCulture));
+            GetMaxDisplayLength(template).ToString(CultureInfo.InvariantCulture));
         byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));
         return Convert.ToHexString(hash.AsSpan(0, 6)).ToLowerInvariant();
     }
@@ -323,6 +362,18 @@ public static class PrintTemplatePolicy
             }
         }
 
+        if (sourceVersion < 11)
+        {
+            foreach (PrintTemplateProfile template in templates.Where(HasRestrictedDisplayText))
+            {
+                if (template.MaxDisplayLength != RestrictedDisplayTextLength)
+                {
+                    template.MaxDisplayLength = RestrictedDisplayTextLength;
+                    changed = true;
+                }
+            }
+        }
+
         return changed;
     }
 
@@ -415,7 +466,7 @@ public static class PrintTemplatePolicy
             LabelQrPrefix = source?.LabelQrPrefix ?? string.Empty,
             LayoutStyle = HorizontalLayoutStyle,
             TextFontSizePoints = Horizontal60x40FontSizePoints,
-            MaxDisplayLength = source is { MaxDisplayLength: > 0 } ? source.MaxDisplayLength : 16,
+            MaxDisplayLength = RestrictedDisplayTextLength,
         };
     }
 

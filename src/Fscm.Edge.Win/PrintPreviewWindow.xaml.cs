@@ -64,13 +64,17 @@ public partial class PrintPreviewWindow : Window
         bool landscape = string.Equals(settings.PrintOrientation, "landscape", StringComparison.OrdinalIgnoreCase);
         (width, height) = landscape ? (height, width) : (width, height);
         string size = $"{width.ToString("0.##", CultureInfo.InvariantCulture)} x {height.ToString("0.##", CultureInfo.InvariantCulture)} mm";
-        string layout = PrintTemplatePolicy.NormalizeLayoutStyle(template.LayoutStyle) switch
+        string layoutStyle = PrintTemplatePolicy.NormalizeLayoutStyle(template.LayoutStyle);
+        string layout = layoutStyle switch
         {
             PrintTemplatePolicy.HorizontalLayoutStyle => "左右排版",
             PrintTemplatePolicy.LocationCodeLayoutStyle => "库位码四码排版",
             _ => "上下排版",
         };
-        return $"{template.Name} · {size} · {layout} · {PrintTemplatePolicy.GetTextFontSizePoints(template):0.##} pt";
+        string fontSize = layoutStyle == PrintTemplatePolicy.LocationCodeLayoutStyle
+            ? "自动最大字号"
+            : $"{PrintTemplatePolicy.GetTextFontSizePoints(template):0.##} pt";
+        return $"{template.Name} · {size} · {layout} · {fontSize}";
     }
 
     private static (FixedDocument Document, string Diagnostic) CreateLabelPreview(

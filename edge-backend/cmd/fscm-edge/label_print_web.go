@@ -225,6 +225,10 @@ func createDirectPrintJob(c *gin.Context, service *printing.Service, availabilit
 		writeDirectPrintError(c, http.StatusBadRequest, "UNSUPPORTED_PRINT_JOB_TYPE", "Unsupported direct print job type.")
 		return
 	}
+	if _, message := validateLabelDisplayText(printRequest, *selected); message != "" {
+		writeDirectPrintError(c, http.StatusBadRequest, "LABEL_TEXT_TOO_LONG", message)
+		return
+	}
 
 	job, duplicate, err := service.Create(printRequest)
 	if err != nil {
@@ -273,6 +277,10 @@ func createManualTextJob(c *gin.Context, service *printing.Service, availability
 	}
 	if selected == nil {
 		c.JSON(http.StatusConflict, gin.H{"code": "LABEL_TEMPLATE_UNAVAILABLE", "message": "所选标签模板或打印机当前不可用。"})
+		return
+	}
+	if message := validateRestrictedLabelText(*selected, request.Text); message != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "LABEL_TEXT_TOO_LONG", "message": message})
 		return
 	}
 

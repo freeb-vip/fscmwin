@@ -544,19 +544,30 @@
               </Grid.RowDefinitions>
               <DockPanel>
                 <StackPanel DockPanel.Dock="Left">
-                  <TextBlock FontSize="18" FontWeight="SemiBold" Text="本地可用终端" />
-                  <TextBlock Margin="0,6,0,14" Foreground="{StaticResource MutedTextBrush}" Text="访问过本地 /edge/probe 的局域网客户端会显示在这里。" />
+                  <TextBlock FontSize="18" FontWeight="SemiBold" Text="在线终端" />
+                  <TextBlock Margin="0,6,0,4" Foreground="{StaticResource MutedTextBrush}" Text="已连接本地边缘节点的移动终端，可从这里发出寻找响铃。" />
+                  <TextBlock x:Name="TerminalActionStatusText" Margin="0,0,0,14" Foreground="{StaticResource MutedTextBrush}" Text="等待终端连接" />
                 </StackPanel>
                 <Button DockPanel.Dock="Right" Click="OnRefreshTerminalsClick" Content="刷新终端" />
               </DockPanel>
               <DataGrid x:Name="TerminalsGrid" Grid.Row="1" ItemsSource="{Binding}">
                 <DataGrid.Columns>
-                  <DataGridTextColumn Header="终端名称" Binding="{Binding Name}" Width="160" />
+                  <DataGridTextColumn Header="终端名称" Binding="{Binding Name}" Width="170" />
+                  <DataGridTextColumn Header="终端 ID" Binding="{Binding TerminalId}" Width="190" />
                   <DataGridTextColumn Header="IP" Binding="{Binding Ip}" Width="140" />
-                  <DataGridTextColumn Header="User-Agent" Binding="{Binding UserAgent}" Width="*" />
-                  <DataGridTextColumn Header="来源" Binding="{Binding Source}" Width="90" />
-                  <DataGridTextColumn Header="最后探测时间" Binding="{Binding LastSeenAt, StringFormat=yyyy-MM-dd HH:mm:ss}" Width="160" />
-                  <DataGridTextColumn Header="状态" Binding="{Binding Status}" Width="90" />
+                  <DataGridTextColumn Header="版本" Binding="{Binding AppVersion}" Width="90" />
+                  <DataGridTextColumn Header="最后在线" Binding="{Binding LastSeenAt, StringFormat=yyyy-MM-dd HH:mm:ss}" Width="160" />
+                  <DataGridTextColumn Header="状态" Binding="{Binding Status}" Width="80" />
+                  <DataGridTemplateColumn Header="操作" Width="160">
+                    <DataGridTemplateColumn.CellTemplate>
+                      <DataTemplate>
+                        <StackPanel Orientation="Horizontal">
+                          <Button Padding="10,4" Click="OnFindTerminalClick" Content="响铃" IsEnabled="{Binding CanStartFind}" ToolTip="让终端持续响铃 60 秒" />
+                          <Button Margin="6,0,0,0" Padding="10,4" Click="OnStopFindingTerminalClick" Content="停止" IsEnabled="{Binding CanStopFind}" ToolTip="停止当前寻找响铃" />
+                        </StackPanel>
+                      </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                  </DataGridTemplateColumn>
                 </DataGrid.Columns>
               </DataGrid>
             </Grid>

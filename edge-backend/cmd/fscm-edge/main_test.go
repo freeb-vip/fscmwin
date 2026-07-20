@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"fscm-edge/internal/catalog"
@@ -160,7 +161,7 @@ func TestTemplateVersionUsesStableCrossPlatformContract(t *testing.T) {
 		Orientation: "portrait", Mode: "fit", Copies: 1, SkuQRPrefix: "T", LabelQRPrefix: "BOX-",
 		LayoutStyle: "qr_left_text_right", TextFontSizePoints: 18, MaxDisplayLength: 16,
 	}
-	if actual := templateVersion(template); actual != "a0fc8a8f57fd" {
+	if actual := templateVersion(template); actual != "ae98823ba78f" {
 		t.Fatalf("templateVersion()=%q", actual)
 	}
 }
@@ -178,6 +179,28 @@ func TestPrintInventoryPublishesLocationCodeLayout(t *testing.T) {
 	}
 	if template["label_qr_prefix"] != "" || len(template["version"].(string)) != 12 {
 		t.Fatalf("unexpected location template contract: %+v", template)
+	}
+}
+
+func TestRestrictedLayoutsPublishTwelveCharacterLimit(t *testing.T) {
+	for _, layout := range []string{"qr_left_text_right", "location_code_quad_qr"} {
+		template := printing.Template{LayoutStyle: layout, MaxDisplayLength: 16}
+		if actual := normalizedMaxDisplayLength(template); actual != 12 {
+			t.Fatalf("layout=%s max_display_length=%d", layout, actual)
+		}
+	}
+	if actual := normalizedMaxDisplayLength(printing.Template{LayoutStyle: "stacked", MaxDisplayLength: 16}); actual != 16 {
+		t.Fatalf("stacked max_display_length=%d", actual)
+	}
+}
+
+func TestRestrictedLabelTextCountsUnicodeScalars(t *testing.T) {
+	template := printing.Template{LayoutStyle: "qr_left_text_right"}
+	if message := validateRestrictedLabelText(template, strings.Repeat("\U0001F600", 12)); message != "" {
+		t.Fatalf("twelve Unicode scalars were rejected: %s", message)
+	}
+	if message := validateRestrictedLabelText(template, strings.Repeat("\U0001F600", 13)); message == "" {
+		t.Fatal("thirteen Unicode scalars were accepted")
 	}
 }
 

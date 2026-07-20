@@ -467,6 +467,46 @@ public partial class MainWindow : Window
         await RefreshTerminalsAsync();
     }
 
+    private async void OnFindTerminalClick(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not EdgeTerminal terminal || !terminal.CanStartFind)
+        {
+            return;
+        }
+
+        await RunTerminalCommandAsync(terminal, stop: false);
+    }
+
+    private async void OnStopFindingTerminalClick(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not EdgeTerminal terminal || !terminal.CanStopFind)
+        {
+            return;
+        }
+
+        await RunTerminalCommandAsync(terminal, stop: true);
+    }
+
+    private async Task RunTerminalCommandAsync(EdgeTerminal terminal, bool stop)
+    {
+        TerminalActionStatusText.Text = stop ? $"正在停止 {terminal.Name} 的响铃..." : $"正在让 {terminal.Name} 响铃...";
+        try
+        {
+            _ = stop
+                ? await _runtime.StopFindingTerminalAsync(terminal.TerminalId)
+                : await _runtime.FindTerminalAsync(terminal.TerminalId);
+            TerminalActionStatusText.Text = stop
+                ? $"{terminal.Name} 已停止响铃。"
+                : $"{terminal.Name} 已开始响铃，60 秒后自动停止。";
+            await RefreshTerminalsAsync();
+        }
+        catch (Exception ex)
+        {
+            TerminalActionStatusText.Text = $"终端操作失败：{ex.Message}";
+            MessageBox.Show(ex.Message, "寻找终端", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
     private async void OnRefreshPrintJobsClick(object sender, RoutedEventArgs e)
     {
         await RefreshPrintJobsAsync();
@@ -570,6 +610,11 @@ public partial class MainWindow : Window
         }
 
         NormalizeTemplateCompatibility(template);
+        if (PrintTemplatePolicy.GetDisplayTextValidationError(template, text) is string displayTextError)
+        {
+            LabelStatusText.Text = displayTextError;
+            return;
+        }
         bool locationLayout = template.LayoutStyle == PrintTemplatePolicy.LocationCodeLayoutStyle;
         var labelPrefix = locationLayout ? string.Empty : LabelPrefixTextBox.Text.Trim();
         if (labelPrefix.Length > 20)
@@ -642,6 +687,11 @@ public partial class MainWindow : Window
         text = string.IsNullOrWhiteSpace(text)
             ? template.LayoutStyle == PrintTemplatePolicy.LocationCodeLayoutStyle ? "A-01-B-02-C3" : "SKU-001"
             : text;
+        if (PrintTemplatePolicy.GetDisplayTextValidationError(template, text) is string displayTextError)
+        {
+            LabelStatusText.Text = displayTextError;
+            return;
+        }
         EdgeSettings settings = _runtime.LoadEdgeSettings();
         ApplyTemplateToSettings(settings, template);
         settings.DefaultPrinter = string.IsNullOrWhiteSpace(template.Printer)
@@ -988,6 +1038,10 @@ public partial class MainWindow : Window
         var terminals = await _runtime.GetTerminalsAsync();
         TerminalsGrid.ItemsSource = terminals;
         HomeTerminalCountText.Text = terminals.Count.ToString(CultureInfo.InvariantCulture);
+        if (terminals.Count > 0 && !terminals.Any(terminal => terminal.Finding))
+        {
+            TerminalActionStatusText.Text = $"{terminals.Count} 台终端，{terminals.Count(terminal => terminal.CanStartFind)} 台可寻找";
+        }
     }
 
     private async Task RefreshPrintJobsAsync()
@@ -1426,7 +1480,6 @@ public partial class MainWindow : Window
     private static void NormalizeTemplateCompatibility(PrintTemplateProfile template)
     {
         template.Type = NormalizeTemplateType(template);
-        template.MaxDisplayLength = template.MaxDisplayLength > 0 ? template.MaxDisplayLength : 16;
         template.Copies = Math.Clamp(template.Copies, 1, 99);
         template.Mode = "fit";
         template.OffsetXMillimeters = Math.Clamp(template.OffsetXMillimeters, -5, 5);
@@ -1435,6 +1488,7 @@ public partial class MainWindow : Window
             ? Math.Clamp(template.SafetyInsetMillimeters, 0.5, 5)
             : PrintPageContextFactory.DefaultSafetyInsetMillimeters;
         template.LayoutStyle = PrintTemplatePolicy.NormalizeLayoutStyle(template.LayoutStyle);
+        template.MaxDisplayLength = PrintTemplatePolicy.GetMaxDisplayLength(template);
         template.Orientation = PrintTemplatePolicy.GetAutomaticOrientation(template.LayoutStyle);
         template.TextFontSizePoints = PrintTemplatePolicy.GetTextFontSizePoints(template);
     }
@@ -1600,7 +1654,9 @@ public partial class MainWindow : Window
             LabelQrPrefix = layoutStyle == PrintTemplatePolicy.LocationCodeLayoutStyle ? string.Empty : existing?.LabelQrPrefix ?? string.Empty,
             LayoutStyle = layoutStyle,
             TextFontSizePoints = ResolveTemplateFontSize(settings, existing, layoutStyle),
-            MaxDisplayLength = existing is { MaxDisplayLength: > 0 } ? existing.MaxDisplayLength : 16,
+            MaxDisplayLength = layoutStyle is PrintTemplatePolicy.HorizontalLayoutStyle or PrintTemplatePolicy.LocationCodeLayoutStyle
+                ? PrintTemplatePolicy.RestrictedDisplayTextLength
+                : existing is { MaxDisplayLength: > 0 } ? existing.MaxDisplayLength : 16,
         };
     }
 
@@ -2179,6 +2235,17 @@ public partial class MainWindow : Window
         if (ProductPrintTemplateComboBox.SelectedItem is not PrintTemplateProfile template || !_availableSkuPrintTemplates.Any(item => string.Equals(item.Id, template.Id, StringComparison.OrdinalIgnoreCase)))
         {
             MessageBox.Show("没有可用的标签模板。请在打印配置中检查打印机是否在线。", "产品管理", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        string skuPrefix = string.IsNullOrWhiteSpace(template.SkuQrPrefix) ? "T" : template.SkuQrPrefix;
+        SkuSummary? invalidSku = selected.FirstOrDefault(sku =>
+            PrintTemplatePolicy.GetDisplayTextValidationError(template, skuPrefix + sku.Code) is not null);
+        if (invalidSku is not null)
+        {
+            string message = PrintTemplatePolicy.GetDisplayTextValidationError(template, skuPrefix + invalidSku.Code)!;
+            MessageBox.Show($"{message}\n异常内容：{skuPrefix}{invalidSku.Code}", "产品管理", MessageBoxButton.OK, MessageBoxImage.Warning);
+            ProductStatusText.Text = $"SKU {invalidSku.Code} 的标签文字超过 12 个字符，未创建打印任务。";
             return;
         }
 

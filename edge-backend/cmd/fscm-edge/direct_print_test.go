@@ -20,6 +20,7 @@ func newDirectPrintTestService(t *testing.T) (*printing.Service, *printerAvailab
 	templatesPath := filepath.Join(t.TempDir(), "print-templates.json")
 	templates, err := json.Marshal([]printing.Template{{
 		ID: "sku_60x40", Name: "SKU label", Printer: "Zebra", Type: "label",
+		LayoutStyle: "qr_left_text_right", MaxDisplayLength: 16,
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -123,6 +124,57 @@ func TestDirectPrintCreatesCustomLabelJob(t *testing.T) {
 	job := service.Jobs()[0]
 	if job.Kind != "custom_label" || job.Text != "BOX-001" || job.Copies != 3 || len(job.Items) != 1 || job.Items[0].QRCodeContent != "Q-BOX-001" {
 		t.Fatalf("unexpected custom label job: %+v", job)
+	}
+}
+
+func TestDirectPrintRejectsLongHorizontalTextWithoutPersisting(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service, availability := newDirectPrintTestService(t)
+	version := templateVersion(service.Templates()[0])
+	recorder := performDirectPrintRequest(t, service, availability, map[string]interface{}{
+		"source": "mobile-app", "template_code": "sku_60x40", "copies": 1,
+		"type": "sku_label", "idempotency_key": "long-label",
+		"payload_snapshot": map[string]interface{}{
+			"type": "sku_label", "sku_code": "ABCDEFGHIJKLM",
+			"qr_payload": "ABCDEFGHIJKLM", "template_version": version,
+		},
+	})
+
+	if recorder.Code != http.StatusBadRequest || !bytes.Contains(recorder.Body.Bytes(), []byte("LABEL_TEXT_TOO_LONG")) {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(service.Jobs()) != 0 {
+		t.Fatalf("long direct label persisted jobs: %+v", service.Jobs())
+	}
+}
+
+func TestWebLabelPrintRejectsLongLocationTextWithoutPersisting(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service, availability := newDirectPrintTestService(t)
+	template := service.Templates()[0]
+	template.LayoutStyle = "location_code_quad_qr"
+	if err := service.SaveTemplate(template); err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(map[string]interface{}{
+		"template_id": template.ID,
+		"text":        "ABCDEFGHIJKLM",
+		"copies":      1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	ginContext, _ := gin.CreateTestContext(recorder)
+	ginContext.Request = httptest.NewRequest(http.MethodPost, "/edge/web/label-jobs", bytes.NewReader(body))
+	ginContext.Request.Header.Set("Content-Type", "application/json")
+	createManualTextJob(ginContext, service, availability)
+
+	if recorder.Code != http.StatusBadRequest || !bytes.Contains(recorder.Body.Bytes(), []byte("LABEL_TEXT_TOO_LONG")) {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(service.Jobs()) != 0 {
+		t.Fatalf("long web label persisted jobs: %+v", service.Jobs())
 	}
 }
 

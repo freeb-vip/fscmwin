@@ -17,7 +17,10 @@ import (
 func newPrintAvailabilityTestService(t *testing.T) *printing.Service {
 	t.Helper()
 	templatesPath := filepath.Join(t.TempDir(), "print-templates.json")
-	templates, err := json.Marshal([]printing.Template{{ID: "sku", Name: "SKU", Type: "label", Printer: "Zebra"}})
+	templates, err := json.Marshal([]printing.Template{{
+		ID: "sku", Name: "SKU", Type: "label", Printer: "Zebra",
+		LayoutStyle: "qr_left_text_right", SkuQRPrefix: "T", MaxDisplayLength: 16,
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,6 +87,24 @@ func TestCreatePrintJobAllowsAvailableTemplatePrinter(t *testing.T) {
 	}
 	if len(service.Jobs()) != 1 || service.Jobs()[0].Printer != "Zebra" {
 		t.Fatalf("unexpected jobs: %+v", service.Jobs())
+	}
+}
+
+func TestCreatePrintJobRejectsLongHorizontalTextWithoutPersisting(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service := newPrintAvailabilityTestService(t)
+	availability := &printerAvailability{printers: map[string]struct{}{"Zebra": {}}}
+
+	response := performPrintJobRequest(t, service, availability, printing.Request{
+		TemplateID: "sku",
+		Items:      []printing.Item{{SKUCode: "ABCDEFGHIJKL", Quantity: 1}},
+	})
+
+	if response.Code != http.StatusBadRequest || !bytes.Contains(response.Body.Bytes(), []byte("LABEL_TEXT_TOO_LONG")) {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if len(service.Jobs()) != 0 {
+		t.Fatalf("long label persisted jobs: %+v", service.Jobs())
 	}
 }
 

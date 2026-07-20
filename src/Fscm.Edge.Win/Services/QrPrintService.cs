@@ -21,6 +21,7 @@ public sealed class QrPrintService
     internal const double UnitsPerMillimeter = 96d / 25.4d;
     private const double PointsToDeviceIndependentPixels = 96d / 72d;
     private static readonly Typeface LabelTypeface = new(new FontFamily("Microsoft YaHei UI"), FontStyles.Normal, FontWeights.Bold, FontStretches.Normal);
+    private static readonly Typeface LocationLabelTypeface = new(new FontFamily("Microsoft YaHei UI"), FontStyles.Normal, FontWeights.Black, FontStretches.Normal);
 
     public void Print(EdgeSettings settings, EdgePrintJob job, PrintTemplateProfile template)
     {
@@ -43,6 +44,7 @@ public sealed class QrPrintService
             string payload = string.IsNullOrWhiteSpace(item.QrCodeContent)
                 ? settings.SkuQrPrefix + item.SkuCode
                 : item.QrCodeContent;
+            ValidateDisplayText(template, payload);
             for (int index = 0; index < quantity; index++)
             {
                 document.Pages.Add(new PageContent
@@ -67,6 +69,7 @@ public sealed class QrPrintService
         string displayText,
         PrintTemplateProfile template)
     {
+        ValidateDisplayText(template, displayText);
         if (string.IsNullOrWhiteSpace(settings.DefaultPrinter))
         {
             throw new InvalidOperationException("请先选择本地打印机。");
@@ -113,6 +116,7 @@ public sealed class QrPrintService
         string displayText,
         out string diagnostic)
     {
+        ValidateDisplayText(template, displayText);
         PrintPageContext context;
         if (string.IsNullOrWhiteSpace(settings.DefaultPrinter))
         {
@@ -229,8 +233,8 @@ public sealed class QrPrintService
 
         return layoutStyle switch
         {
-            PrintTemplatePolicy.LocationCodeLayoutStyle => CreateLocationCodeLabelContent(image, displayText, width, height, template, qrScale),
-            PrintTemplatePolicy.HorizontalLayoutStyle => CreateHorizontalLabelContent(image, displayText, width, height, template.MaxDisplayLength, fontSize, qrScale),
+            PrintTemplatePolicy.LocationCodeLayoutStyle => CreateLocationCodeLabelContent(image, displayText, width, height, qrScale),
+            PrintTemplatePolicy.HorizontalLayoutStyle => CreateHorizontalLabelContent(image, displayText, width, height, fontSize, qrScale),
             _ => CreateStackedLabelContent(image, displayText, width, height, template.MaxDisplayLength, fontSize, qrScale),
         };
     }
@@ -242,24 +246,30 @@ public sealed class QrPrintService
             : qrPayload;
     }
 
+    internal static void ValidateDisplayText(PrintTemplateProfile template, string? displayText)
+    {
+        string? error = PrintTemplatePolicy.GetDisplayTextValidationError(template, displayText);
+        if (error is not null)
+        {
+            throw new InvalidOperationException(error);
+        }
+    }
+
     private static Border CreateLocationCodeLabelContent(
         BitmapImage image,
         string displayText,
         double width,
         double height,
-        PrintTemplateProfile template,
         double qrScale)
     {
         var layout = CalculateLocationCodeLayout(width, height);
-        int displayLimit = template.MaxDisplayLength > 0 ? template.MaxDisplayLength : 12;
-        string text = displayText.Length > displayLimit
-            ? displayText[..displayLimit] + "…"
-            : displayText;
+        string text = displayText;
+        double textMaxWidth = Math.Max(layout.CenterWidth - 4, 1);
+        double textMaxHeight = Math.Max(height - 4, 1);
         double fontSizePoints = FitLocationCodeFontSizePoints(
             text,
-            Math.Max(layout.CenterWidth - 4, 1),
-            PrintTemplatePolicy.GetTextFontSizePoints(template),
-            PrintTemplatePolicy.LocationCodeMinimumFontSizePoints);
+            textMaxWidth,
+            textMaxHeight);
         double fontSize = fontSizePoints * PointsToDeviceIndependentPixels;
         double qrSize = Math.Max(Math.Min(layout.SideWidth, layout.QrRowHeight) * qrScale, 1);
 
@@ -272,8 +282,9 @@ public sealed class QrPrintService
 
         Grid leftCodes = CreateLocationQrColumn(image, qrSize, layout.RowGap);
         Grid rightCodes = CreateLocationQrColumn(image, qrSize, layout.RowGap);
-        TextBlock label = CreateTextBlock(text, fontSize, Math.Max(layout.CenterWidth - 4, 1));
+        TextBlock label = CreateTextBlock(text, fontSize, textMaxWidth);
         label.FontWeight = FontWeights.Black;
+        label.TextDecorations = TextDecorations.Underline;
         Grid.SetColumn(leftCodes, 0);
         Grid.SetColumn(label, 2);
         Grid.SetColumn(rightCodes, 4);
@@ -319,21 +330,10 @@ public sealed class QrPrintService
         return (sideWidth, centerWidth, qrRowHeight, columnGap, rowGap);
     }
 
-    internal static double FitLocationCodeFontSizePoints(
-        string text,
-        double maxWidth,
-        double preferredFontSizePoints,
-        double minimumFontSizePoints)
+    internal static double FitLocationCodeFontSizePoints(string text, double maxWidth, double maxHeight)
     {
-        double preferred = Math.Max(preferredFontSizePoints, minimumFontSizePoints);
-        for (double points = preferred; points > minimumFontSizePoints; points -= 1)
-        {
-            if (MeasureTextWidth(text, points * PointsToDeviceIndependentPixels) <= maxWidth)
-            {
-                return points;
-            }
-        }
-        return minimumFontSizePoints;
+        return FitTextFontSize(text, maxWidth, maxHeight, Math.Max(maxHeight, 1), LocationLabelTypeface) /
+            PointsToDeviceIndependentPixels;
     }
 
     private static Border CreateStackedLabelContent(
@@ -378,14 +378,16 @@ public sealed class QrPrintService
         string displayText,
         double width,
         double height,
-        int maxDisplayLength,
         double fontSize,
         double qrScale)
     {
         double gap = 2 * UnitsPerMillimeter;
         double regionWidth = Math.Max((width - gap) / 2d, 1);
         double qrSize = Math.Max(Math.Min(regionWidth, height) * qrScale, 1);
-        string text = TruncateTextToWidth(displayText, maxDisplayLength, Math.Max(regionWidth - 4, 1), fontSize);
+        double textMaxWidth = Math.Max(regionWidth - 4, 1);
+        double textMaxHeight = Math.Max(height - 4, 1);
+        string text = displayText;
+        double fittedFontSize = FitTextFontSize(text, textMaxWidth, textMaxHeight, fontSize);
 
         Grid grid = new() { Width = width, Height = height };
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(regionWidth) });
@@ -401,7 +403,7 @@ public sealed class QrPrintService
             VerticalAlignment = VerticalAlignment.Center,
         };
         RenderOptions.SetBitmapScalingMode(qr, BitmapScalingMode.NearestNeighbor);
-        TextBlock label = CreateTextBlock(text, fontSize, Math.Max(regionWidth - 4, 1));
+        TextBlock label = CreateTextBlock(text, fittedFontSize, textMaxWidth);
         Grid.SetColumn(qr, 0);
         Grid.SetColumn(label, 2);
         grid.Children.Add(qr);
@@ -447,17 +449,53 @@ public sealed class QrPrintService
         return value + suffix;
     }
 
+    internal static double FitTextFontSize(
+        string text,
+        double maxWidth,
+        double maxHeight,
+        double maximumFontSize,
+        Typeface? typeface = null)
+    {
+        if (string.IsNullOrEmpty(text) || maxWidth <= 0 || maxHeight <= 0 || maximumFontSize <= 1)
+        {
+            return Math.Max(Math.Min(maximumFontSize, 1), 0.1);
+        }
+
+        double lower = 0.1;
+        double upper = maximumFontSize;
+        for (int iteration = 0; iteration < 24; iteration++)
+        {
+            double candidate = (lower + upper) / 2d;
+            (double Width, double Height) size = MeasureText(text, candidate, typeface ?? LabelTypeface);
+            if (size.Width <= maxWidth && size.Height <= maxHeight)
+            {
+                lower = candidate;
+            }
+            else
+            {
+                upper = candidate;
+            }
+        }
+
+        return lower;
+    }
+
     private static double MeasureTextWidth(string text, double fontSize)
+    {
+        return MeasureText(text, fontSize, LabelTypeface).Width;
+    }
+
+    private static (double Width, double Height) MeasureText(string text, double fontSize, Typeface typeface)
     {
         FormattedText formatted = new(
             text,
             CultureInfo.CurrentUICulture,
             FlowDirection.LeftToRight,
-            LabelTypeface,
+            typeface,
             fontSize,
             Brushes.Black,
             1);
-        return formatted.WidthIncludingTrailingWhitespace;
+        return (formatted.WidthIncludingTrailingWhitespace, formatted.Height);
     }
 
     private static BitmapImage CreateQrImage(string payload)

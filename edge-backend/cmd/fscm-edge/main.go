@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"math"
@@ -20,6 +21,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"fscm-edge/internal/cache"
 	"fscm-edge/internal/catalog"
@@ -32,20 +34,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/grandcat/zeroconf"
+	"golang.org/x/net/websocket"
 )
-
-type terminal struct {
-	Name       string    `json:"name"`
-	IP         string    `json:"ip"`
-	UserAgent  string    `json:"user_agent"`
-	Source     string    `json:"source"`
-	LastSeenAt time.Time `json:"last_seen_at"`
-	Status     string    `json:"status"`
-}
-type terminalStore struct {
-	sync.RWMutex
-	items map[string]terminal
-}
 
 type printerAvailability struct {
 	sync.RWMutex
@@ -138,7 +128,7 @@ func main() {
 	startRemotePrintQueue(ctx, reg, printer, availability, time.Duration(cfg.PrintPollSeconds)*time.Second)
 	startLocalPrintAuditSync(ctx, reg, printer, 5*time.Second)
 
-	terminals := &terminalStore{items: make(map[string]terminal)}
+	terminals := newTerminalStore()
 	router := gin.Default()
 	router.Use(cors())
 	router.GET("/edge/health", func(c *gin.Context) {
@@ -146,7 +136,7 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"status": "ok", "mode": "proxy", "backend_version": version.Version, "backend_commit": version.Commit, "edge_api_version": version.APIVersion, "center": proxyHandler.CenterStatus(), "cache": responseCache.Status(), "catalog": catalogStatus, "catalog_media_cache": mediaCache.Status(), "catalog_ticket_key_ready": catalogManager.TicketKeyReady(), "registration": reg.Status()})
 	})
 	router.GET("/edge/probe", func(c *gin.Context) {
-		terminals.record(c)
+		terminals.recordProbe(c.ClientIP(), c.Request.UserAgent(), c.GetHeader("X-Edge-Terminal-Name"))
 		catalogStatus, _ := catalogManager.Status()
 		c.JSON(http.StatusOK, gin.H{"ok": true, "node_id": cfg.NodeID, "node_name": cfg.NodeName, "lan_base_url": cfg.LANBaseURL, "capabilities": catalogCapabilities(catalogStatus), "catalog": catalogStatus, "catalog_ticket_key_ready": catalogManager.TicketKeyReady(), "direct_print_available": true, "cache_mode": cfg.Cache.Mode})
 	})
@@ -155,8 +145,20 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"templates": availableLabelTemplates(printer.Templates(), availability)})
 	})
 	router.GET("/edge/print-inventory", func(c *gin.Context) {
-		terminals.record(c)
+		terminals.recordProbe(c.ClientIP(), c.Request.UserAgent(), c.GetHeader("X-Edge-Terminal-Name"))
 		c.JSON(http.StatusOK, printInventory(printer.Templates(), cfg.DefaultPrinter, availability))
+	})
+	router.GET("/edge/terminals/connect", func(c *gin.Context) {
+		if err := catalogManager.AuthorizeTicket(c.GetHeader("X-Edge-Ticket")); err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"code": "EDGE_TERMINAL_TICKET_REQUIRED"})
+			return
+		}
+		ip, userAgent := c.ClientIP(), c.Request.UserAgent()
+		server := websocket.Server{
+			Handshake: func(*websocket.Config, *http.Request) error { return nil },
+			Handler:   func(ws *websocket.Conn) { terminals.connect(ws, ip, userAgent) },
+		}
+		server.ServeHTTP(c.Writer, c.Request)
 	})
 	router.POST("/edge/web/label-jobs", func(c *gin.Context) {
 		createWebLabelJob(c, printer, availability)
@@ -315,6 +317,14 @@ func main() {
 	})
 	admin.POST("/cache/clear", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"cleared": responseCache.Clear()}) })
 	admin.GET("/terminals", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"terminals": terminals.list()}) })
+	admin.POST("/terminals/:terminal_id/find", func(c *gin.Context) {
+		result, err := terminals.find(c.Param("terminal_id"))
+		writeTerminalCommandResponse(c, result, err)
+	})
+	admin.POST("/terminals/:terminal_id/find/stop", func(c *gin.Context) {
+		result, err := terminals.stopFind(c.Param("terminal_id"))
+		writeTerminalCommandResponse(c, result, err)
+	})
 	admin.GET("/print-config", func(c *gin.Context) { c.JSON(http.StatusOK, printer.Config()) })
 	admin.PUT("/print-inventory", func(c *gin.Context) {
 		var payload struct {
@@ -543,6 +553,12 @@ func createPrintJob(c *gin.Context, printer *printing.Service, availability *pri
 		c.JSON(http.StatusBadRequest, gin.H{"code": "PRINT_TEMPLATE_NOT_FOUND"})
 		return
 	}
+	if template, ok := findPrintTemplate(printer.Templates(), req.TemplateID); ok {
+		if _, message := validateLabelDisplayText(req, template); message != "" {
+			c.JSON(http.StatusBadRequest, gin.H{"code": "LABEL_TEXT_TOO_LONG", "message": message})
+			return
+		}
+	}
 	if code := validateManufacturerBoxMarkRequest(req, printer.Templates(), availability); code != "" {
 		c.JSON(http.StatusBadRequest, gin.H{"code": code})
 		return
@@ -569,6 +585,54 @@ func resolvePrintRequestPrinter(req printing.Request, printer *printing.Service)
 		}
 	}
 	return strings.TrimSpace(first(req.Printer, printer.Config().DefaultPrinter))
+}
+
+func findPrintTemplate(templates []printing.Template, id string) (printing.Template, bool) {
+	for _, template := range templates {
+		if template.ID == id {
+			return template, true
+		}
+	}
+	return printing.Template{}, false
+}
+
+func restrictedLabelTextMessage(template printing.Template) string {
+	switch normalizeTemplateLayoutStyle(template) {
+	case "location_code_quad_qr":
+		return "库位码最多 12 个字符，当前内容不适配，请输入少于或等于 12 个字符。"
+	case "qr_left_text_right":
+		return "左右排版右侧文字最多 12 个字符，当前内容不适配，请输入少于或等于 12 个字符。"
+	default:
+		return ""
+	}
+}
+
+func validateRestrictedLabelText(template printing.Template, text string) string {
+	message := restrictedLabelTextMessage(template)
+	if message == "" || utf8.RuneCountInString(text) <= 12 {
+		return ""
+	}
+	return message
+}
+
+func validateLabelDisplayText(req printing.Request, template printing.Template) (string, string) {
+	if restrictedLabelTextMessage(template) == "" {
+		return "", ""
+	}
+	if strings.EqualFold(strings.TrimSpace(req.Kind), "manual_text") {
+		text := strings.TrimSpace(req.Text)
+		return text, validateRestrictedLabelText(template, text)
+	}
+	for _, item := range req.Items {
+		text := strings.TrimSpace(item.QRCodeContent)
+		if text == "" {
+			text = first(template.SkuQRPrefix, "T") + strings.TrimSpace(item.SKUCode)
+		}
+		if message := validateRestrictedLabelText(template, text); message != "" {
+			return text, message
+		}
+	}
+	return "", ""
 }
 
 func validateManufacturerBoxMarkRequest(req printing.Request, templates []printing.Template, availability *printerAvailability) string {
@@ -656,6 +720,9 @@ func templateTextFontSize(template printing.Template) float64 {
 }
 
 func normalizedMaxDisplayLength(template printing.Template) int {
+	if restrictedLabelTextMessage(template) != "" {
+		return 12
+	}
 	if template.MaxDisplayLength > 0 {
 		return template.MaxDisplayLength
 	}
@@ -819,6 +886,14 @@ func claimRemotePrintJob(ctx context.Context, reg *registry.Client, printer *pri
 			return false, completeErr
 		}
 		return true, nil
+	}
+	if template, ok := findPrintTemplate(printer.Templates(), request.TemplateID); ok {
+		if _, message := validateLabelDisplayText(request, template); message != "" {
+			if completeErr := reg.CompletePrintJob(ctx, claim.ID, claim.LeaseToken, "failed", message, nil); completeErr != nil {
+				return false, completeErr
+			}
+			return true, nil
+		}
 	}
 	if _, _, err := printer.CreateRemote(request, claim.ID, claim.LeaseToken); err != nil {
 		return false, err
@@ -1293,21 +1368,21 @@ func bytesCompareIP(left, right net.IP) int {
 	}
 	return len(left) - len(right)
 }
-func (s *terminalStore) record(c *gin.Context) {
-	ip := c.ClientIP()
-	value := terminal{Name: first(c.GetHeader("X-Edge-Terminal-Name"), ip), IP: ip, UserAgent: c.Request.UserAgent(), Source: "probe", LastSeenAt: time.Now(), Status: "online"}
-	s.Lock()
-	s.items[ip+"|"+value.UserAgent] = value
-	s.Unlock()
-}
-func (s *terminalStore) list() []terminal {
-	s.RLock()
-	defer s.RUnlock()
-	result := make([]terminal, 0, len(s.items))
-	for _, value := range s.items {
-		result = append(result, value)
+func writeTerminalCommandResponse(c *gin.Context, result terminalCommandResult, err error) {
+	if err == nil {
+		c.JSON(http.StatusOK, gin.H{"command_id": result.CommandID, "status": result.Status, "message": result.Message})
+		return
 	}
-	return result
+	switch {
+	case errors.Is(err, errTerminalNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"code": "EDGE_TERMINAL_NOT_FOUND"})
+	case errors.Is(err, errTerminalOffline), errors.Is(err, errFindDeviceDisabled):
+		c.JSON(http.StatusConflict, gin.H{"code": "EDGE_TERMINAL_UNAVAILABLE", "message": err.Error()})
+	case errors.Is(err, errTerminalTimeout):
+		c.JSON(http.StatusGatewayTimeout, gin.H{"code": "EDGE_TERMINAL_COMMAND_TIMEOUT"})
+	default:
+		c.JSON(http.StatusBadGateway, gin.H{"code": "EDGE_TERMINAL_COMMAND_FAILED", "message": err.Error()})
+	}
 }
 func first(values ...string) string {
 	for _, value := range values {
