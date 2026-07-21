@@ -267,6 +267,71 @@ func TestSetStatusWithErrorTracksLifecycle(t *testing.T) {
 	}
 }
 
+func TestCancelRemoteBatchStopsClaimedJobAndKeepsTerminalStateSticky(t *testing.T) {
+	service, err := New(Config{JobsPath: filepath.Join(t.TempDir(), "edge.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = service.Close() }()
+	batchID := uint(81)
+	otherBatchID := uint(82)
+	job, _, err := service.CreateRemote(Request{
+		JobID: "center-job-181", IdempotencyKey: "center-job-181", Kind: "batch_content", Text: "WRONG-001", RemoteBatchID: &batchID,
+	}, 181, "lease-181")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, _, err := service.CreateRemote(Request{
+		JobID: "center-job-182", IdempotencyKey: "center-job-182", Kind: "batch_content", Text: "RIGHT-001", RemoteBatchID: &otherBatchID,
+	}, 182, "lease-182")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stopped, err := service.CancelRemoteBatch(batchID)
+	if err != nil || len(stopped) != 1 || stopped[0].ID != job.ID || stopped[0].Status != "cancelled" {
+		t.Fatalf("unexpected stopped jobs: %+v err=%v", stopped, err)
+	}
+	unchanged, ok := service.Find(other.ID)
+	if !ok || unchanged.Status != "queued" {
+		t.Fatalf("unrelated batch job changed: %+v", unchanged)
+	}
+	staleStart, ok, err := service.SetStatus(job.ID, "printing")
+	if err != nil || !ok || staleStart.Status != "cancelled" {
+		t.Fatalf("cancelled job restarted: %+v ok=%v err=%v", staleStart, ok, err)
+	}
+	manualRetry, ok, err := service.SetStatus(job.ID, "queued")
+	if err != nil || !ok || manualRetry.Status != "cancelled" {
+		t.Fatalf("cancelled job was manually retried: %+v ok=%v err=%v", manualRetry, ok, err)
+	}
+	completions, err := service.PendingRemoteCompletions(10)
+	if err != nil || len(completions) != 1 || completions[0].ErrorCode != "BATCH_CANCELLED_BY_OPERATOR" {
+		t.Fatalf("unexpected cancellation receipt: %+v err=%v", completions, err)
+	}
+}
+
+func TestPreferredRemoteBatchCannotBeOverwrittenWhileActive(t *testing.T) {
+	service, err := New(Config{JobsPath: filepath.Join(t.TempDir(), "edge.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = service.Close() }()
+
+	if !service.SetPreferredRemoteBatchID(7) {
+		t.Fatal("first batch was not activated")
+	}
+	if service.SetPreferredRemoteBatchID(8) {
+		t.Fatal("a second batch replaced the active batch")
+	}
+	if got := service.PreferredRemoteBatchID(); got != 7 {
+		t.Fatalf("active batch changed to %d", got)
+	}
+	service.ClearPreferredRemoteBatchID(7)
+	if !service.SetPreferredRemoteBatchID(8) || service.PreferredRemoteBatchID() != 8 {
+		t.Fatal("next batch could not start after the active batch cleared")
+	}
+}
+
 func TestCreatePreservesCenterPayloadAndManualText(t *testing.T) {
 	service, err := New(Config{JobsPath: filepath.Join(t.TempDir(), "edge.db")})
 	if err != nil {

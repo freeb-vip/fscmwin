@@ -53,13 +53,13 @@ func TestSyncRemoteCompletionsRetriesServerFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := registry.New(registry.Config{CenterURL: center.URL, NodeID: "edge-1"})
-	if err := syncRemoteCompletions(t.Context(), client, service); err == nil {
+	if err := syncRemoteCompletions(t.Context(), client, service, nil); err == nil {
 		t.Fatal("server failure was not reported")
 	}
 	if err := service.MarkRemoteCompletionFailed(11, errors.New("retry now"), time.Now().Add(-time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if err := syncRemoteCompletions(t.Context(), client, service); err != nil {
+	if err := syncRemoteCompletions(t.Context(), client, service, nil); err != nil {
 		t.Fatal(err)
 	}
 	status, err := service.RemoteCompletionStatus()
@@ -81,7 +81,7 @@ func TestSyncRemoteCompletionsDropsExpiredLeaseReceipt(t *testing.T) {
 	if err := service.EnqueueRemoteFailure(12, "expired", "PRINT_FAILED", "offline", nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := syncRemoteCompletions(t.Context(), registry.New(registry.Config{CenterURL: center.URL, NodeID: "edge-1"}), service); err != nil {
+	if err := syncRemoteCompletions(t.Context(), registry.New(registry.Config{CenterURL: center.URL, NodeID: "edge-1"}), service, nil); err != nil {
 		t.Fatal(err)
 	}
 	status, err := service.RemoteCompletionStatus()

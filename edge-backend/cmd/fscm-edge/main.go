@@ -127,7 +127,7 @@ func main() {
 	catalogManager.Start(ctx)
 	startRemotePrintQueue(ctx, reg, printer, availability, time.Duration(cfg.PrintPollSeconds)*time.Second)
 	startLocalPrintAuditSync(ctx, reg, printer, 5*time.Second)
-	startRemoteCompletionSync(ctx, reg, printer, time.Second)
+	startRemoteCompletionSync(ctx, reg, printer, availability, time.Second)
 
 	terminals := newTerminalStore()
 	router := gin.Default()
@@ -380,6 +380,12 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"jobs": jobs, "total": total, "page": page, "page_size": pageSize})
 	})
 	admin.POST("/print-jobs/pull", func(c *gin.Context) {
+		if batchID, err := strconv.ParseUint(c.Query("batch_id"), 10, 32); err == nil && batchID > 0 {
+			if !printer.SetPreferredRemoteBatchID(uint(batchID)) {
+				c.JSON(http.StatusConflict, gin.H{"code": "REMOTE_BATCH_ALREADY_ACTIVE", "batch_id": printer.PreferredRemoteBatchID()})
+				return
+			}
+		}
 		claimed, err := claimRemotePrintJob(c.Request.Context(), reg, printer, availability)
 		if err != nil {
 			c.JSON(http.StatusBadGateway, gin.H{"code": "CENTER_PRINT_JOB_PULL_FAILED"})
@@ -422,6 +428,20 @@ func main() {
 		}
 		c.JSON(http.StatusOK, gin.H{"job": job})
 	})
+	admin.POST("/print-batches/:batch_id/stop", func(c *gin.Context) {
+		batchID, err := strconv.ParseUint(c.Param("batch_id"), 10, 32)
+		if err != nil || batchID == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_REMOTE_BATCH_ID"})
+			return
+		}
+		jobs, err := printer.CancelRemoteBatch(uint(batchID))
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"code": "BATCH_STOP_PERSIST_FAILED"})
+			return
+		}
+		_ = syncRemoteCompletions(c.Request.Context(), reg, printer, availability)
+		c.JSON(http.StatusOK, gin.H{"jobs": jobs, "stopped": len(jobs)})
+	})
 	admin.POST("/print-jobs/:id/status", func(c *gin.Context) {
 		var payload struct {
 			Status string `json:"status"`
@@ -441,7 +461,7 @@ func main() {
 			return
 		}
 		if job.RemoteJobID > 0 && isTerminalRemoteStatus(payload.Status) {
-			_ = syncRemoteCompletions(c.Request.Context(), reg, printer)
+			_ = syncRemoteCompletions(c.Request.Context(), reg, printer, availability)
 		}
 		c.JSON(http.StatusOK, gin.H{"job": job})
 	})
@@ -838,12 +858,12 @@ func startLocalPrintAuditSync(ctx context.Context, reg *registry.Client, printer
 	}()
 }
 
-func startRemoteCompletionSync(ctx context.Context, reg *registry.Client, printer *printing.Service, interval time.Duration) {
+func startRemoteCompletionSync(ctx context.Context, reg *registry.Client, printer *printing.Service, availability *printerAvailability, interval time.Duration) {
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
-			_ = syncRemoteCompletions(ctx, reg, printer)
+			_ = syncRemoteCompletions(ctx, reg, printer, availability)
 			select {
 			case <-ctx.Done():
 				return
@@ -853,7 +873,7 @@ func startRemoteCompletionSync(ctx context.Context, reg *registry.Client, printe
 	}()
 }
 
-func syncRemoteCompletions(ctx context.Context, reg *registry.Client, printer *printing.Service) error {
+func syncRemoteCompletions(ctx context.Context, reg *registry.Client, printer *printing.Service, availability *printerAvailability) error {
 	completions, err := printer.PendingRemoteCompletions(50)
 	if err != nil {
 		return err
@@ -864,7 +884,18 @@ func syncRemoteCompletions(ctx context.Context, reg *registry.Client, printer *p
 			result = json.RawMessage(completion.Result)
 		}
 		err = reg.CompletePrintJobWithCode(ctx, completion.RemoteJobID, completion.LeaseToken, completion.Status, completion.ErrorCode, completion.ErrorMessage, result)
-		if err == nil || registry.IsLeaseInvalid(err) {
+		if err == nil {
+			if markErr := printer.MarkRemoteCompletionSynced(completion.RemoteJobID); markErr != nil {
+				return markErr
+			}
+			if availability != nil {
+				if _, claimErr := claimRemotePrintJob(ctx, reg, printer, availability); claimErr != nil {
+					return claimErr
+				}
+			}
+			continue
+		}
+		if registry.IsLeaseInvalid(err) {
 			if markErr := printer.MarkRemoteCompletionSynced(completion.RemoteJobID); markErr != nil {
 				return markErr
 			}
@@ -931,8 +962,12 @@ func claimRemotePrintJob(ctx context.Context, reg *registry.Client, printer *pri
 		return false, nil
 	}
 	defer printer.EndRemoteClaim()
-	claim, err := reg.ClaimPrintJob(ctx)
+	preferredBatchID := printer.PreferredRemoteBatchID()
+	claim, batchStatus, err := reg.ClaimPrintJobForBatch(ctx, preferredBatchID)
 	if err != nil || claim == nil {
+		if err == nil && preferredBatchID > 0 && batchStatus != "" && batchStatus != "running" {
+			printer.ClearPreferredRemoteBatchID(preferredBatchID)
+		}
 		return false, err
 	}
 	var payload struct {

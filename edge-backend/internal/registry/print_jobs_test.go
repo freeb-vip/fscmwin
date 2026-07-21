@@ -49,6 +49,26 @@ func TestClaimPrintJobKeepsLegacyResponseCompatible(t *testing.T) {
 	}
 }
 
+func TestClaimPrintJobSendsPreferredBatchAndReadsBatchStatus(t *testing.T) {
+	center := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request["node_id"] != "edge-1" || request["batch_id"] != float64(41) {
+			t.Fatalf("unexpected claim request: %+v", request)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"job":null,"batch_status":"completed"},"msg":"ok"}`))
+	}))
+	defer center.Close()
+
+	job, status, err := New(Config{CenterURL: center.URL, NodeID: "edge-1"}).ClaimPrintJobForBatch(context.Background(), 41)
+	if err != nil || job != nil || status != "completed" {
+		t.Fatalf("preferred batch claim failed: job=%+v status=%s err=%v", job, status, err)
+	}
+}
+
 func TestCompletePrintJobReportsConflictAsInvalidLease(t *testing.T) {
 	center := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusConflict)

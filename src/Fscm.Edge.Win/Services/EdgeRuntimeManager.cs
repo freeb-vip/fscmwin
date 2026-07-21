@@ -565,11 +565,12 @@ public sealed class EdgeRuntimeManager : IDisposable
         }
     }
 
-    public async Task<bool> PullRemotePrintJobAsync()
+    public async Task<bool> PullRemotePrintJobAsync(uint? batchId = null)
     {
         try
         {
-            using var request = CreateLocalAdminRequest(HttpMethod.Post, "/edge/print-jobs/pull");
+            string path = batchId is > 0 ? $"/edge/print-jobs/pull?batch_id={batchId}" : "/edge/print-jobs/pull";
+            using var request = CreateLocalAdminRequest(HttpMethod.Post, path);
             using var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
             {
@@ -605,6 +606,33 @@ public sealed class EdgeRuntimeManager : IDisposable
     public async Task<IReadOnlyList<ProductSummary>> GetProductsAsync(string keyword)
     {
         return (await GetProductsPageAsync(keyword, 1, 100).ConfigureAwait(false)).Items;
+    }
+
+    public async Task<BatchPrintResult<IReadOnlyList<EdgePrintJob>>> StopLocalBatchPrintAsync(uint batchId)
+    {
+        if (batchId == 0)
+        {
+            return new BatchPrintResult<IReadOnlyList<EdgePrintJob>> { Message = "批次 ID 无效。" };
+        }
+
+        try
+        {
+            using var request = CreateLocalAdminRequest(HttpMethod.Post, $"/edge/print-batches/{batchId}/stop");
+            using var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                return new BatchPrintResult<IReadOnlyList<EdgePrintJob>>
+                {
+                    Message = $"本地边缘服务停止批次失败：{(int)response.StatusCode} {response.ReasonPhrase}",
+                };
+            }
+            EdgePrintJobListResponse? payload = await response.Content.ReadFromJsonAsync<EdgePrintJobListResponse>(JsonOptions).ConfigureAwait(false);
+            return new BatchPrintResult<IReadOnlyList<EdgePrintJob>> { Succeeded = true, Data = payload?.Jobs ?? [] };
+        }
+        catch (Exception ex)
+        {
+            return new BatchPrintResult<IReadOnlyList<EdgePrintJob>> { Message = $"本地边缘服务停止批次异常：{ex.Message}" };
+        }
     }
 
     public async Task<IReadOnlyList<SkuSummary>> GetSkusAsync(string keyword, uint? productId = null)

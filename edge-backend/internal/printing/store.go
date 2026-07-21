@@ -260,6 +260,8 @@ func remoteCompletionForJob(job Job) RemoteCompletion {
 		errorCode = "PRINT_EXECUTION_FAILED"
 		if job.Status == "interrupted" {
 			errorCode = "EDGE_RESTART_INTERRUPTED"
+		} else if job.Status == "cancelled" {
+			errorCode = "BATCH_CANCELLED_BY_OPERATOR"
 		}
 	}
 	result, _ := json.Marshal(map[string]interface{}{"local_job_id": job.ID, "printer": job.Printer})

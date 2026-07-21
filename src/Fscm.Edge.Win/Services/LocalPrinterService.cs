@@ -87,6 +87,45 @@ public sealed class LocalPrinterService
         }
     }
 
+    public int CancelBatchPrintJobs(IEnumerable<EdgePrintJob> jobs)
+    {
+        int cancelled = 0;
+        foreach (IGrouping<string, EdgePrintJob> printerJobs in jobs
+                     .Where(job => !string.IsNullOrWhiteSpace(job.Printer) && !string.IsNullOrWhiteSpace(job.Id))
+                     .GroupBy(job => job.Printer, StringComparer.OrdinalIgnoreCase))
+        {
+            try
+            {
+                using LocalPrintServer server = new();
+                using PrintQueue queue = server.GetPrintQueue(printerJobs.Key);
+                HashSet<string> ids = printerJobs.Select(job => job.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                queue.Refresh();
+                using PrintJobInfoCollection printJobs = queue.GetPrintJobInfoCollection();
+                foreach (PrintSystemJobInfo printJob in printJobs)
+                {
+                    try
+                    {
+                        if (ids.Any(id => printJob.Name.Contains(id, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            printJob.Cancel();
+                            cancelled++;
+                        }
+                    }
+                    finally
+                    {
+                        printJob.Dispose();
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is PrintSystemException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
+            {
+                // The local task remains cancelled even when a printer driver
+                // has already consumed the spool entry.
+            }
+        }
+        return cancelled;
+    }
+
     internal static void EnsureQueueAvailable(PrintQueue queue)
     {
         queue.Refresh();

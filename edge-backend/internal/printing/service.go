@@ -125,6 +125,7 @@ type Service struct {
 	templatesPath  string
 	store          *Store
 	remoteClaiming bool
+	preferredBatch uint
 }
 
 func New(cfg Config) (*Service, error) {
@@ -141,7 +142,22 @@ func New(cfg Config) (*Service, error) {
 			keys[job.IdempotencyKey] = job.ID
 		}
 	}
-	return &Service{cfg: cfg, jobs: jobs, keys: keys, templatesPath: cfg.TemplatesPath, store: store}, nil
+	service := &Service{cfg: cfg, jobs: jobs, keys: keys, templatesPath: cfg.TemplatesPath, store: store}
+	for _, job := range jobs {
+		if job.RemoteBatchID != nil && job.RemoteJobID > 0 && (job.Status == "queued" || job.Status == "printing") {
+			service.preferredBatch = *job.RemoteBatchID
+			break
+		}
+	}
+	if service.preferredBatch == 0 {
+		for _, job := range jobs {
+			if job.RemoteBatchID != nil && job.RemoteJobID > 0 {
+				service.preferredBatch = *job.RemoteBatchID
+				break
+			}
+		}
+	}
+	return service, nil
 }
 
 func (s *Service) Close() error   { return s.store.Close() }
@@ -252,6 +268,18 @@ func (s *Service) SetStatusWithError(id, status, jobError string) (Job, bool, er
 	for i := range s.jobs {
 		if s.jobs[i].ID == id {
 			job := s.jobs[i]
+			// A queued snapshot may still be held by the Windows worker when an
+			// operator stops its batch. Keep terminal states sticky so that stale
+			// workers cannot restart or overwrite a cancelled job.
+			if job.Status == "cancelled" && status != "cancelled" {
+				return job, true, nil
+			}
+			if isTerminalPrintStatus(job.Status) && status != "queued" {
+				return job, true, nil
+			}
+			if status == "printing" && job.Status != "queued" {
+				return job, true, nil
+			}
 			job.Status = status
 			job.Error = jobError
 			now := time.Now()
@@ -276,13 +304,48 @@ func (s *Service) SetStatusWithError(id, status, jobError string) (Job, bool, er
 	}
 	return Job{}, false, nil
 }
+
+// CancelRemoteBatch stops any center task from the batch that has already
+// reached this edge. Center-side cancellation separately prevents new leases.
+func (s *Service) CancelRemoteBatch(batchID uint) ([]Job, error) {
+	if batchID == 0 {
+		return nil, errors.New("remote batch id is required")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	affected := make([]Job, 0, 1)
+	for i := range s.jobs {
+		job := s.jobs[i]
+		if job.RemoteBatchID == nil || *job.RemoteBatchID != batchID || (job.Status != "queued" && job.Status != "printing") {
+			continue
+		}
+		now := time.Now()
+		job.Status = "cancelled"
+		job.Error = "批量打印已由操作员停止"
+		job.FinishedAt = &now
+		if err := s.store.SaveWithRemoteCompletion(job, remoteCompletionForJob(job)); err != nil {
+			return affected, err
+		}
+		s.jobs[i] = job
+		affected = append(affected, job)
+	}
+	if s.preferredBatch == batchID {
+		s.preferredBatch = 0
+	}
+	return affected, nil
+}
 func (s *Service) Create(req Request) (Job, bool, error) {
 	return s.create(req, 0, "")
 }
 
 // CreateRemote preserves the center lease so the Windows print worker can report its final result.
 func (s *Service) CreateRemote(req Request, remoteJobID uint, leaseToken string) (Job, bool, error) {
-	return s.create(req, remoteJobID, leaseToken)
+	job, duplicate, err := s.create(req, remoteJobID, leaseToken)
+	if err == nil && req.RemoteBatchID != nil {
+		s.SetPreferredRemoteBatchID(*req.RemoteBatchID)
+	}
+	return job, duplicate, err
 }
 
 func (s *Service) create(req Request, remoteJobID uint, leaseToken string) (Job, bool, error) {
@@ -506,6 +569,33 @@ func (s *Service) BeginRemoteClaim() bool {
 func (s *Service) EndRemoteClaim() {
 	s.mu.Lock()
 	s.remoteClaiming = false
+	s.mu.Unlock()
+}
+
+func (s *Service) PreferredRemoteBatchID() uint {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.preferredBatch
+}
+
+func (s *Service) SetPreferredRemoteBatchID(batchID uint) bool {
+	if batchID == 0 {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.preferredBatch != 0 && s.preferredBatch != batchID {
+		return false
+	}
+	s.preferredBatch = batchID
+	return true
+}
+
+func (s *Service) ClearPreferredRemoteBatchID(batchID uint) {
+	s.mu.Lock()
+	if batchID == 0 || s.preferredBatch == batchID {
+		s.preferredBatch = 0
+	}
 	s.mu.Unlock()
 }
 

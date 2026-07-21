@@ -66,6 +66,12 @@ public sealed class EdgePrintJob
     [JsonPropertyName("copies")]
     public int Copies { get; set; } = 1;
 
+    [JsonPropertyName("remote_batch_id")]
+    public uint? RemoteBatchId { get; set; }
+
+    [JsonPropertyName("remote_sequence_no")]
+    public int RemoteSequenceNo { get; set; }
+
     [JsonPropertyName("box_marks")]
     public List<ManufacturerBoxMark> BoxMarks { get; set; } = [];
 }

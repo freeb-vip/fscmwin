@@ -70,7 +70,8 @@ public sealed class QrPrintService
         EdgeSettings settings,
         string qrPayload,
         string displayText,
-        PrintTemplateProfile template)
+        PrintTemplateProfile template,
+        string? documentName = null)
     {
         ValidateDisplayText(template, displayText);
         if (string.IsNullOrWhiteSpace(settings.DefaultPrinter))
@@ -88,7 +89,7 @@ public sealed class QrPrintService
         LocalPrinterService.EnsureQueueAvailable(queue);
         PreparedPrintTarget target = PrintTargetService.Prepare(queue, settings);
         FixedDocument document = CreateLabelDocument(template, qrPayload, displayText, target.Context);
-        PrintTargetService.Print(queue, target, document, $"FSCM 标签 - {displayText}");
+        PrintTargetService.Print(queue, target, document, string.IsNullOrWhiteSpace(documentName) ? $"FSCM 标签 - {displayText}" : documentName);
     }
 
     public void PrintLabel(

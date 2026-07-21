@@ -732,7 +732,6 @@
                     <ColumnDefinition Width="1.25*" />
                     <ColumnDefinition Width="1.5*" />
                     <ColumnDefinition Width="0.7*" />
-                    <ColumnDefinition Width="0.7*" />
                     <ColumnDefinition Width="1.05*" />
                     <ColumnDefinition Width="1.05*" />
                   </Grid.ColumnDefinitions>
@@ -749,17 +748,13 @@
                     <TextBox x:Name="BatchCopiesTextBox" Margin="0,6,0,0" Height="36" Text="1" />
                   </StackPanel>
                   <StackPanel Grid.Column="3" Margin="0,0,12,0">
-                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="间隔(秒)" />
-                    <TextBox x:Name="BatchIntervalTextBox" Margin="0,6,0,0" Height="36" Text="1" />
-                  </StackPanel>
-                  <StackPanel Grid.Column="4" Margin="0,0,12,0">
                     <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="失败策略" />
                     <ComboBox x:Name="BatchFailurePolicyComboBox" Margin="0,6,0,0" Height="36" SelectedIndex="0" SelectedValuePath="Tag">
                       <ComboBoxItem Content="失败后暂停" Tag="pause" />
                       <ComboBoxItem Content="跳过失败继续" Tag="continue" />
                     </ComboBox>
                   </StackPanel>
-                  <StackPanel Grid.Column="5">
+                  <StackPanel Grid.Column="4">
                     <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="内容来源" />
                     <ComboBox x:Name="BatchSourceComboBox" Margin="0,6,0,0" Height="36" SelectedIndex="0" SelectedValuePath="Tag" SelectionChanged="OnBatchSourceChanged">
                       <ComboBoxItem Content="范围生成" Tag="range" />
@@ -811,6 +806,7 @@
                 <DockPanel>
                   <TextBlock x:Name="BatchPrintStatusText" VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" Text="请选择配置并生成预览。" TextWrapping="Wrap" />
                   <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                    <Button x:Name="BatchStopButton" Margin="0,0,8,0" Click="OnStopActiveBatchClick" Content="停止当前批次" IsEnabled="False" Style="{StaticResource DangerButtonStyle}" />
                     <Button x:Name="BatchPreviewButton" Click="OnPreviewBatchPrintClick" Content="生成预览" />
                     <Button x:Name="BatchSubmitButton" Margin="8,0,0,0" Click="OnSubmitBatchPrintClick" Content="提交整个批次" IsEnabled="False" Style="{StaticResource PrimaryButtonStyle}" />
                   </StackPanel>
@@ -847,7 +843,7 @@
                     <DataGridTextColumn Header="模板" Binding="{Binding TemplateCode}" Width="170" />
                     <DataGridTextColumn Header="打印机" Binding="{Binding PrinterName}" Width="180" />
                     <DataGridTextColumn Header="进度" Binding="{Binding ProgressText}" Width="90" />
-                    <DataGridTextColumn Header="间隔" Binding="{Binding IntervalSeconds, StringFormat={}{0} 秒}" Width="80" />
+                    <DataGridTextColumn Header="执行方式" Binding="{Binding IntervalText}" Width="100" />
                     <DataGridTextColumn Header="失败策略" Binding="{Binding FailurePolicyText}" Width="120" />
                     <DataGridTextColumn Header="状态" Binding="{Binding StatusText}" Width="90" />
                     <DataGridTextColumn Header="创建时间" Binding="{Binding CreatedAt, StringFormat=yyyy-MM-dd HH:mm:ss}" Width="165" />
@@ -857,7 +853,7 @@
                           <StackPanel Orientation="Horizontal">
                             <Button Margin="0,0,5,0" Padding="7,2" Click="OnPauseBatchClick" Content="暂停" />
                             <Button Margin="0,0,5,0" Padding="7,2" Click="OnResumeBatchClick" Content="继续" />
-                            <Button Padding="7,2" Click="OnCancelBatchClick" Content="取消" />
+                            <Button Padding="7,2" Click="OnCancelBatchClick" Content="停止" Style="{StaticResource DangerButtonStyle}" />
                           </StackPanel>
                         </DataTemplate>
                       </DataGridTemplateColumn.CellTemplate>

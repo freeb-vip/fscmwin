@@ -181,21 +181,33 @@ func (c *Client) SyncLocalPrintAudit(ctx context.Context, audit LocalPrintAudit)
 
 // ClaimPrintJob leases one center task. A nil job means the queue is currently empty.
 func (c *Client) ClaimPrintJob(ctx context.Context) (*ClaimedPrintJob, error) {
+	job, _, err := c.ClaimPrintJobForBatch(ctx, 0)
+	return job, err
+}
+
+// ClaimPrintJobForBatch keeps an active batch contiguous while remaining
+// compatible with centers that ignore the optional batch_id field.
+func (c *Client) ClaimPrintJobForBatch(ctx context.Context, batchID uint) (*ClaimedPrintJob, string, error) {
 	var payload struct {
 		Code int `json:"code"`
 		Data struct {
-			Job        *ClaimedPrintJob `json:"job"`
-			LeaseToken string           `json:"lease_token"`
+			Job         *ClaimedPrintJob `json:"job"`
+			LeaseToken  string           `json:"lease_token"`
+			BatchStatus string           `json:"batch_status"`
 		} `json:"data"`
 		Msg string `json:"msg"`
 	}
-	if err := c.request(ctx, http.MethodPost, "/api/edge/nodes/print-jobs/claim", map[string]string{"node_id": c.cfg.NodeID}, &payload); err != nil {
-		return nil, err
+	request := map[string]interface{}{"node_id": c.cfg.NodeID}
+	if batchID > 0 {
+		request["batch_id"] = batchID
+	}
+	if err := c.request(ctx, http.MethodPost, "/api/edge/nodes/print-jobs/claim", request, &payload); err != nil {
+		return nil, "", err
 	}
 	if payload.Data.Job != nil && payload.Data.Job.LeaseToken == "" {
 		payload.Data.Job.LeaseToken = payload.Data.LeaseToken
 	}
-	return payload.Data.Job, nil
+	return payload.Data.Job, payload.Data.BatchStatus, nil
 }
 
 func (c *Client) CompletePrintJob(ctx context.Context, jobID uint, leaseToken, status, errorMessage string, result interface{}) error {

@@ -3,6 +3,8 @@
 // Copyright (C) Leszek Pomianowski and WPF UI Contributors.
 // All Rights Reserved.
 
+using Fscm.Edge.Win.Models;
+
 namespace Fscm.Edge.Win.Services;
 
 public static class PrintJobDispatchPolicy
@@ -45,5 +47,28 @@ public static class PrintJobDispatchPolicy
                 throw new InvalidOperationException($"打印保护已拦截：内容“{key}”累计超过 {MaxCopiesPerContent} 份。");
             }
         }
+    }
+
+    public static EdgePrintJob? SelectNextQueuedJob(IEnumerable<EdgePrintJob> jobs, uint? activeBatchId)
+    {
+        List<EdgePrintJob> queued = jobs
+            .Where(job => string.Equals(job.Status, "queued", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (activeBatchId is uint batchId)
+        {
+            return queued
+                .Where(job => job.RemoteBatchId == batchId)
+                .OrderBy(job => job.RemoteSequenceNo)
+                .ThenBy(job => job.SubmittedAt)
+                .FirstOrDefault();
+        }
+
+        return queued
+            .Where(job => job.RemoteBatchId.HasValue)
+            .OrderBy(job => job.SubmittedAt)
+            .ThenBy(job => job.RemoteBatchId)
+            .ThenBy(job => job.RemoteSequenceNo)
+            .FirstOrDefault()
+            ?? queued.FirstOrDefault();
     }
 }

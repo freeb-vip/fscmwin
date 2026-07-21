@@ -45,7 +45,9 @@ public partial class MainWindow : Window
     private readonly StartupService _startup = new();
     private readonly LocalPrinterService _printerService = new();
     private readonly DispatcherTimer _timer;
+    private readonly DispatcherTimer _printQueueTimer;
     private readonly SemaphoreSlim _refreshGate = new(1, 1);
+    private readonly SemaphoreSlim _printQueueGate = new(1, 1);
     private readonly FormsNotifyIcon _notifyIcon;
     private readonly List<EdgePrintJob> _allPrintJobs = [];
     private IReadOnlyList<PrintTemplateProfile> _printTemplates = [];
@@ -57,6 +59,8 @@ public partial class MainWindow : Window
     private IReadOnlyList<BatchPrintItem> _batchImportedItems = [];
     private IReadOnlyList<BatchPrintItem> _batchPreviewItems = [];
     private uint _batchCenterNodeId;
+    private CenterPrintBatch? _activePrintBatch;
+    private uint? _printingBatchId;
     private bool _batchPrintBusy;
     private int _boxLabelPage = 1;
     private long _boxLabelTotal;
@@ -100,6 +104,8 @@ public partial class MainWindow : Window
 
         _timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(8) };
         _timer.Tick += async (_, _) => await RefreshAllAsync();
+        _printQueueTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
+        _printQueueTimer.Tick += async (_, _) => await RefreshPrintJobsAsync();
 
         Loaded += async (_, _) =>
         {
@@ -110,6 +116,7 @@ public partial class MainWindow : Window
             await StartRuntimeAsync();
             await RefreshAllAsync();
             _timer.Start();
+            _printQueueTimer.Start();
             _ = CheckForUpdatesAsync(interactive: false);
         };
 
@@ -201,6 +208,7 @@ public partial class MainWindow : Window
     private async Task ShutdownAsync()
     {
         _timer.Stop();
+        _printQueueTimer.Stop();
         _notifyIcon.Visible = false;
         _notifyIcon.Dispose();
         await _runtime.StopAsync();
@@ -784,6 +792,11 @@ public partial class MainWindow : Window
 
     private async void OnSubmitBatchPrintClick(object sender, RoutedEventArgs e)
     {
+        if (_printingBatchId.HasValue || _activePrintBatch is not null)
+        {
+            BatchPrintStatusText.Text = "已有批次正在执行或暂停，请先等待其完成或停止该批次。";
+            return;
+        }
         if (!await PreviewBatchPrintAsync())
         {
             return;
@@ -806,8 +819,13 @@ public partial class MainWindow : Window
                 BatchPrintStatusText.Text = result.Message;
                 return;
             }
+            _activePrintBatch = result.Data;
+            _printingBatchId = result.Data.Id;
+            _printQueueTimer.Interval = TimeSpan.FromMilliseconds(200);
             BatchPrintStatusText.Text = $"批次 {result.Data.Id} 已提交，共 {result.Data.TotalCount} 个任务。";
             await LoadBatchHistoryAsync();
+            _ = await _runtime.PullRemotePrintJobAsync(result.Data.Id);
+            await RefreshPrintJobsAsync();
         }
         catch (Exception ex)
         {
@@ -876,12 +894,72 @@ public partial class MainWindow : Window
 
     private async void OnCancelBatchClick(object sender, RoutedEventArgs e)
     {
-        if ((sender as FrameworkElement)?.DataContext is not CenterPrintBatch batch ||
-            MessageBox.Show($"确定取消批次 {batch.Id} 的剩余任务吗？", "取消批次", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
+        if ((sender as FrameworkElement)?.DataContext is not CenterPrintBatch batch)
         {
             return;
         }
-        await UpdateBatchStatusAsync(sender, "cancel", "取消");
+        await StopBatchAsync(batch);
+    }
+
+    private async void OnStopActiveBatchClick(object sender, RoutedEventArgs e)
+    {
+        if (_activePrintBatch is not null)
+        {
+            await StopBatchAsync(_activePrintBatch);
+        }
+    }
+
+    private async Task StopBatchAsync(CenterPrintBatch batch)
+    {
+        if (!IsActiveBatchStatus(batch.Status))
+        {
+            BatchPrintStatusText.Text = $"批次 {batch.Id} 已不在执行中。";
+            await LoadBatchHistoryAsync();
+            return;
+        }
+        if (MessageBox.Show(
+                $"确定立即停止批次 {batch.Id} 吗？\n\n尚未打印的内容将被取消；已经送入打印机的页面可能无法撤回。",
+                "停止批量打印",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning) != MessageBoxResult.Yes)
+        {
+            return;
+        }
+
+        try
+        {
+            SetBatchPrintBusy(true);
+            BatchPrintResult<CenterPrintBatch> centerResult = await _runtime.UpdateCenterPrintBatchAsync(batch.Id, "cancel");
+            if (!centerResult.Succeeded)
+            {
+                BatchPrintStatusText.Text = $"停止批次失败：{centerResult.Message}";
+                return;
+            }
+
+            BatchPrintResult<IReadOnlyList<EdgePrintJob>> localResult = await _runtime.StopLocalBatchPrintAsync(batch.Id);
+            if (!localResult.Succeeded)
+            {
+                _activePrintBatch = null;
+                BatchPrintStatusText.Text = $"批次 {batch.Id} 已在中心停止，但本地任务停止失败：{localResult.Message}";
+                return;
+            }
+            IReadOnlyList<EdgePrintJob> localJobs = localResult.Data ?? [];
+            int spoolJobs = _printerService.CancelBatchPrintJobs(localJobs);
+            _activePrintBatch = null;
+            if (_printingBatchId == batch.Id)
+            {
+                _printingBatchId = null;
+                _printQueueTimer.Interval = TimeSpan.FromSeconds(2);
+            }
+            BatchPrintStatusText.Text = localJobs.Count == 0
+                ? $"批次 {batch.Id} 已停止，中心不会再下发后续任务。"
+                : $"批次 {batch.Id} 已停止，本地取消 {localJobs.Count} 个任务，撤销 {spoolJobs} 个打印队列作业。";
+        }
+        finally
+        {
+            SetBatchPrintBusy(false);
+            await LoadBatchHistoryAsync();
+        }
     }
 
     private async Task UpdateBatchStatusAsync(object sender, string action, string actionText)
@@ -892,9 +970,8 @@ public partial class MainWindow : Window
         }
         bool allowed = action switch
         {
-            "pause" => batch.Status == "running",
-            "resume" => batch.Status == "paused",
-            "cancel" => batch.Status is "running" or "paused",
+            "pause" => string.Equals(batch.Status, "running", StringComparison.OrdinalIgnoreCase),
+            "resume" => string.Equals(batch.Status, "paused", StringComparison.OrdinalIgnoreCase),
             _ => false,
         };
         if (!allowed)
@@ -949,7 +1026,12 @@ public partial class MainWindow : Window
             BatchPrintStatusText.Text = result.Message;
             return;
         }
-        BatchHistoryGrid.ItemsSource = result.Data.Where(batch => batch.EdgeNodeId == _batchCenterNodeId).ToList();
+        List<CenterPrintBatch> batches = result.Data.Where(batch => batch.EdgeNodeId == _batchCenterNodeId).ToList();
+        BatchHistoryGrid.ItemsSource = batches;
+        _activePrintBatch = _printingBatchId is uint printingBatchId
+            ? batches.FirstOrDefault(batch => batch.Id == printingBatchId && IsActiveBatchStatus(batch.Status))
+            : batches.FirstOrDefault(batch => IsActiveBatchStatus(batch.Status));
+        BatchStopButton.IsEnabled = !_batchPrintBusy && _activePrintBatch is not null;
     }
 
     private BatchPrintRequest BuildBatchPrintRequest()
@@ -963,7 +1045,6 @@ public partial class MainWindow : Window
             throw new InvalidOperationException("请选择可用的标签模板。");
         }
         int copies = ReadBatchNumber(BatchCopiesTextBox.Text, "默认份数", 1, PrintJobDispatchPolicy.MaxCopiesPerContent);
-        int interval = ReadBatchNumber(BatchIntervalTextBox.Text, "任务间隔", 1, 60);
         string sourceType = SelectedBatchSource();
         var source = new BatchPrintSource { Type = sourceType };
         if (sourceType == "range")
@@ -996,7 +1077,7 @@ public partial class MainWindow : Window
             EdgeNodeId = _batchCenterNodeId,
             TemplateCode = template.Id,
             DefaultCopies = copies,
-            IntervalSeconds = interval,
+            IntervalSeconds = 0,
             FailurePolicy = BatchFailurePolicyComboBox.SelectedValue?.ToString() == "continue" ? "continue" : "pause",
             Source = source,
         };
@@ -1053,7 +1134,14 @@ public partial class MainWindow : Window
     {
         _batchPrintBusy = busy;
         BatchPreviewButton.IsEnabled = !busy;
-        BatchSubmitButton.IsEnabled = !busy && _batchPreviewItems.Count > 0;
+        BatchSubmitButton.IsEnabled = !busy && _batchPreviewItems.Count > 0 && _activePrintBatch is null && !_printingBatchId.HasValue;
+        BatchStopButton.IsEnabled = !busy && _activePrintBatch is not null;
+    }
+
+    private static bool IsActiveBatchStatus(string? status)
+    {
+        return string.Equals(status, "running", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(status, "paused", StringComparison.OrdinalIgnoreCase);
     }
 
     private string SelectedBatchSource()
@@ -1404,27 +1492,39 @@ public partial class MainWindow : Window
 
     private async Task RefreshPrintJobsAsync()
     {
-        _allPrintJobs.Clear();
-        _allPrintJobs.AddRange(await _runtime.GetPrintJobsAsync());
-        var hadQueuedJobs = _allPrintJobs.Any(job => string.Equals(job.Status, "queued", StringComparison.OrdinalIgnoreCase));
-        await ProcessQueuedPrintJobsAsync();
-        if (hadQueuedJobs)
+        if (!await _printQueueGate.WaitAsync(0))
         {
-            _allPrintJobs.Clear();
-            _allPrintJobs.AddRange(await _runtime.GetPrintJobsAsync());
+            return;
         }
 
-        var queued = _allPrintJobs.Count(job => string.Equals(job.Status, "queued", StringComparison.OrdinalIgnoreCase));
-        var failed = _allPrintJobs.Count(job => string.Equals(job.Status, "failed", StringComparison.OrdinalIgnoreCase));
-        var completed = _allPrintJobs.Count(job => job.Status.Equals("done", StringComparison.OrdinalIgnoreCase) ||
-            job.Status.Equals("success", StringComparison.OrdinalIgnoreCase) ||
-            job.Status.Equals("completed", StringComparison.OrdinalIgnoreCase));
-        PrintQueueSummaryText.Text = _allPrintJobs.Count == 0
-            ? "暂无打印任务"
-            : $"共 {_allPrintJobs.Count} 个任务 · 排队 {queued} · 失败 {failed} · 已完成 {completed} · {DateTimeOffset.Now:HH:mm:ss} 更新";
-        HomePrintQueueText.Text = queued.ToString(CultureInfo.InvariantCulture);
-        HomePrintProcessedText.Text = completed.ToString(CultureInfo.InvariantCulture);
-        ApplyPrintFilter();
+        try
+        {
+            await ReloadLocalPrintJobsAsync();
+            await ProcessQueuedPrintJobsAsync();
+            await ReloadLocalPrintJobsAsync();
+
+            var queued = _allPrintJobs.Count(job => string.Equals(job.Status, "queued", StringComparison.OrdinalIgnoreCase));
+            var failed = _allPrintJobs.Count(job => string.Equals(job.Status, "failed", StringComparison.OrdinalIgnoreCase));
+            var completed = _allPrintJobs.Count(job => job.Status.Equals("done", StringComparison.OrdinalIgnoreCase) ||
+                job.Status.Equals("success", StringComparison.OrdinalIgnoreCase) ||
+                job.Status.Equals("completed", StringComparison.OrdinalIgnoreCase));
+            PrintQueueSummaryText.Text = _allPrintJobs.Count == 0
+                ? "暂无打印任务"
+                : $"共 {_allPrintJobs.Count} 个任务 · 排队 {queued} · 失败 {failed} · 已完成 {completed} · {DateTimeOffset.Now:HH:mm:ss} 更新";
+            HomePrintQueueText.Text = queued.ToString(CultureInfo.InvariantCulture);
+            HomePrintProcessedText.Text = completed.ToString(CultureInfo.InvariantCulture);
+            ApplyPrintFilter();
+        }
+        finally
+        {
+            _printQueueGate.Release();
+        }
+    }
+
+    private async Task ReloadLocalPrintJobsAsync()
+    {
+        _allPrintJobs.Clear();
+        _allPrintJobs.AddRange(await _runtime.GetPrintJobsAsync());
     }
 
     private async Task ProcessQueuedPrintJobsAsync()
@@ -1436,11 +1536,41 @@ public partial class MainWindow : Window
 
         try
         {
-            var queued = _allPrintJobs
-                .Where(job => string.Equals(job.Status, "queued", StringComparison.OrdinalIgnoreCase))
-                .ToList();
-            foreach (var job in queued)
+            while (true)
             {
+                EdgePrintJob? job = PrintJobDispatchPolicy.SelectNextQueuedJob(_allPrintJobs, _printingBatchId);
+                if (job is null)
+                {
+                    if (_printingBatchId is not uint activeBatchId)
+                    {
+                        break;
+                    }
+
+                    bool claimed = await _runtime.PullRemotePrintJobAsync(activeBatchId);
+                    await ReloadLocalPrintJobsAsync();
+                    if (claimed || PrintJobDispatchPolicy.SelectNextQueuedJob(_allPrintJobs, activeBatchId) is not null)
+                    {
+                        continue;
+                    }
+
+                    BatchPrintResult<IReadOnlyList<CenterPrintBatch>> batches = await _runtime.GetCenterPrintBatchesAsync();
+                    CenterPrintBatch? activeBatch = batches.Data?.FirstOrDefault(batch => batch.Id == activeBatchId);
+                    if (!batches.Succeeded || activeBatch is null || string.Equals(activeBatch.Status, "running", StringComparison.OrdinalIgnoreCase))
+                    {
+                        break;
+                    }
+
+                    _printingBatchId = null;
+                    _printQueueTimer.Interval = TimeSpan.FromSeconds(2);
+                    continue;
+                }
+
+                if (job.RemoteBatchId is uint jobBatchId)
+                {
+                    _printingBatchId = jobBatchId;
+                    _printQueueTimer.Interval = TimeSpan.FromMilliseconds(200);
+                }
+
                 try
                 {
                     var template = _printTemplates.FirstOrDefault(item =>
@@ -1471,7 +1601,7 @@ public partial class MainWindow : Window
                     }
 
                     var started = await _runtime.UpdatePrintJobStatusAsync(job.Id, "printing");
-                    if (started is null)
+                    if (started is null || !string.Equals(started.Status, "printing", StringComparison.OrdinalIgnoreCase))
                     {
                         continue;
                     }
@@ -1506,7 +1636,10 @@ public partial class MainWindow : Window
                                 settings,
                                 string.IsNullOrWhiteSpace(started.QrCodeContent) ? started.Text : started.QrCodeContent,
                                 started.Text,
-                                template);
+                                template,
+                                string.Equals(started.Kind, "batch_content", StringComparison.OrdinalIgnoreCase)
+                                    ? $"FSCM 批量打印 - {started.Id}"
+                                    : null);
                         }
                         else
                         {
@@ -1520,6 +1653,8 @@ public partial class MainWindow : Window
                 {
                     await _runtime.UpdatePrintJobStatusAsync(job.Id, "failed", ex.Message);
                 }
+
+                await ReloadLocalPrintJobsAsync();
             }
         }
         finally

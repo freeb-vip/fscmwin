@@ -138,6 +138,9 @@ public sealed class CenterPrintBatch
     public string FailurePolicyText => FailurePolicy == "continue" ? "失败后继续" : "失败后暂停";
 
     [JsonIgnore]
+    public string IntervalText => IntervalSeconds == 0 ? "连续打印" : $"{IntervalSeconds} 秒";
+
+    [JsonIgnore]
     public string StatusText => Status switch
     {
         "running" => "执行中",
