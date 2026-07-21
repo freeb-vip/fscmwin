@@ -119,7 +119,7 @@ func main() {
 	}
 	defer func() { _ = mediaCache.Close() }()
 	availability := &printerAvailability{printers: make(map[string]struct{})}
-	reg := registry.New(registry.Config{CenterURL: cfg.CenterURL, APIToken: cfg.APIToken, NodeID: cfg.NodeID, NodeName: cfg.NodeName, LANBaseURL: cfg.LANBaseURL, Version: version.Version, APIVersion: version.APIVersion, CacheMode: cfg.Cache.Mode, NamespaceID: cfg.NamespaceID, Capabilities: []string{"proxy", "adaptive_cache", "catalog_cache", "catalog_media_cache", "box_label_catalog", "local_print", "print_templates"}, Inventory: func() interface{} { return printInventory(printer.Templates(), cfg.DefaultPrinter, availability) }, HeartbeatInterval: time.Duration(cfg.HeartbeatSeconds) * time.Second, OnCatalogRevision: catalogManager.OnRemoteRevision, OnTicketPublicKey: catalogManager.SetTicketPublicKey})
+	reg := registry.New(registry.Config{CenterURL: cfg.CenterURL, APIToken: cfg.APIToken, NodeID: cfg.NodeID, NodeName: cfg.NodeName, LANBaseURL: cfg.LANBaseURL, Version: version.Version, APIVersion: version.APIVersion, CacheMode: cfg.Cache.Mode, NamespaceID: cfg.NamespaceID, Capabilities: []string{"proxy", "adaptive_cache", "catalog_cache", "catalog_media_cache", "box_label_catalog", "local_print", "print_templates", "batch_print_v1"}, Inventory: func() interface{} { return printInventory(printer.Templates(), cfg.DefaultPrinter, availability) }, HeartbeatInterval: time.Duration(cfg.HeartbeatSeconds) * time.Second, OnCatalogRevision: catalogManager.OnRemoteRevision, OnTicketPublicKey: catalogManager.SetTicketPublicKey})
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	startServiceAdvertisement(ctx, cfg)
@@ -127,13 +127,15 @@ func main() {
 	catalogManager.Start(ctx)
 	startRemotePrintQueue(ctx, reg, printer, availability, time.Duration(cfg.PrintPollSeconds)*time.Second)
 	startLocalPrintAuditSync(ctx, reg, printer, 5*time.Second)
+	startRemoteCompletionSync(ctx, reg, printer, time.Second)
 
 	terminals := newTerminalStore()
 	router := gin.Default()
 	router.Use(cors())
 	router.GET("/edge/health", func(c *gin.Context) {
 		catalogStatus, _ := catalogManager.Status()
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "mode": "proxy", "backend_version": version.Version, "backend_commit": version.Commit, "edge_api_version": version.APIVersion, "center": proxyHandler.CenterStatus(), "cache": responseCache.Status(), "catalog": catalogStatus, "catalog_media_cache": mediaCache.Status(), "catalog_ticket_key_ready": catalogManager.TicketKeyReady(), "registration": reg.Status()})
+		completionStatus, _ := printer.RemoteCompletionStatus()
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "mode": "proxy", "backend_version": version.Version, "backend_commit": version.Commit, "edge_api_version": version.APIVersion, "center": proxyHandler.CenterStatus(), "cache": responseCache.Status(), "catalog": catalogStatus, "catalog_media_cache": mediaCache.Status(), "catalog_ticket_key_ready": catalogManager.TicketKeyReady(), "registration": reg.Status(), "remote_print_completions": completionStatus})
 	})
 	router.GET("/edge/probe", func(c *gin.Context) {
 		terminals.recordProbe(c.ClientIP(), c.Request.UserAgent(), c.GetHeader("X-Edge-Terminal-Name"))
@@ -438,15 +440,8 @@ func main() {
 			c.JSON(http.StatusNotFound, gin.H{"code": "PRINT_JOB_NOT_FOUND"})
 			return
 		}
-		if job.RemoteJobID > 0 && (payload.Status == "completed" || payload.Status == "failed") {
-			centerStatus := "succeeded"
-			if payload.Status == "failed" {
-				centerStatus = "failed"
-			}
-			if err := reg.CompletePrintJob(c.Request.Context(), job.RemoteJobID, job.RemoteLeaseToken, centerStatus, payload.Error, map[string]interface{}{"local_job_id": job.ID, "printer": job.Printer}); err != nil {
-				c.JSON(http.StatusBadGateway, gin.H{"code": "CENTER_PRINT_JOB_COMPLETE_FAILED", "job": job})
-				return
-			}
+		if job.RemoteJobID > 0 && isTerminalRemoteStatus(payload.Status) {
+			_ = syncRemoteCompletions(c.Request.Context(), reg, printer)
 		}
 		c.JSON(http.StatusOK, gin.H{"job": job})
 	})
@@ -570,6 +565,10 @@ func createPrintJob(c *gin.Context, printer *printing.Service, availability *pri
 	}
 	job, duplicate, err := printer.Create(req)
 	if err != nil {
+		if errors.Is(err, printing.ErrPrintCopiesExceeded) {
+			c.JSON(http.StatusBadRequest, gin.H{"code": "PRINT_COPIES_LIMIT_EXCEEDED", "message": err.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"code": "PRINT_JOB_PERSIST_FAILED"})
 		return
 	}
@@ -619,7 +618,7 @@ func validateLabelDisplayText(req printing.Request, template printing.Template) 
 	if restrictedLabelTextMessage(template) == "" {
 		return "", ""
 	}
-	if strings.EqualFold(strings.TrimSpace(req.Kind), "manual_text") {
+	if isTextLabelKind(req.Kind) {
 		text := strings.TrimSpace(req.Text)
 		return text, validateRestrictedLabelText(template, text)
 	}
@@ -635,6 +634,11 @@ func validateLabelDisplayText(req printing.Request, template printing.Template) 
 	return "", ""
 }
 
+func isTextLabelKind(kind string) bool {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	return kind == "manual_text" || kind == "batch_content"
+}
+
 func validateManufacturerBoxMarkRequest(req printing.Request, templates []printing.Template, availability *printerAvailability) string {
 	if req.Kind != "manufacturer_box_mark" {
 		return ""
@@ -642,7 +646,7 @@ func validateManufacturerBoxMarkRequest(req printing.Request, templates []printi
 	if len(req.BoxMarks) == 0 || len(req.BoxMarks) > 100 {
 		return "INVALID_BOX_MARK_COUNT"
 	}
-	if req.Copies < 1 || req.Copies > 100 {
+	if req.Copies < 1 || req.Copies > printing.MaxCopiesPerContent {
 		return "INVALID_PRINT_COPIES"
 	}
 	for _, template := range templates {
@@ -652,12 +656,43 @@ func validateManufacturerBoxMarkRequest(req printing.Request, templates []printi
 		if template.Type != "manufacturer_box_mark" || math.Abs(template.WidthMillimeters-100) >= 0.1 || math.Abs(template.HeightMillimeters-150) >= 0.1 || !strings.EqualFold(strings.TrimSpace(template.Orientation), "portrait") {
 			return "INVALID_BOX_MARK_TEMPLATE"
 		}
+		if normalizeTemplateLayoutStyle(template) == "box_mark_quad_qr" {
+			if boxMarkDocumentVersion(req) != "manufacturer_box_mark.v2" {
+				return "INVALID_BOX_MARK_PAYLOAD"
+			}
+			for _, mark := range req.BoxMarks {
+				if !validQuadBoxMark(mark) {
+					return "INVALID_BOX_MARK_SKU_CONTENT"
+				}
+			}
+		}
 		if strings.TrimSpace(template.Printer) == "" || !availability.Has(template.Printer) {
 			return "BOX_MARK_PRINTER_UNAVAILABLE"
 		}
 		return ""
 	}
 	return "PRINT_TEMPLATE_NOT_FOUND"
+}
+
+func boxMarkDocumentVersion(req printing.Request) string {
+	if len(req.PayloadSnapshot) == 0 {
+		return ""
+	}
+	var payload struct {
+		DocumentVersion string `json:"document_version"`
+	}
+	if json.Unmarshal(req.PayloadSnapshot, &payload) != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.DocumentVersion)
+}
+
+func validQuadBoxMark(mark printing.BoxMark) bool {
+	boxMarkCode := first(mark.Shop, mark.BoxUID, mark.InboundCode)
+	boxQRPayload := first(mark.BoxQRPayload, mark.BoxUID, mark.InboundCode, boxMarkCode)
+	skuQRPayload := first(mark.SKUQRPayload, mark.SKUCode)
+	return boxMarkCode != "" && boxQRPayload != "" && strings.TrimSpace(mark.SKUCode) != "" &&
+		strings.TrimSpace(mark.SKUName) != "" && skuQRPayload != "" && mark.QtyPerBox > 0
 }
 
 func printInventory(templates []printing.Template, defaultPrinter string, availability *printerAvailability) map[string]interface{} {
@@ -672,10 +707,7 @@ func printInventory(templates []printing.Template, defaultPrinter string, availa
 		printers = append(printers, map[string]interface{}{"name": name, "is_default": name == strings.TrimSpace(defaultPrinter), "status": "ready"})
 	}
 	addPrinter(defaultPrinter)
-	ordered := append([]printing.Template(nil), templates...)
-	sort.SliceStable(ordered, func(left, right int) bool {
-		return inventoryTemplatePriority(ordered[left]) < inventoryTemplatePriority(ordered[right])
-	})
+	ordered := orderPrintTemplates(templates)
 	result := make([]map[string]interface{}, 0, len(ordered))
 	for _, template := range ordered {
 		if !availability.Has(template.Printer) {
@@ -683,7 +715,7 @@ func printInventory(templates []printing.Template, defaultPrinter string, availa
 		}
 		addPrinter(template.Printer)
 		result = append(result, map[string]interface{}{
-			"code": template.ID, "number": template.TemplateNumber, "name": template.Name, "type": inventoryTemplateType(template), "printer_name": template.Printer,
+			"code": template.ID, "number": template.TemplateNumber, "name": template.Name, "sort_order": template.SortOrder, "type": inventoryTemplateType(template), "printer_name": template.Printer,
 			"width_mm": template.WidthMillimeters, "height_mm": template.HeightMillimeters, "orientation": template.Orientation,
 			"layout_style": normalizeTemplateLayoutStyle(template), "text_font_size_pt": templateTextFontSize(template),
 			"max_display_length": normalizedMaxDisplayLength(template), "label_qr_prefix": template.LabelQRPrefix,
@@ -699,6 +731,9 @@ func normalizeTemplateLayoutStyle(template printing.Template) string {
 	}
 	if strings.EqualFold(strings.TrimSpace(template.LayoutStyle), "qr_left_text_right") {
 		return "qr_left_text_right"
+	}
+	if strings.EqualFold(strings.TrimSpace(template.LayoutStyle), "box_mark_quad_qr") {
+		return "box_mark_quad_qr"
 	}
 	return "stacked"
 }
@@ -741,21 +776,23 @@ func templateVersion(template printing.Template) string {
 	return hex.EncodeToString(sum[:6])
 }
 
-func inventoryTemplatePriority(template printing.Template) int {
-	if !strings.EqualFold(strings.TrimSpace(template.Type), "label") {
-		return 3
-	}
-	return labelTemplatePriority(template)
-}
-
-func labelTemplatePriority(template printing.Template) int {
-	if matchesTemplateSize(template, 60, 40) {
-		return 0
-	}
-	if matchesTemplateSize(template, 100, 150) && strings.EqualFold(strings.TrimSpace(template.Orientation), "portrait") {
-		return 1
-	}
-	return 2
+func orderPrintTemplates(templates []printing.Template) []printing.Template {
+	ordered := append([]printing.Template(nil), templates...)
+	sort.SliceStable(ordered, func(left, right int) bool {
+		leftOrder := ordered[left].SortOrder
+		rightOrder := ordered[right].SortOrder
+		if leftOrder <= 0 && rightOrder <= 0 {
+			return false
+		}
+		if leftOrder <= 0 {
+			return false
+		}
+		if rightOrder <= 0 {
+			return true
+		}
+		return leftOrder < rightOrder
+	})
+	return ordered
 }
 
 func matchesTemplateSize(template printing.Template, width, height float64) bool {
@@ -799,6 +836,47 @@ func startLocalPrintAuditSync(ctx context.Context, reg *registry.Client, printer
 			}
 		}
 	}()
+}
+
+func startRemoteCompletionSync(ctx context.Context, reg *registry.Client, printer *printing.Service, interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			_ = syncRemoteCompletions(ctx, reg, printer)
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+}
+
+func syncRemoteCompletions(ctx context.Context, reg *registry.Client, printer *printing.Service) error {
+	completions, err := printer.PendingRemoteCompletions(50)
+	if err != nil {
+		return err
+	}
+	for _, completion := range completions {
+		var result interface{}
+		if len(completion.Result) > 0 {
+			result = json.RawMessage(completion.Result)
+		}
+		err = reg.CompletePrintJobWithCode(ctx, completion.RemoteJobID, completion.LeaseToken, completion.Status, completion.ErrorCode, completion.ErrorMessage, result)
+		if err == nil || registry.IsLeaseInvalid(err) {
+			if markErr := printer.MarkRemoteCompletionSynced(completion.RemoteJobID); markErr != nil {
+				return markErr
+			}
+			continue
+		}
+		delay := time.Duration(1<<min(completion.Attempts, 4)) * time.Second
+		if markErr := printer.MarkRemoteCompletionFailed(completion.RemoteJobID, err, time.Now().Add(delay)); markErr != nil {
+			return markErr
+		}
+		return err
+	}
+	return nil
 }
 
 func syncLocalPrintAudits(ctx context.Context, reg *registry.Client, printer *printing.Service) error {
@@ -849,6 +927,10 @@ func claimRemotePrintJob(ctx context.Context, reg *registry.Client, printer *pri
 	if !availability.Ready() {
 		return false, nil
 	}
+	if !printer.BeginRemoteClaim() {
+		return false, nil
+	}
+	defer printer.EndRemoteClaim()
 	claim, err := reg.ClaimPrintJob(ctx)
 	if err != nil || claim == nil {
 		return false, err
@@ -862,40 +944,45 @@ func claimRemotePrintJob(ctx context.Context, reg *registry.Client, printer *pri
 		Items     []printing.BoxMark `json:"items"`
 	}
 	if err := json.Unmarshal(claim.PayloadSnapshot, &payload); err != nil || !validClaimPayload(payload.Kind, payload.SKUCode, payload.Text, payload.Items) {
-		if completeErr := reg.CompletePrintJob(ctx, claim.ID, claim.LeaseToken, "failed", "invalid print job payload", nil); completeErr != nil {
-			return false, completeErr
-		}
-		return true, nil
+		return enqueueClaimFailure(printer, claim, "INVALID_PRINT_JOB_PAYLOAD", "invalid print job payload")
 	}
 	localID := fmt.Sprintf("center-job-%d", claim.ID)
-	request := printing.Request{JobID: localID, IdempotencyKey: localID, Source: "center", Printer: claim.PrinterName, Template: claim.TemplateCode, TemplateID: claim.TemplateCode, Kind: payload.Kind, Text: payload.Text, QRCodeContent: payload.Text, Copies: claim.Copies, BoxMarks: payload.Items}
+	request := printing.Request{JobID: localID, IdempotencyKey: localID, Source: "center", Printer: claim.PrinterName, Template: claim.TemplateCode, TemplateID: claim.TemplateCode, Kind: payload.Kind, Text: payload.Text, QRCodeContent: first(payload.QRPayload, payload.Text), PayloadSnapshot: append(json.RawMessage(nil), claim.PayloadSnapshot...), Copies: claim.Copies, BoxMarks: payload.Items, RemoteBatchID: claim.BatchID, RemoteSequenceNo: claim.SequenceNo, RemoteJobType: claim.JobType, RemoteAttemptCount: claim.AttemptCount}
 	if payload.Kind == "manual_text" {
 		// Keep one item for older Windows workers that predate the manual_text
 		// dispatcher. New workers render Text directly; older workers print this QR item.
 		request.Items = []printing.Item{{SKUCode: payload.Text, QRCodeContent: payload.Text, Quantity: claim.Copies}}
-	} else if payload.Kind != "manufacturer_box_mark" {
+	} else if payload.Kind != "manufacturer_box_mark" && payload.Kind != "batch_content" {
 		request.Items = []printing.Item{{SKUID: payload.SKUID, SKUCode: payload.SKUCode, QRCodeContent: payload.QRPayload, Quantity: claim.Copies}}
 	}
 	printerName := resolvePrintRequestPrinter(request, printer)
+	if code := validateManufacturerBoxMarkRequest(request, printer.Templates(), availability); code != "" {
+		return enqueueClaimFailure(printer, claim, code, code)
+	}
 	if printerName == "" || !availability.Has(printerName) {
 		message := "printer unavailable"
 		if printerName != "" {
 			message = fmt.Sprintf("printer unavailable: %s", printerName)
 		}
-		if completeErr := reg.CompletePrintJob(ctx, claim.ID, claim.LeaseToken, "failed", message, nil); completeErr != nil {
-			return false, completeErr
-		}
-		return true, nil
+		return enqueueClaimFailure(printer, claim, "PRINTER_UNAVAILABLE", message)
 	}
 	if template, ok := findPrintTemplate(printer.Templates(), request.TemplateID); ok {
 		if _, message := validateLabelDisplayText(request, template); message != "" {
-			if completeErr := reg.CompletePrintJob(ctx, claim.ID, claim.LeaseToken, "failed", message, nil); completeErr != nil {
-				return false, completeErr
-			}
-			return true, nil
+			return enqueueClaimFailure(printer, claim, "INVALID_LABEL_CONTENT", message)
 		}
 	}
 	if _, _, err := printer.CreateRemote(request, claim.ID, claim.LeaseToken); err != nil {
+		if errors.Is(err, printing.ErrPrintCopiesExceeded) {
+			return enqueueClaimFailure(printer, claim, "PRINT_COPIES_LIMIT_EXCEEDED", err.Error())
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func enqueueClaimFailure(printer *printing.Service, claim *registry.ClaimedPrintJob, errorCode, errorMessage string) (bool, error) {
+	result := map[string]interface{}{"phase": "claim_validation", "batch_id": claim.BatchID, "sequence_no": claim.SequenceNo}
+	if err := printer.EnqueueRemoteFailure(claim.ID, claim.LeaseToken, errorCode, errorMessage, result); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -903,13 +990,17 @@ func claimRemotePrintJob(ctx context.Context, reg *registry.Client, printer *pri
 
 func validClaimPayload(kind, skuCode, text string, items []printing.BoxMark) bool {
 	switch kind {
-	case "manual_text":
+	case "manual_text", "batch_content":
 		return strings.TrimSpace(text) != ""
 	case "manufacturer_box_mark":
 		return len(items) > 0
 	default:
 		return strings.TrimSpace(skuCode) != ""
 	}
+}
+
+func isTerminalRemoteStatus(status string) bool {
+	return status == "completed" || status == "failed" || status == "cancelled" || status == "interrupted"
 }
 
 func validJobStatus(status string) bool {
@@ -1278,7 +1369,7 @@ func writeCatalogObject(c *gin.Context, item interface{}, state string) {
 }
 
 func catalogCapabilities(status catalog.Status) []string {
-	capabilities := []string{"proxy", "adaptive_cache", "local_print", "print_templates"}
+	capabilities := []string{"proxy", "adaptive_cache", "local_print", "print_templates", "batch_print_v1"}
 	if status.Ready {
 		capabilities = append(capabilities, "catalog_cache", "catalog_media_cache")
 	}

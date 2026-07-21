@@ -2,9 +2,11 @@ package printing
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestCreateUsesTemplatePrefixAndIdempotency(t *testing.T) {
@@ -47,6 +49,195 @@ func TestCreateUsesTemplatePrefixAndIdempotency(t *testing.T) {
 	}
 	if !duplicate || second.ID != first.ID {
 		t.Fatalf("idempotency did not return original job: duplicate=%v id=%q", duplicate, second.ID)
+	}
+}
+
+func TestCreateRejectsMoreThanFiveCopiesOfSameContent(t *testing.T) {
+	t.Parallel()
+	service, err := New(Config{JobsPath: filepath.Join(t.TempDir(), "edge.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = service.Close() }()
+
+	for _, request := range []Request{
+		{Kind: "manual_text", Text: "A001", Copies: 6},
+		{Items: []Item{{SKUCode: "A001", Quantity: 3}, {SKUCode: "A001", Quantity: 3}}},
+	} {
+		if _, _, err := service.Create(request); !errors.Is(err, ErrPrintCopiesExceeded) {
+			t.Fatalf("expected copy protection error, got %v", err)
+		}
+	}
+	if len(service.Jobs()) != 0 {
+		t.Fatalf("blocked requests were persisted: %+v", service.Jobs())
+	}
+}
+
+func TestCreateRejectsSameContentAcrossActiveJobs(t *testing.T) {
+	t.Parallel()
+	service, err := New(Config{JobsPath: filepath.Join(t.TempDir(), "edge.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = service.Close() }()
+
+	first, _, err := service.Create(Request{Kind: "manual_text", Text: "A001", Copies: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := service.Create(Request{Kind: "manual_text", Text: "A001", Copies: 3}); !errors.Is(err, ErrPrintCopiesExceeded) {
+		t.Fatalf("expected active-job copy protection error, got %v", err)
+	}
+	if _, _, err := service.Create(Request{Kind: "manual_text", Text: "A002", Copies: 5}); err != nil {
+		t.Fatalf("different content should be allowed: %v", err)
+	}
+	if _, _, err := service.Create(Request{Items: []Item{{SKUCode: "SKU-1", Quantity: 3}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := service.Create(Request{Items: []Item{{SKUCode: "SKU-1", Quantity: 3}}}); !errors.Is(err, ErrPrintCopiesExceeded) {
+		t.Fatalf("expected prefixed SKU copy protection error, got %v", err)
+	}
+	if _, _, err := service.SetStatus(first.ID, "completed"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := service.Create(Request{Kind: "manual_text", Text: "A001", Copies: 3}); err != nil {
+		t.Fatalf("completed local job should not block a later request: %v", err)
+	}
+}
+
+func TestCreateRejectsRepeatedContentWithinRemoteBatch(t *testing.T) {
+	t.Parallel()
+	service, err := New(Config{JobsPath: filepath.Join(t.TempDir(), "edge.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = service.Close() }()
+	batchID := uint(7)
+
+	first, _, err := service.CreateRemote(Request{Kind: "batch_content", Text: "A001", Copies: 3, RemoteBatchID: &batchID}, 1, "lease-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := service.SetStatus(first.ID, "completed"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := service.CreateRemote(Request{Kind: "batch_content", Text: "A001", Copies: 3, RemoteBatchID: &batchID}, 2, "lease-2"); !errors.Is(err, ErrPrintCopiesExceeded) {
+		t.Fatalf("expected batch copy protection error, got %v", err)
+	}
+}
+
+func TestRemoteCompletionOutboxAndClaimBackpressure(t *testing.T) {
+	service, err := New(Config{JobsPath: filepath.Join(t.TempDir(), "edge.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = service.Close() }()
+	batchID := uint(41)
+	job, _, err := service.CreateRemote(Request{
+		JobID: "center-job-91", IdempotencyKey: "center-job-91", Kind: "batch_content", Text: "H01-00-01", Copies: 2,
+		RemoteBatchID: &batchID, RemoteSequenceNo: 1, RemoteJobType: "batch_content", RemoteAttemptCount: 1,
+	}, 91, "lease-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if service.BeginRemoteClaim() {
+		t.Fatal("queued local job did not block remote prefetch")
+	}
+	if _, _, err := service.SetStatusWithError(job.ID, "printing", ""); err != nil {
+		t.Fatal(err)
+	}
+	if service.BeginRemoteClaim() {
+		t.Fatal("printing local job did not block remote prefetch")
+	}
+	if _, _, err := service.SetStatusWithError(job.ID, "completed", ""); err != nil {
+		t.Fatal(err)
+	}
+	completions, err := service.PendingRemoteCompletions(10)
+	if err != nil || len(completions) != 1 {
+		t.Fatalf("pending completions=%+v err=%v", completions, err)
+	}
+	completion := completions[0]
+	if completion.RemoteJobID != 91 || completion.LeaseToken != "lease-1" || completion.Status != "succeeded" {
+		t.Fatalf("unexpected completion: %+v", completion)
+	}
+	if !service.BeginRemoteClaim() {
+		t.Fatal("terminal local job unexpectedly blocked the next claim")
+	}
+	if service.BeginRemoteClaim() {
+		t.Fatal("concurrent remote claim was allowed")
+	}
+	service.EndRemoteClaim()
+}
+
+func TestRepeatedRemoteLeaseRefreshesReceiptWithoutDuplicateJob(t *testing.T) {
+	service, err := New(Config{JobsPath: filepath.Join(t.TempDir(), "edge.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = service.Close() }()
+	request := Request{JobID: "center-job-92", IdempotencyKey: "center-job-92", Kind: "batch_content", Text: "BOX-009-Z", Copies: 1}
+	job, _, err := service.CreateRemote(request, 92, "expired-lease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := service.SetStatusWithError(job.ID, "completed", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.MarkRemoteCompletionSynced(92); err != nil {
+		t.Fatal(err)
+	}
+	reused, duplicate, err := service.CreateRemote(request, 92, "fresh-lease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !duplicate || reused.ID != job.ID || reused.RemoteLeaseToken != "fresh-lease" || len(service.Jobs()) != 1 {
+		t.Fatalf("remote replay created a duplicate or kept stale lease: duplicate=%v job=%+v", duplicate, reused)
+	}
+	completions, err := service.PendingRemoteCompletions(10)
+	if err != nil || len(completions) != 1 || completions[0].LeaseToken != "fresh-lease" {
+		t.Fatalf("completion was not refreshed: %+v err=%v", completions, err)
+	}
+}
+
+func TestRestartQueuesFailedRemoteCompletion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "edge.db")
+	service, err := New(Config{JobsPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, _, err := service.CreateRemote(Request{JobID: "center-job-93", IdempotencyKey: "center-job-93", Kind: "batch_content", Text: "A001"}, 93, "lease-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := service.SetStatus(job.ID, "printing"); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := New(Config{JobsPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = restarted.Close() }()
+	completions, err := restarted.PendingRemoteCompletions(10)
+	if err != nil || len(completions) != 1 {
+		t.Fatalf("pending completions=%+v err=%v", completions, err)
+	}
+	if completions[0].Status != "failed" || completions[0].ErrorCode != "EDGE_RESTART_INTERRUPTED" || completions[0].RemoteJobID != 93 {
+		t.Fatalf("unexpected restart completion: %+v", completions[0])
+	}
+	status, err := restarted.RemoteCompletionStatus()
+	if err != nil || status.Pending != 1 {
+		t.Fatalf("unexpected outbox status: %+v err=%v", status, err)
+	}
+	if err := restarted.MarkRemoteCompletionFailed(93, errors.New("center unavailable"), time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := restarted.PendingRemoteCompletions(10)
+	if err != nil || len(retry) != 1 || retry[0].Attempts != 1 {
+		t.Fatalf("completion retry was not persisted: %+v err=%v", retry, err)
 	}
 }
 

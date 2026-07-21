@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -16,6 +17,12 @@ var (
 	ErrMobilePrintUnauthorized = fmt.Errorf("mobile print authorization failed")
 	ErrMobilePrintNodeMissing  = fmt.Errorf("current edge node is unavailable to the mobile user")
 )
+
+type ResponseError struct {
+	StatusCode int
+}
+
+func (e *ResponseError) Error() string { return fmt.Sprintf("registry returned %d", e.StatusCode) }
 
 type Config struct {
 	CenterURL, APIToken, NodeID, NodeName, LANBaseURL, Version, APIVersion, CacheMode string
@@ -92,6 +99,11 @@ func (c *Client) inventory() interface{} {
 
 type ClaimedPrintJob struct {
 	ID              uint            `json:"id"`
+	BatchID         *uint           `json:"batch_id,omitempty"`
+	SequenceNo      int             `json:"sequence_no"`
+	AvailableAt     *time.Time      `json:"available_at,omitempty"`
+	JobType         string          `json:"job_type"`
+	AttemptCount    int             `json:"attempt_count"`
 	TemplateCode    string          `json:"template_code"`
 	PrinterName     string          `json:"printer_name"`
 	Copies          int             `json:"copies"`
@@ -187,8 +199,17 @@ func (c *Client) ClaimPrintJob(ctx context.Context) (*ClaimedPrintJob, error) {
 }
 
 func (c *Client) CompletePrintJob(ctx context.Context, jobID uint, leaseToken, status, errorMessage string, result interface{}) error {
-	payload := map[string]interface{}{"node_id": c.cfg.NodeID, "lease_token": leaseToken, "status": status, "error_message": errorMessage, "result": result}
+	return c.CompletePrintJobWithCode(ctx, jobID, leaseToken, status, "", errorMessage, result)
+}
+
+func (c *Client) CompletePrintJobWithCode(ctx context.Context, jobID uint, leaseToken, status, errorCode, errorMessage string, result interface{}) error {
+	payload := map[string]interface{}{"node_id": c.cfg.NodeID, "lease_token": leaseToken, "status": status, "error_code": errorCode, "error_message": errorMessage, "result": result}
 	return c.request(ctx, http.MethodPost, fmt.Sprintf("/api/edge/nodes/print-jobs/%d/complete", jobID), payload, nil)
+}
+
+func IsLeaseInvalid(err error) bool {
+	var responseErr *ResponseError
+	return errors.As(err, &responseErr) && responseErr.StatusCode == http.StatusConflict
 }
 
 func (c *Client) request(ctx context.Context, method, path string, payload, output interface{}) error {
@@ -212,7 +233,7 @@ func (c *Client) request(ctx context.Context, method, path string, payload, outp
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("registry returned %d", response.StatusCode)
+		return &ResponseError{StatusCode: response.StatusCode}
 	}
 	if output != nil {
 		return json.NewDecoder(response.Body).Decode(output)

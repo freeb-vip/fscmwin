@@ -8,6 +8,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Printing;
+using System.Text;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Documents;
@@ -18,6 +19,7 @@ using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using Fscm.Edge.Win.Models;
 using Fscm.Edge.Win.Services;
+using Microsoft.Win32;
 using QRCoder;
 using DrawingIcon = System.Drawing.Icon;
 using FormsContextMenuStrip = System.Windows.Forms.ContextMenuStrip;
@@ -52,6 +54,10 @@ public partial class MainWindow : Window
     private IReadOnlyList<LocalPrinter> _localPrinters = [];
     private IReadOnlyList<SkuSummary> _productSkus = [];
     private IReadOnlyList<BoxLabelSummary> _boxLabels = [];
+    private IReadOnlyList<BatchPrintItem> _batchImportedItems = [];
+    private IReadOnlyList<BatchPrintItem> _batchPreviewItems = [];
+    private uint _batchCenterNodeId;
+    private bool _batchPrintBusy;
     private int _boxLabelPage = 1;
     private long _boxLabelTotal;
     private string _productQueryMode = "sku";
@@ -526,7 +532,7 @@ public partial class MainWindow : Window
             await RefreshPrintJobsAsync();
             PrintQueueSummaryText.Text = pulled
                 ? $"已向中心主动领取任务 · {DateTimeOffset.Now:HH:mm:ss}"
-                : "主动领取失败，请确认边缘服务和中心连接正常。";
+                : "当前无可领取任务，或本地打印队列尚未空闲。";
         }
         finally
         {
@@ -716,6 +722,354 @@ public partial class MainWindow : Window
         }
     }
 
+    private async void OnRefreshBatchPrintClick(object sender, RoutedEventArgs e)
+    {
+        await LoadBatchPrintPageAsync(forceNodeLookup: true);
+    }
+
+    private void OnBatchSourceChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (BatchRangePanel is null)
+        {
+            return;
+        }
+        string source = SelectedBatchSource();
+        BatchRangePanel.Visibility = source == "range" ? Visibility.Visible : Visibility.Collapsed;
+        BatchManualPanel.Visibility = source == "manual" ? Visibility.Visible : Visibility.Collapsed;
+        BatchUploadPanel.Visibility = source == "upload" ? Visibility.Visible : Visibility.Collapsed;
+        BatchSubmitButton.IsEnabled = false;
+    }
+
+    private async void OnPreviewBatchPrintClick(object sender, RoutedEventArgs e)
+    {
+        await PreviewBatchPrintAsync();
+    }
+
+    private async Task<bool> PreviewBatchPrintAsync()
+    {
+        if (_batchPrintBusy)
+        {
+            return false;
+        }
+        try
+        {
+            SetBatchPrintBusy(true);
+            if (!await EnsureBatchCenterNodeAsync())
+            {
+                return false;
+            }
+            BatchPrintRequest request = BuildBatchPrintRequest();
+            BatchPrintResult<BatchPrintPreview> result = await _runtime.PreviewBatchPrintAsync(request);
+            if (!result.Succeeded || result.Data is null)
+            {
+                BatchPrintStatusText.Text = result.Message;
+                BatchSubmitButton.IsEnabled = false;
+                return false;
+            }
+            ApplyBatchPreview(result.Data);
+            BatchPrintStatusText.Text = $"预览校验通过，共 {result.Data.TotalCount} 个独立打印任务。";
+            return true;
+        }
+        catch (Exception ex)
+        {
+            BatchPrintStatusText.Text = $"生成预览失败：{ex.Message}";
+            BatchSubmitButton.IsEnabled = false;
+            return false;
+        }
+        finally
+        {
+            SetBatchPrintBusy(false);
+        }
+    }
+
+    private async void OnSubmitBatchPrintClick(object sender, RoutedEventArgs e)
+    {
+        if (!await PreviewBatchPrintAsync())
+        {
+            return;
+        }
+        if (BatchWarningsText.Text.Length > 0 && MessageBox.Show(
+                "预览包含重复内容警告，是否确认保留并提交？",
+                "确认批量打印",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning) != MessageBoxResult.Yes)
+        {
+            return;
+        }
+        try
+        {
+            SetBatchPrintBusy(true);
+            BatchPrintRequest request = BuildBatchPrintRequest();
+            BatchPrintResult<CenterPrintBatch> result = await _runtime.CreateBatchPrintAsync(request, $"windows-batch-print-{Guid.NewGuid():N}");
+            if (!result.Succeeded || result.Data is null)
+            {
+                BatchPrintStatusText.Text = result.Message;
+                return;
+            }
+            BatchPrintStatusText.Text = $"批次 {result.Data.Id} 已提交，共 {result.Data.TotalCount} 个任务。";
+            await LoadBatchHistoryAsync();
+        }
+        catch (Exception ex)
+        {
+            BatchPrintStatusText.Text = $"提交批次失败：{ex.Message}";
+        }
+        finally
+        {
+            SetBatchPrintBusy(false);
+        }
+    }
+
+    private async void OnImportBatchFileClick(object sender, RoutedEventArgs e)
+    {
+        var dialog = new OpenFileDialog
+        {
+            Title = "导入批量打印内容",
+            Filter = "支持的文件 (*.csv;*.xlsx)|*.csv;*.xlsx|CSV 文件 (*.csv)|*.csv|Excel 工作簿 (*.xlsx)|*.xlsx",
+            CheckFileExists = true,
+        };
+        if (dialog.ShowDialog(this) != true)
+        {
+            return;
+        }
+        try
+        {
+            int defaultCopies = ReadBatchNumber(BatchCopiesTextBox.Text, "默认份数", 1, PrintJobDispatchPolicy.MaxCopiesPerContent);
+            _batchImportedItems = BatchPrintImportService.Read(dialog.FileName, defaultCopies);
+            BatchImportFileText.Text = $"{Path.GetFileName(dialog.FileName)} · {_batchImportedItems.Count} 条";
+            BatchSourceComboBox.SelectedValue = "upload";
+            await PreviewBatchPrintAsync();
+        }
+        catch (Exception ex)
+        {
+            _batchImportedItems = [];
+            BatchImportFileText.Text = "导入失败";
+            BatchPrintStatusText.Text = ex.Message;
+            BatchSubmitButton.IsEnabled = false;
+        }
+    }
+
+    private void OnDownloadBatchTemplateClick(object sender, RoutedEventArgs e)
+    {
+        var dialog = new SaveFileDialog
+        {
+            Title = "保存批量打印导入模板",
+            Filter = "CSV 文件 (*.csv)|*.csv",
+            FileName = "批量打印导入模板.csv",
+            AddExtension = true,
+        };
+        if (dialog.ShowDialog(this) == true)
+        {
+            File.WriteAllText(dialog.FileName, BatchPrintImportService.CsvTemplate, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+            BatchPrintStatusText.Text = $"模板已保存：{dialog.FileName}";
+        }
+    }
+
+    private async void OnPauseBatchClick(object sender, RoutedEventArgs e)
+    {
+        await UpdateBatchStatusAsync(sender, "pause", "暂停");
+    }
+
+    private async void OnResumeBatchClick(object sender, RoutedEventArgs e)
+    {
+        await UpdateBatchStatusAsync(sender, "resume", "继续");
+    }
+
+    private async void OnCancelBatchClick(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not CenterPrintBatch batch ||
+            MessageBox.Show($"确定取消批次 {batch.Id} 的剩余任务吗？", "取消批次", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
+        {
+            return;
+        }
+        await UpdateBatchStatusAsync(sender, "cancel", "取消");
+    }
+
+    private async Task UpdateBatchStatusAsync(object sender, string action, string actionText)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not CenterPrintBatch batch)
+        {
+            return;
+        }
+        bool allowed = action switch
+        {
+            "pause" => batch.Status == "running",
+            "resume" => batch.Status == "paused",
+            "cancel" => batch.Status is "running" or "paused",
+            _ => false,
+        };
+        if (!allowed)
+        {
+            BatchPrintStatusText.Text = $"批次 {batch.Id} 当前状态不允许{actionText}。";
+            return;
+        }
+        BatchPrintResult<CenterPrintBatch> result = await _runtime.UpdateCenterPrintBatchAsync(batch.Id, action);
+        BatchPrintStatusText.Text = result.Succeeded ? $"批次 {batch.Id} 已{actionText}。" : result.Message;
+        await LoadBatchHistoryAsync();
+    }
+
+    private async Task LoadBatchPrintPageAsync(bool forceNodeLookup = false)
+    {
+        EdgeSettings settings = _runtime.LoadEdgeSettings();
+        BatchNodeText.Text = string.IsNullOrWhiteSpace(settings.NodeId) ? "未配置 Node ID" : $"{settings.NodeName} ({settings.NodeId})";
+        string? selectedTemplateId = (BatchTemplateComboBox.SelectedItem as PrintTemplateProfile)?.Id;
+        var templates = _labelTemplates.Where(template => template.IsPrinterAvailable).ToList();
+        BatchTemplateComboBox.ItemsSource = templates;
+        BatchTemplateComboBox.SelectedItem = templates.FirstOrDefault(template => template.Id == selectedTemplateId) ?? templates.FirstOrDefault();
+        if (forceNodeLookup)
+        {
+            _batchCenterNodeId = 0;
+        }
+        if (await EnsureBatchCenterNodeAsync())
+        {
+            await LoadBatchHistoryAsync();
+        }
+    }
+
+    private async Task<bool> EnsureBatchCenterNodeAsync()
+    {
+        if (_batchCenterNodeId > 0)
+        {
+            return true;
+        }
+        BatchPrintResult<uint> result = await _runtime.ResolveCurrentCenterNodeIdAsync();
+        if (!result.Succeeded || result.Data == 0)
+        {
+            BatchPrintStatusText.Text = result.Message;
+            return false;
+        }
+        _batchCenterNodeId = result.Data;
+        return true;
+    }
+
+    private async Task LoadBatchHistoryAsync()
+    {
+        BatchPrintResult<IReadOnlyList<CenterPrintBatch>> result = await _runtime.GetCenterPrintBatchesAsync();
+        if (!result.Succeeded || result.Data is null)
+        {
+            BatchPrintStatusText.Text = result.Message;
+            return;
+        }
+        BatchHistoryGrid.ItemsSource = result.Data.Where(batch => batch.EdgeNodeId == _batchCenterNodeId).ToList();
+    }
+
+    private BatchPrintRequest BuildBatchPrintRequest()
+    {
+        if (_batchCenterNodeId == 0)
+        {
+            throw new InvalidOperationException("尚未解析当前中心节点。");
+        }
+        if (BatchTemplateComboBox.SelectedItem is not PrintTemplateProfile template)
+        {
+            throw new InvalidOperationException("请选择可用的标签模板。");
+        }
+        int copies = ReadBatchNumber(BatchCopiesTextBox.Text, "默认份数", 1, PrintJobDispatchPolicy.MaxCopiesPerContent);
+        int interval = ReadBatchNumber(BatchIntervalTextBox.Text, "任务间隔", 1, 60);
+        string sourceType = SelectedBatchSource();
+        var source = new BatchPrintSource { Type = sourceType };
+        if (sourceType == "range")
+        {
+            source.Range = new BatchPrintRangeSource
+            {
+                Start = BatchRangeStartTextBox.Text.Trim(),
+                End = BatchRangeEndTextBox.Text.Trim(),
+                Step = ReadBatchNumber(BatchRangeStepTextBox.Text, "步长", 1, int.MaxValue),
+            };
+        }
+        else if (sourceType == "manual")
+        {
+            source.Items = ParseManualBatchItems(BatchManualTextBox.Text, copies);
+        }
+        else
+        {
+            if (_batchImportedItems.Count == 0)
+            {
+                throw new InvalidOperationException("请先导入 CSV 或 Excel 文件。");
+            }
+            source.Items = _batchImportedItems.Select(item => new BatchPrintItem { Content = item.Content, Copies = item.Copies }).ToList();
+        }
+        if (source.Items is not null)
+        {
+            PrintJobDispatchPolicy.EnsureContentCopiesAllowed(source.Items.Select(item => (item.Content, item.Copies)));
+        }
+        return new BatchPrintRequest
+        {
+            EdgeNodeId = _batchCenterNodeId,
+            TemplateCode = template.Id,
+            DefaultCopies = copies,
+            IntervalSeconds = interval,
+            FailurePolicy = BatchFailurePolicyComboBox.SelectedValue?.ToString() == "continue" ? "continue" : "pause",
+            Source = source,
+        };
+    }
+
+    private static List<BatchPrintItem> ParseManualBatchItems(string text, int defaultCopies)
+    {
+        var items = new List<BatchPrintItem>();
+        foreach (string rawLine in text.Replace("\r", string.Empty, StringComparison.Ordinal).Split('\n'))
+        {
+            string line = rawLine.Trim();
+            if (line.Length == 0)
+            {
+                continue;
+            }
+            string[] parts = line.Split('\t');
+            int copies = defaultCopies;
+            if (parts.Length > 1 && (!int.TryParse(parts[^1].Trim(), out copies) || !PrintJobDispatchPolicy.IsCopiesAllowed(copies)))
+            {
+                throw new InvalidOperationException($"手工内容第 {items.Count + 1} 行份数必须在 1 到 {PrintJobDispatchPolicy.MaxCopiesPerContent} 之间。");
+            }
+            string content = parts.Length > 1 ? string.Join('\t', parts[..^1]).Trim() : line;
+            items.Add(new BatchPrintItem { Content = content, Copies = copies });
+        }
+        if (items.Count is < 1 or > 1000)
+        {
+            throw new InvalidOperationException("手工内容必须包含 1 到 1000 条记录。");
+        }
+        return items;
+    }
+
+    private void ApplyBatchPreview(BatchPrintPreview preview)
+    {
+        PrintJobDispatchPolicy.EnsureContentCopiesAllowed(preview.Items.Select(item => (item.Content, item.Copies)));
+        string source = SelectedBatchSource() switch { "range" => "范围生成", "upload" => "文件导入", _ => "手工录入" };
+        var remarks = _batchImportedItems.ToDictionary(item => item.SequenceNo, item => item.Remark);
+        foreach (BatchPrintItem item in preview.Items)
+        {
+            item.Source = source;
+            item.ValidationStatus = "有效";
+            if (source == "文件导入" && remarks.TryGetValue(item.SequenceNo, out string? remark))
+            {
+                item.Remark = remark;
+            }
+        }
+        _batchPreviewItems = preview.Items;
+        BatchPreviewGrid.ItemsSource = _batchPreviewItems;
+        BatchPreviewSummaryText.Text = $"{preview.TotalCount} 条";
+        BatchWarningsText.Text = string.Join(Environment.NewLine, preview.Warnings);
+        BatchSubmitButton.IsEnabled = preview.TotalCount > 0;
+    }
+
+    private void SetBatchPrintBusy(bool busy)
+    {
+        _batchPrintBusy = busy;
+        BatchPreviewButton.IsEnabled = !busy;
+        BatchSubmitButton.IsEnabled = !busy && _batchPreviewItems.Count > 0;
+    }
+
+    private string SelectedBatchSource()
+    {
+        return BatchSourceComboBox.SelectedValue?.ToString() ?? "range";
+    }
+
+    private static int ReadBatchNumber(string value, string field, int minimum, int maximum)
+    {
+        if (!int.TryParse(value.Trim(), out int parsed) || parsed < minimum || parsed > maximum)
+        {
+            throw new InvalidOperationException($"{field}必须是 {minimum} 到 {maximum} 之间的整数。");
+        }
+        return parsed;
+    }
+
     private static Task RunOnStaAsync(Action action)
     {
         var completion = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -787,11 +1141,12 @@ public partial class MainWindow : Window
             {
                 ManufacturerBoxMark sample = ManufacturerBoxMarkPrintService.CreatePreviewSample();
                 ManufacturerBoxMarkPrintService boxMarkPrinter = new();
-                FixedDocument document = boxMarkPrinter.CreatePreviewDocument(settings, [sample], out string diagnostic);
+                FixedDocument document = boxMarkPrinter.CreatePreviewDocument(settings, template, [sample], out string diagnostic);
+                bool quadLayout = PrintTemplatePolicy.NormalizeLayoutStyle(template.LayoutStyle) == PrintTemplatePolicy.BoxMarkQuadLayoutStyle;
                 PrintPreviewWindow preview = new(
                     document,
                     "厂家箱唛打印预览",
-                    $"{template.DisplayName} · 100 x 150 mm · 1 BOX + 2 SKU 二维码",
+                    $"{template.DisplayName} · 100 x 150 mm · {(quadLayout ? "2 BOX + 2 SKU 二维码" : "1 BOX + 2 SKU 二维码")}",
                     diagnostic,
                     showConfirmButton: true,
                     confirmButtonText: "打印测试箱唛")
@@ -804,12 +1159,15 @@ public partial class MainWindow : Window
                     return;
                 }
 
-                boxMarkPrinter.Print(settings, new EdgePrintJob
-                {
-                    Id = "template-preview",
-                    Copies = settings.PrintCopies,
-                    BoxMarks = [sample],
-                });
+                boxMarkPrinter.Print(
+                    settings,
+                    new EdgePrintJob
+                    {
+                        Id = "template-preview",
+                        Copies = settings.PrintCopies,
+                        BoxMarks = [sample],
+                    },
+                    template);
                 PrintConfigStatusText.Text = $"厂家箱唛测试页已发送至 {settings.DefaultPrinter}。";
                 return;
             }
@@ -1134,13 +1492,13 @@ public partial class MainWindow : Window
                         if (string.Equals(started.Kind, "manufacturer_box_mark", StringComparison.OrdinalIgnoreCase))
                         {
                             settings.PrintCopies = Math.Max(1, started.Copies);
-                            new ManufacturerBoxMarkPrintService().Print(settings, started);
+                            new ManufacturerBoxMarkPrintService().Print(settings, started, template);
                         }
-                        else if (string.Equals(started.Kind, "manual_text", StringComparison.OrdinalIgnoreCase))
+                        else if (PrintJobDispatchPolicy.IsTextLabel(started.Kind))
                         {
                             if (string.IsNullOrWhiteSpace(started.Text))
                             {
-                                throw new InvalidOperationException("手工标签内容为空。");
+                                throw new InvalidOperationException("标签内容为空。");
                             }
 
                             settings.PrintCopies = Math.Max(1, started.Copies);
@@ -1152,6 +1510,7 @@ public partial class MainWindow : Window
                         }
                         else
                         {
+                            settings.PrintCopies = 1;
                             new QrPrintService().Print(settings, started, template);
                         }
                     });
@@ -1221,11 +1580,12 @@ public partial class MainWindow : Window
 
     private void LoadPrintTemplates(string selectedId)
     {
-        _printTemplates = _runtime.LoadPrintTemplates();
+        _printTemplates = PrintTemplatePolicy.OrderTemplates(_runtime.LoadPrintTemplates());
         foreach (var template in _printTemplates)
         {
             NormalizeTemplateCompatibility(template);
         }
+        UpdateTemplateSortState();
         UpdateTemplatePrinterStatuses();
 
         _loadingPrintTemplate = true;
@@ -1250,6 +1610,7 @@ public partial class MainWindow : Window
                     Id = "label_60x40mm",
                     TemplateNumber = "T01",
                     Name = "标签 60 × 40 mm",
+                    SortOrder = 1,
                     Type = "label",
                     WidthMillimeters = 60,
                     HeightMillimeters = 40,
@@ -1480,7 +1841,7 @@ public partial class MainWindow : Window
     private static void NormalizeTemplateCompatibility(PrintTemplateProfile template)
     {
         template.Type = NormalizeTemplateType(template);
-        template.Copies = Math.Clamp(template.Copies, 1, 99);
+        template.Copies = Math.Clamp(template.Copies, 1, PrintJobDispatchPolicy.MaxCopiesPerContent);
         template.Mode = "fit";
         template.OffsetXMillimeters = Math.Clamp(template.OffsetXMillimeters, -5, 5);
         template.OffsetYMillimeters = Math.Clamp(template.OffsetYMillimeters, -5, 5);
@@ -1499,6 +1860,7 @@ public partial class MainWindow : Window
         {
             PrintTemplatePolicy.HorizontalLayoutStyle => "左右排版",
             PrintTemplatePolicy.LocationCodeLayoutStyle => "库位码四码排版",
+            PrintTemplatePolicy.BoxMarkQuadLayoutStyle => "箱唛横向四码排版",
             _ => "上下排版",
         };
     }
@@ -1595,6 +1957,12 @@ public partial class MainWindow : Window
             return "shipping";
         }
 
+        if (string.Equals(template.Id, "manufacturer_box_mark_100x150mm", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(template.Id, "manufacturer_box_mark_quad_100x150mm", StringComparison.OrdinalIgnoreCase))
+        {
+            return "manufacturer_box_mark";
+        }
+
         var type = template.Type.Trim().ToLowerInvariant();
         if (type is "label" or "shipping" or "manufacturer_box_mark" or "custom")
         {
@@ -1640,6 +2008,7 @@ public partial class MainWindow : Window
         {
             Id = existing?.Id ?? settings.PrintTemplate,
             Name = string.IsNullOrWhiteSpace(PrintTemplateNameTextBox.Text) ? existing?.Name ?? "标签预览" : PrintTemplateNameTextBox.Text.Trim(),
+            SortOrder = existing?.SortOrder ?? (_printTemplates.Count + 1),
             Type = GetSelectedTemplateType(existing?.Type),
             Printer = settings.DefaultPrinter,
             WidthMillimeters = settings.PrintWidthMillimeters,
@@ -1707,12 +2076,13 @@ public partial class MainWindow : Window
         profile.TemplateNumber = existing?.TemplateNumber ?? PrintTemplatePolicy.NextTemplateNumber(_printTemplates);
         profile.Name = name;
 
-        var templates = _printTemplates
+        var templates = NormalizeTemplateSortOrders(_printTemplates
             .Where(template => !string.Equals(template.Id, profile.Id, StringComparison.OrdinalIgnoreCase))
             .Append(profile)
-            .ToList();
+            .ToList());
         _runtime.SavePrintTemplates(templates);
         _printTemplates = templates;
+        UpdateTemplateSortState();
         PrintTemplatesList.ItemsSource = _printTemplates;
         PrintTemplatesList.SelectedItem = profile;
         LoadLabelTemplates();
@@ -1857,6 +2227,7 @@ public partial class MainWindow : Window
             Id = $"template_{Guid.NewGuid():N}",
             TemplateNumber = PrintTemplatePolicy.NextTemplateNumber(_printTemplates),
             Name = $"{source.Name} - 副本",
+            SortOrder = _printTemplates.Count + 1,
             Type = source.Type,
             Printer = source.Printer,
             WidthMillimeters = source.WidthMillimeters,
@@ -1873,8 +2244,9 @@ public partial class MainWindow : Window
             TextFontSizePoints = source.TextFontSizePoints,
             MaxDisplayLength = source.MaxDisplayLength,
         };
-        _printTemplates = _printTemplates.Append(copy).ToList();
+        _printTemplates = NormalizeTemplateSortOrders(_printTemplates.Append(copy));
         _runtime.SavePrintTemplates(_printTemplates);
+        UpdateTemplateSortState();
         PrintTemplatesList.ItemsSource = _printTemplates;
         PrintTemplatesList.SelectedItem = copy;
         LoadLabelTemplates();
@@ -1903,7 +2275,8 @@ public partial class MainWindow : Window
         }
 
         var settings = _runtime.LoadEdgeSettings();
-        _printTemplates = _printTemplates.Where(item => !string.Equals(item.Id, template.Id, StringComparison.OrdinalIgnoreCase)).ToList();
+        _printTemplates = NormalizeTemplateSortOrders(
+            _printTemplates.Where(item => !string.Equals(item.Id, template.Id, StringComparison.OrdinalIgnoreCase)));
         if (string.Equals(settings.PrintTemplate, template.Id, StringComparison.OrdinalIgnoreCase))
         {
             settings.PrintTemplate = _printTemplates[0].Id;
@@ -1911,6 +2284,7 @@ public partial class MainWindow : Window
         }
 
         _runtime.SavePrintTemplates(_printTemplates);
+        UpdateTemplateSortState();
         PrintTemplatesList.ItemsSource = _printTemplates;
         PrintTemplatesList.SelectedIndex = 0;
         if (string.Equals(_editingPrintTemplateId, template.Id, StringComparison.OrdinalIgnoreCase))
@@ -1920,6 +2294,64 @@ public partial class MainWindow : Window
 
         LoadLabelTemplates();
         PrintConfigStatusText.Text = "模板已删除。";
+    }
+
+    private void OnMovePrintTemplateUpClick(object sender, RoutedEventArgs e)
+    {
+        MovePrintTemplate(sender, -1);
+    }
+
+    private void OnMovePrintTemplateDownClick(object sender, RoutedEventArgs e)
+    {
+        MovePrintTemplate(sender, 1);
+    }
+
+    private void MovePrintTemplate(object sender, int offset)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not PrintTemplateProfile template)
+        {
+            return;
+        }
+
+        List<PrintTemplateProfile> ordered = PrintTemplatePolicy.OrderTemplates(_printTemplates).ToList();
+        int currentIndex = ordered.FindIndex(item => string.Equals(item.Id, template.Id, StringComparison.OrdinalIgnoreCase));
+        int targetIndex = currentIndex + offset;
+        if (currentIndex < 0 || targetIndex < 0 || targetIndex >= ordered.Count)
+        {
+            return;
+        }
+
+        (ordered[currentIndex], ordered[targetIndex]) = (ordered[targetIndex], ordered[currentIndex]);
+        _printTemplates = NormalizeTemplateSortOrders(ordered);
+        _runtime.SavePrintTemplates(_printTemplates);
+        UpdateTemplateSortState();
+        PrintTemplatesList.ItemsSource = null;
+        PrintTemplatesList.ItemsSource = _printTemplates;
+        PrintTemplatesList.SelectedItem = template;
+        PrintTemplatesList.ScrollIntoView(template);
+        LoadLabelTemplates();
+        PrintConfigStatusText.Text = $"模板“{template.DisplayName}”已{(offset < 0 ? "上移" : "下移")}，终端模板顺序已更新。";
+    }
+
+    private static IReadOnlyList<PrintTemplateProfile> NormalizeTemplateSortOrders(IEnumerable<PrintTemplateProfile> templates)
+    {
+        List<PrintTemplateProfile> ordered = PrintTemplatePolicy.OrderTemplates(templates).ToList();
+        for (int index = 0; index < ordered.Count; index++)
+        {
+            ordered[index].SortOrder = index + 1;
+        }
+        return ordered;
+    }
+
+    private void UpdateTemplateSortState()
+    {
+        IReadOnlyList<PrintTemplateProfile> ordered = PrintTemplatePolicy.OrderTemplates(_printTemplates);
+        for (int index = 0; index < ordered.Count; index++)
+        {
+            ordered[index].CanMoveUp = index > 0;
+            ordered[index].CanMoveDown = index < ordered.Count - 1;
+        }
+        PrintTemplatesList.Items.Refresh();
     }
 
     private void OnSetDefaultPrintTemplateClick(object sender, RoutedEventArgs e)
@@ -2430,9 +2862,9 @@ public partial class MainWindow : Window
             return false;
         }
 
-        if (!int.TryParse(PrintCopiesTextBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var copies) || copies is < 1 or > 99)
+        if (!int.TryParse(PrintCopiesTextBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var copies) || !PrintJobDispatchPolicy.IsCopiesAllowed(copies))
         {
-            ShowPrintValidation("打印份数必须是 1 到 99 之间的整数。");
+            ShowPrintValidation($"打印份数必须是 1 到 {PrintJobDispatchPolicy.MaxCopiesPerContent} 之间的整数。");
             return false;
         }
 
@@ -2698,19 +3130,24 @@ public partial class MainWindow : Window
             EdgeSettings settings = _runtime.LoadEdgeSettings();
             ApplyTemplateToSettings(settings, template);
             settings.DefaultPrinter = template.Printer;
-            List<ManufacturerBoxMark> marks = selected.Select(label => label.PrintSnapshot!).ToList();
-            FixedDocument document = new ManufacturerBoxMarkPrintService().CreatePreviewDocument(settings, marks, out string diagnostic);
+            List<ManufacturerBoxMark> marks = ManufacturerBoxMarkPrintService.PrepareMarksForTemplate(template, selected).ToList();
+            if (marks.Count > 100)
+            {
+                throw new InvalidOperationException("展开后的箱唛标签超过 100 页，请减少本次选择数量。");
+            }
+            FixedDocument document = new ManufacturerBoxMarkPrintService().CreatePreviewDocument(settings, template, marks, out string diagnostic);
+            bool quadLayout = PrintTemplatePolicy.NormalizeLayoutStyle(template.LayoutStyle) == PrintTemplatePolicy.BoxMarkQuadLayoutStyle;
             PrintPreviewWindow preview = new(
                 document,
                 "厂家箱唛真实数据预览",
-                $"{template.DisplayName} · {marks.Count} 个箱唛 · 100 x 150 mm · 每页 1 BOX + 2 SKU 二维码",
+                $"{template.DisplayName} · {selected.Count} 个箱唛 / {marks.Count} 张标签 · 100 x 150 mm · 每页 {(quadLayout ? "2 BOX + 2 SKU" : "1 BOX + 2 SKU")} 二维码",
                 diagnostic,
                 showConfirmButton: false)
             {
                 Owner = this,
             };
             preview.ShowDialog();
-            BoxLabelCatalogStatusText.Text = $"已预览 {marks.Count} 个箱唛，未提交打印任务。";
+            BoxLabelCatalogStatusText.Text = $"已预览 {selected.Count} 个箱唛，共 {marks.Count} 张标签，未提交打印任务。";
         }
         catch (Exception ex)
         {
@@ -2759,14 +3196,30 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (!int.TryParse(BoxLabelCopiesTextBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var copies) || copies is < 1 or > 100)
+        if (!int.TryParse(BoxLabelCopiesTextBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var copies) || !PrintJobDispatchPolicy.IsCopiesAllowed(copies))
         {
-            MessageBox.Show("打印份数必须是 1 到 100 的整数。", "箱唛管理", MessageBoxButton.OK, MessageBoxImage.Warning);
+            MessageBox.Show($"打印份数必须是 1 到 {PrintJobDispatchPolicy.MaxCopiesPerContent} 的整数。", "箱唛管理", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
 
-        var accepted = await _runtime.SubmitBoxMarkPrintJobAsync(template.Id, selected, copies);
-        BoxLabelCatalogStatusText.Text = accepted ? $"已创建 {selected.Count} 个箱唛的本地打印任务" : "打印任务创建失败，请检查模板和打印机状态";
+        int pageCount;
+        try
+        {
+            pageCount = ManufacturerBoxMarkPrintService.PrepareMarksForTemplate(template, selected).Count;
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(ex.Message, "箱唛打印", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+        if (pageCount > 100)
+        {
+            MessageBox.Show("展开后的箱唛标签超过 100 页，请减少本次选择数量。", "箱唛打印", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        var accepted = await _runtime.SubmitBoxMarkPrintJobAsync(template, selected, copies);
+        BoxLabelCatalogStatusText.Text = accepted ? $"已创建 {selected.Count} 个箱唛、{pageCount} 张标签的本地打印任务" : "打印任务创建失败，请检查模板、箱唛内容和打印机状态";
         if (accepted)
         {
             await RefreshPrintJobsAsync();
@@ -2893,6 +3346,7 @@ public partial class MainWindow : Window
         TerminalsPage.Visibility = tag == "Terminals" ? Visibility.Visible : Visibility.Collapsed;
         PrintPage.Visibility = tag is "Print" or "PrintConfig" ? Visibility.Visible : Visibility.Collapsed;
         LabelPage.Visibility = tag == "LabelPrint" ? Visibility.Visible : Visibility.Collapsed;
+        BatchPrintPage.Visibility = tag == "BatchPrint" ? Visibility.Visible : Visibility.Collapsed;
         ProductsPage.Visibility = tag == "Products" ? Visibility.Visible : Visibility.Collapsed;
         BoxLabelsPage.Visibility = tag == "BoxLabels" ? Visibility.Visible : Visibility.Collapsed;
         PrintJobsCard.Visibility = tag == "Print" ? Visibility.Visible : Visibility.Collapsed;
@@ -2903,6 +3357,7 @@ public partial class MainWindow : Window
         {
             "Terminals" => ("在线终端", "查看局域网内已探测到的手机或业务终端。"),
             "LabelPrint" => ("标签打印", "输入任意字符串，使用当前选择的通用标签模板打印二维码标签。"),
+            "BatchPrint" => ("批量打印", "生成并预览不同标签内容，提交中心批次后由当前边缘节点依次打印。"),
             "Print" => ("打印服务", "优先查看本地打印任务，打印机和规格在打印配置中管理。"),
             "PrintConfig" => ("打印配置", "管理打印模板、打印机、尺寸和二维码打印参数。"),
             "Products" => ("产品管理", "本地优先分页查询产品和 SKU，缺失数据自动从中心同步。"),
@@ -2910,6 +3365,11 @@ public partial class MainWindow : Window
             "Advanced" => ("高级设置", "配置远端服务并管理边缘后端进程、运行文件和日志。"),
             _ => ("总览", "查看边缘节点最关键的运行状态。"),
         };
+
+        if (tag == "BatchPrint")
+        {
+            _ = LoadBatchPrintPageAsync();
+        }
 
         if (tag == "BoxLabels" && BoxLabelsGrid.ItemsSource is null)
         {

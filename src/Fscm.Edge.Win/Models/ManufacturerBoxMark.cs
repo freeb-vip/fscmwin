@@ -39,6 +39,15 @@ public sealed class ManufacturerBoxMark
     [JsonPropertyName("sku_qr_payload")]
     public string SkuQrPayload { get; set; } = string.Empty;
 
+    [JsonPropertyName("sku_code")]
+    public string SkuCode { get; set; } = string.Empty;
+
+    [JsonPropertyName("sku_name")]
+    public string SkuName { get; set; } = string.Empty;
+
+    [JsonPropertyName("qty_per_box")]
+    public int QuantityPerBox { get; set; }
+
     [JsonPropertyName("box_qr_payload")]
     public string BoxQrPayload { get; set; } = string.Empty;
 

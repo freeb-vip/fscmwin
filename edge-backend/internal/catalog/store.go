@@ -83,6 +83,9 @@ type BoxMark struct {
 	SKUBoxs      string   `json:"sku_boxs"`
 	Batch        string   `json:"batch"`
 	SKUQRPayload string   `json:"sku_qr_payload"`
+	SKUCode      string   `json:"sku_code"`
+	SKUName      string   `json:"sku_name"`
+	QtyPerBox    int      `json:"qty_per_box"`
 	BoxQRPayload string   `json:"box_qr_payload"`
 	BoxUID       string   `json:"box_uid"`
 	InboundCode  string   `json:"inbound_code"`

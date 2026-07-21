@@ -211,6 +211,7 @@
           <ListBoxItem Tag="BoxLabels">箱唛管理</ListBoxItem>
           <ListBoxItem Tag="Terminals">在线终端</ListBoxItem>
           <ListBoxItem Tag="LabelPrint">标签打印</ListBoxItem>
+          <ListBoxItem Tag="BatchPrint">批量打印</ListBoxItem>
           <ListBoxItem Tag="Print">打印任务</ListBoxItem>
           <ListBoxItem Tag="PrintConfig">打印配置</ListBoxItem>
           <ListBoxItem Tag="Advanced">高级设置</ListBoxItem>
@@ -714,6 +715,160 @@
           </StackPanel>
         </ScrollViewer>
 
+        <ScrollViewer x:Name="BatchPrintPage" Visibility="Collapsed" VerticalScrollBarVisibility="Auto">
+          <StackPanel Margin="28">
+            <Border Style="{StaticResource CardStyle}">
+              <StackPanel>
+                <DockPanel Margin="0,0,0,18">
+                  <StackPanel DockPanel.Dock="Left">
+                    <TextBlock FontSize="18" FontWeight="SemiBold" Text="创建批量打印" />
+                    <TextBlock Margin="0,6,0,0" Foreground="{StaticResource MutedTextBrush}" Text="预览确认后提交中心队列，由当前边缘节点按批次顺序领取并打印。" />
+                  </StackPanel>
+                  <Button DockPanel.Dock="Right" Click="OnRefreshBatchPrintClick" Content="刷新" />
+                </DockPanel>
+
+                <Grid Margin="0,0,0,16">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="1.25*" />
+                    <ColumnDefinition Width="1.5*" />
+                    <ColumnDefinition Width="0.7*" />
+                    <ColumnDefinition Width="0.7*" />
+                    <ColumnDefinition Width="1.05*" />
+                    <ColumnDefinition Width="1.05*" />
+                  </Grid.ColumnDefinitions>
+                  <StackPanel Grid.Column="0" Margin="0,0,12,0">
+                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="边缘节点" />
+                    <TextBlock x:Name="BatchNodeText" Margin="0,8,0,0" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+                  </StackPanel>
+                  <StackPanel Grid.Column="1" Margin="0,0,12,0">
+                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="打印模板" />
+                    <ComboBox x:Name="BatchTemplateComboBox" Margin="0,6,0,0" Height="36" DisplayMemberPath="DisplayName" />
+                  </StackPanel>
+                  <StackPanel Grid.Column="2" Margin="0,0,12,0">
+                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="默认份数（最多 5 份）" />
+                    <TextBox x:Name="BatchCopiesTextBox" Margin="0,6,0,0" Height="36" Text="1" />
+                  </StackPanel>
+                  <StackPanel Grid.Column="3" Margin="0,0,12,0">
+                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="间隔(秒)" />
+                    <TextBox x:Name="BatchIntervalTextBox" Margin="0,6,0,0" Height="36" Text="1" />
+                  </StackPanel>
+                  <StackPanel Grid.Column="4" Margin="0,0,12,0">
+                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="失败策略" />
+                    <ComboBox x:Name="BatchFailurePolicyComboBox" Margin="0,6,0,0" Height="36" SelectedIndex="0" SelectedValuePath="Tag">
+                      <ComboBoxItem Content="失败后暂停" Tag="pause" />
+                      <ComboBoxItem Content="跳过失败继续" Tag="continue" />
+                    </ComboBox>
+                  </StackPanel>
+                  <StackPanel Grid.Column="5">
+                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="内容来源" />
+                    <ComboBox x:Name="BatchSourceComboBox" Margin="0,6,0,0" Height="36" SelectedIndex="0" SelectedValuePath="Tag" SelectionChanged="OnBatchSourceChanged">
+                      <ComboBoxItem Content="范围生成" Tag="range" />
+                      <ComboBoxItem Content="手工录入" Tag="manual" />
+                      <ComboBoxItem Content="文件导入" Tag="upload" />
+                    </ComboBox>
+                  </StackPanel>
+                </Grid>
+
+                <Grid x:Name="BatchRangePanel" Margin="0,0,0,16">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="0.5*" />
+                  </Grid.ColumnDefinitions>
+                  <StackPanel Grid.Column="0" Margin="0,0,12,0">
+                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="开始内容" />
+                    <TextBox x:Name="BatchRangeStartTextBox" Margin="0,6,0,0" Height="36" Text="H01-00-01" />
+                  </StackPanel>
+                  <StackPanel Grid.Column="1" Margin="0,0,12,0">
+                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="结束内容" />
+                    <TextBox x:Name="BatchRangeEndTextBox" Margin="0,6,0,0" Height="36" Text="H01-00-15" />
+                  </StackPanel>
+                  <StackPanel Grid.Column="2">
+                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="步长" />
+                    <TextBox x:Name="BatchRangeStepTextBox" Margin="0,6,0,0" Height="36" Text="1" />
+                  </StackPanel>
+                </Grid>
+
+                <StackPanel x:Name="BatchManualPanel" Margin="0,0,0,16" Visibility="Collapsed">
+                  <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="打印内容（每行一条；可使用 Tab 加份数，例如 H01-00-01    2）" />
+                  <TextBox x:Name="BatchManualTextBox" Margin="0,6,0,0" MinHeight="130" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" TextWrapping="NoWrap" />
+                </StackPanel>
+
+                <Grid x:Name="BatchUploadPanel" Margin="0,0,0,16" Visibility="Collapsed">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                  </Grid.ColumnDefinitions>
+                  <StackPanel Grid.Column="0" Margin="0,0,12,0">
+                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="CSV / Excel 文件" />
+                    <TextBlock x:Name="BatchImportFileText" Margin="0,8,0,0" FontWeight="SemiBold" Text="尚未选择文件" TextTrimming="CharacterEllipsis" />
+                  </StackPanel>
+                  <Button Grid.Column="1" Margin="0,22,8,0" Click="OnDownloadBatchTemplateClick" Content="下载 CSV 模板" />
+                  <Button Grid.Column="2" Margin="0,22,0,0" Click="OnImportBatchFileClick" Content="选择文件" Style="{StaticResource PrimaryButtonStyle}" />
+                </Grid>
+
+                <DockPanel>
+                  <TextBlock x:Name="BatchPrintStatusText" VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" Text="请选择配置并生成预览。" TextWrapping="Wrap" />
+                  <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                    <Button x:Name="BatchPreviewButton" Click="OnPreviewBatchPrintClick" Content="生成预览" />
+                    <Button x:Name="BatchSubmitButton" Margin="8,0,0,0" Click="OnSubmitBatchPrintClick" Content="提交整个批次" IsEnabled="False" Style="{StaticResource PrimaryButtonStyle}" />
+                  </StackPanel>
+                </DockPanel>
+              </StackPanel>
+            </Border>
+
+            <Border Style="{StaticResource CardStyle}" Margin="0,18,0,0">
+              <StackPanel>
+                <DockPanel Margin="0,0,0,12">
+                  <TextBlock DockPanel.Dock="Left" FontSize="18" FontWeight="SemiBold" Text="打印内容预览" />
+                  <TextBlock x:Name="BatchPreviewSummaryText" DockPanel.Dock="Right" Foreground="{StaticResource MutedTextBrush}" Text="0 条" />
+                </DockPanel>
+                <DataGrid x:Name="BatchPreviewGrid" MinHeight="260" MaxHeight="420" IsReadOnly="True" CanUserAddRows="False">
+                  <DataGrid.Columns>
+                    <DataGridTextColumn Header="顺序" Binding="{Binding SequenceNo}" Width="70" />
+                    <DataGridTextColumn Header="打印内容" Binding="{Binding Content}" Width="*" />
+                    <DataGridTextColumn Header="份数" Binding="{Binding Copies}" Width="80" />
+                    <DataGridTextColumn Header="来源" Binding="{Binding Source}" Width="110" />
+                    <DataGridTextColumn Header="校验状态" Binding="{Binding ValidationStatus}" Width="110" />
+                    <DataGridTextColumn Header="备注" Binding="{Binding Remark}" Width="180" />
+                  </DataGrid.Columns>
+                </DataGrid>
+                <TextBlock x:Name="BatchWarningsText" Margin="0,10,0,0" Foreground="#B45309" TextWrapping="Wrap" />
+              </StackPanel>
+            </Border>
+
+            <Border Style="{StaticResource CardStyle}" Margin="0,18,0,0">
+              <StackPanel>
+                <TextBlock FontSize="18" FontWeight="SemiBold" Text="当前节点最近批次" />
+                <DataGrid x:Name="BatchHistoryGrid" Margin="0,14,0,0" MinHeight="230" MaxHeight="420" IsReadOnly="True" CanUserAddRows="False">
+                  <DataGrid.Columns>
+                    <DataGridTextColumn Header="批次" Binding="{Binding Id}" Width="75" />
+                    <DataGridTextColumn Header="模板" Binding="{Binding TemplateCode}" Width="170" />
+                    <DataGridTextColumn Header="打印机" Binding="{Binding PrinterName}" Width="180" />
+                    <DataGridTextColumn Header="进度" Binding="{Binding ProgressText}" Width="90" />
+                    <DataGridTextColumn Header="间隔" Binding="{Binding IntervalSeconds, StringFormat={}{0} 秒}" Width="80" />
+                    <DataGridTextColumn Header="失败策略" Binding="{Binding FailurePolicyText}" Width="120" />
+                    <DataGridTextColumn Header="状态" Binding="{Binding StatusText}" Width="90" />
+                    <DataGridTextColumn Header="创建时间" Binding="{Binding CreatedAt, StringFormat=yyyy-MM-dd HH:mm:ss}" Width="165" />
+                    <DataGridTemplateColumn Header="操作" Width="190">
+                      <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate>
+                          <StackPanel Orientation="Horizontal">
+                            <Button Margin="0,0,5,0" Padding="7,2" Click="OnPauseBatchClick" Content="暂停" />
+                            <Button Margin="0,0,5,0" Padding="7,2" Click="OnResumeBatchClick" Content="继续" />
+                            <Button Padding="7,2" Click="OnCancelBatchClick" Content="取消" />
+                          </StackPanel>
+                        </DataTemplate>
+                      </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                  </DataGrid.Columns>
+                </DataGrid>
+              </StackPanel>
+            </Border>
+          </StackPanel>
+        </ScrollViewer>
+
         <ScrollViewer x:Name="PrintPage" Visibility="Collapsed" VerticalScrollBarVisibility="Auto">
           <StackPanel Margin="28">
             <Border x:Name="PrintJobsCard" Style="{StaticResource CardStyle}" MinHeight="420">
@@ -834,6 +989,16 @@
                     <DataGridTextColumn Header="缩放" Binding="{Binding Mode}" Width="100" />
                     <DataGridTextColumn Header="份数" Binding="{Binding Copies}" Width="70" />
                     <DataGridTextColumn Header="偏移(mm)" Binding="{Binding OffsetXMillimeters, StringFormat={}{0:0.##}}" Width="90" />
+                    <DataGridTemplateColumn Header="排序" Width="84">
+                      <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate>
+                          <StackPanel Orientation="Horizontal">
+                            <Button Width="32" Height="30" Padding="0" Click="OnMovePrintTemplateUpClick" Content="↑" FontSize="16" IsEnabled="{Binding CanMoveUp}" ToolTip="上移模板" />
+                            <Button Width="32" Height="30" Margin="6,0,0,0" Padding="0" Click="OnMovePrintTemplateDownClick" Content="↓" FontSize="16" IsEnabled="{Binding CanMoveDown}" ToolTip="下移模板" />
+                          </StackPanel>
+                        </DataTemplate>
+                      </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
                     <DataGridTemplateColumn Header="操作" Width="260">
                       <DataGridTemplateColumn.CellTemplate>
                         <DataTemplate>
@@ -921,7 +1086,7 @@
                 </Grid>
 
                 <StackPanel Margin="0,0,0,16" Width="200" HorizontalAlignment="Left">
-                  <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="份数" />
+                  <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="份数（最多 5 份）" />
                   <TextBox x:Name="PrintCopiesTextBox" Margin="0,6,0,0" />
                 </StackPanel>
 
@@ -951,6 +1116,7 @@
                     <ComboBoxItem Content="上下排版（二维码在上、文字在下）" Tag="stacked" />
                     <ComboBoxItem Content="左右排版（二维码在左、文字在右）" Tag="qr_left_text_right" />
                     <ComboBoxItem Content="库位码（左右各上下两个二维码，中间编码）" Tag="location_code_quad_qr" />
+                    <ComboBoxItem Content="箱唛横向四码（左右二维码，中间信息）" Tag="box_mark_quad_qr" />
                   </ComboBox>
                 </StackPanel>
 
@@ -1171,7 +1337,7 @@
                       <Button x:Name="BoxLabelEditTemplateButton" Margin="6,0,0,0" Click="OnEditSelectedBoxMarkTemplateClick" Style="{StaticResource CopyCodeButtonStyle}" ToolTip="编辑当前厂家箱唛模板">
                         <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="15" Text="&#xE70F;" />
                       </Button>
-                      <TextBox x:Name="BoxLabelCopiesTextBox" Width="48" Height="36" Margin="8,0,0,0" Text="1" TextAlignment="Center" VerticalContentAlignment="Center" ToolTip="打印份数" />
+                      <TextBox x:Name="BoxLabelCopiesTextBox" Width="48" Height="36" Margin="8,0,0,0" Text="1" TextAlignment="Center" VerticalContentAlignment="Center" ToolTip="打印份数，最多 5 份" />
                       <Button x:Name="BoxLabelPreviewButton" Margin="8,0,0,0" Click="OnPreviewSelectedBoxLabelsClick" Style="{StaticResource CopyCodeButtonStyle}" ToolTip="预览勾选或当前箱唛">
                         <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="15" Text="&#xE890;" />
                       </Button>

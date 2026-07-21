@@ -154,6 +154,119 @@ public sealed class ManufacturerBoxMarkPrintServiceTests
         Assert.Contains("400", sample.Pcs);
     }
 
+    [Fact]
+    public void PrepareMarksForTemplate_ExpandsMixedBoxIntoOnePagePerSku()
+    {
+        ManufacturerBoxMark snapshot = ManufacturerBoxMarkPrintService.CreatePreviewSample();
+        BoxLabelSummary label = new()
+        {
+            LabelCode = "BOX-MIXED-01",
+            BoxUid = "BOX-UID-01",
+            PrintSnapshot = snapshot,
+            SkuItems =
+            [
+                new() { SkuCode = "SKU-A", SkuName = "红色上衣", QuantityPerBox = 10 },
+                new() { SkuCode = "SKU-B", ProductName = "蓝色长裤", QuantityPerBox = 20 },
+                new() { SkuCode = "SKU-C", QuantityPerBox = 30 },
+            ],
+        };
+        PrintTemplateProfile template = new() { LayoutStyle = PrintTemplatePolicy.BoxMarkQuadLayoutStyle };
+
+        IReadOnlyList<ManufacturerBoxMark> pages = ManufacturerBoxMarkPrintService.PrepareMarksForTemplate(template, [label]);
+
+        Assert.Equal(3, pages.Count);
+        Assert.Equal(["SKU-A", "SKU-B", "SKU-C"], pages.Select(page => page.SkuCode));
+        Assert.Equal(["红色上衣", "蓝色长裤", "SKU-C"], pages.Select(page => page.SkuName));
+        Assert.Equal([10, 20, 30], pages.Select(page => page.QuantityPerBox));
+        Assert.All(pages, page => Assert.Equal(snapshot.BoxQrPayload, page.BoxQrPayload));
+        Assert.Equal("TB15-BLACK-XL", snapshot.SkuQrPayload);
+    }
+
+    [Fact]
+    public void QuadLayout_RendersFourQrCodesAndUnderlinedSkuContent()
+    {
+        Exception? failure = null;
+        Thread thread = new(() =>
+        {
+            try
+            {
+                const double Width = 100 * UnitsPerMillimeter;
+                const double Height = 150 * UnitsPerMillimeter;
+                ManufacturerBoxMark mark = ManufacturerBoxMarkPrintService.CreatePreviewSample();
+                FixedPage page = ManufacturerBoxMarkPrintService.CreatePage(
+                    mark,
+                    Width,
+                    Height,
+                    0,
+                    PrintTemplatePolicy.BoxMarkQuadLayoutStyle);
+
+                Canvas portraitPage = Assert.IsType<Canvas>(Assert.Single(page.Children));
+                Grid layout = Assert.IsType<Grid>(Assert.Single(portraitPage.Children));
+                Assert.Equal(Height, layout.Width, 3);
+                Assert.Equal(Width, layout.Height, 3);
+                MatrixTransform rotation = Assert.IsType<MatrixTransform>(layout.RenderTransform);
+                Assert.Equal(0, rotation.Matrix.M11, 3);
+                Assert.Equal(1, rotation.Matrix.M12, 3);
+                Assert.Equal(-1, rotation.Matrix.M21, 3);
+                Assert.Equal(0, rotation.Matrix.M22, 3);
+                Assert.Equal(Width, rotation.Matrix.OffsetX, 3);
+                Assert.Equal(0, rotation.Matrix.OffsetY, 3);
+                List<Image> qrImages = Descendants<Image>(layout).ToList();
+                Assert.Equal(4, qrImages.Count);
+                string[] texts = Descendants<TextBlock>(layout).Select(text => text.Text).ToArray();
+                Assert.Equal(2, texts.Count(text => text == "BOX ID"));
+                Assert.Equal(2, texts.Count(text => text == "SKU"));
+                Assert.Contains("箱唛编码", texts);
+                Assert.Contains("SKU 名称", texts);
+                Assert.Contains("箱规数量", texts);
+                Assert.Contains(mark.SkuName, texts);
+                Assert.Contains($"{mark.QuantityPerBox} PCS", texts);
+                TextBlock name = Assert.Single(Descendants<TextBlock>(layout), text => text.Text == mark.SkuName);
+                TextBlock quantity = Assert.Single(Descendants<TextBlock>(layout), text => text.Text == $"{mark.QuantityPerBox} PCS");
+                Assert.Contains(name.TextDecorations, decoration => decoration.Location == TextDecorationLocation.Underline);
+                Assert.Contains(quantity.TextDecorations, decoration => decoration.Location == TextDecorationLocation.Underline);
+                Grid columns = Assert.Single(Descendants<Grid>(layout), grid => grid.ColumnDefinitions.Count == 5);
+                Assert.True(columns.ColumnDefinitions[2].Width.Value > 0);
+
+                page.Measure(new Size(Width, Height));
+                page.Arrange(new Rect(0, 0, Width, Height));
+                page.UpdateLayout();
+                string? outputPath = Environment.GetEnvironmentVariable("FSCM_BOX_MARK_QUAD_PREVIEW_PATH");
+                if (!string.IsNullOrWhiteSpace(outputPath))
+                {
+                    SavePreview(page, Width, Height, outputPath);
+                }
+            }
+            catch (Exception ex)
+            {
+                failure = ex;
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+        if (failure is not null)
+        {
+            ExceptionDispatchInfo.Capture(failure).Throw();
+        }
+    }
+
+    [Fact]
+    public void QuadLayout_LongSkuNameUsesSmallerButReadableFont()
+    {
+        double shortName = ManufacturerBoxMarkPrintService.FitWrappedTextFontSize("夹克", 160, 180, 3, 180, 8);
+        double longName = ManufacturerBoxMarkPrintService.FitWrappedTextFontSize(
+            "超长款轻量防泼水多功能户外连帽夹克黑色加大码",
+            160,
+            180,
+            3,
+            180,
+            8);
+
+        Assert.True(shortName > longName);
+        Assert.True(longName >= 8);
+    }
+
     private static IEnumerable<T> Descendants<T>(DependencyObject root)
         where T : DependencyObject
     {

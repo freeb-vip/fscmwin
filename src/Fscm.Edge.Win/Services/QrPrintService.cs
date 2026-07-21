@@ -32,6 +32,9 @@ public sealed class QrPrintService
                 : "SKU 打印内容为空。");
         }
 
+        PrintJobDispatchPolicy.EnsureContentCopiesAllowed(job.Items.Select(item =>
+            (string.IsNullOrWhiteSpace(item.QrCodeContent) ? settings.SkuQrPrefix + item.SkuCode : item.QrCodeContent, item.Quantity)));
+
         using LocalPrintServer server = new();
         using PrintQueue queue = server.GetPrintQueue(settings.DefaultPrinter);
         LocalPrinterService.EnsureQueueAvailable(queue);
@@ -40,7 +43,7 @@ public sealed class QrPrintService
         FixedDocument document = new();
         foreach (EdgePrintJobItem item in job.Items)
         {
-            int quantity = Math.Clamp(item.Quantity, 1, 99);
+            int quantity = item.Quantity;
             string payload = string.IsNullOrWhiteSpace(item.QrCodeContent)
                 ? settings.SkuQrPrefix + item.SkuCode
                 : item.QrCodeContent;

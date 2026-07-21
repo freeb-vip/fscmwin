@@ -1,13 +1,18 @@
 package main
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"fscm-edge/internal/catalog"
 	"fscm-edge/internal/printing"
+	"fscm-edge/internal/registry"
 	"github.com/gin-gonic/gin"
 )
 
@@ -24,6 +29,64 @@ func TestCatalogCapabilitiesRequireReadyCatalog(t *testing.T) {
 	}
 	if !hasCapability(withFullCatalog, "catalog_cache") || !hasCapability(withFullCatalog, "box_label_catalog") {
 		t.Fatalf("unexpected full catalog capabilities: %v", withFullCatalog)
+	}
+}
+
+func TestSyncRemoteCompletionsRetriesServerFailure(t *testing.T) {
+	var calls atomic.Int32
+	center := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{},"msg":"ok"}`))
+	}))
+	defer center.Close()
+
+	service, err := printing.New(printing.Config{JobsPath: filepath.Join(t.TempDir(), "edge.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = service.Close() }()
+	if err := service.EnqueueRemoteFailure(11, "lease-11", "PRINT_FAILED", "offline", map[string]string{"phase": "test"}); err != nil {
+		t.Fatal(err)
+	}
+	client := registry.New(registry.Config{CenterURL: center.URL, NodeID: "edge-1"})
+	if err := syncRemoteCompletions(t.Context(), client, service); err == nil {
+		t.Fatal("server failure was not reported")
+	}
+	if err := service.MarkRemoteCompletionFailed(11, errors.New("retry now"), time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncRemoteCompletions(t.Context(), client, service); err != nil {
+		t.Fatal(err)
+	}
+	status, err := service.RemoteCompletionStatus()
+	if err != nil || status.Pending != 0 || calls.Load() != 2 {
+		t.Fatalf("completion was not cleared: status=%+v calls=%d err=%v", status, calls.Load(), err)
+	}
+}
+
+func TestSyncRemoteCompletionsDropsExpiredLeaseReceipt(t *testing.T) {
+	center := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+	}))
+	defer center.Close()
+	service, err := printing.New(printing.Config{JobsPath: filepath.Join(t.TempDir(), "edge.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = service.Close() }()
+	if err := service.EnqueueRemoteFailure(12, "expired", "PRINT_FAILED", "offline", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncRemoteCompletions(t.Context(), registry.New(registry.Config{CenterURL: center.URL, NodeID: "edge-1"}), service); err != nil {
+		t.Fatal(err)
+	}
+	status, err := service.RemoteCompletionStatus()
+	if err != nil || status.Pending != 0 {
+		t.Fatalf("expired receipt was retained: status=%+v err=%v", status, err)
 	}
 }
 
@@ -103,6 +166,8 @@ func TestValidClaimPayload(t *testing.T) {
 	}{
 		{name: "manual text", kind: "manual_text", text: "Test label", valid: true},
 		{name: "empty manual text", kind: "manual_text", valid: false},
+		{name: "batch content", kind: "batch_content", text: "H01-00-01", valid: true},
+		{name: "empty batch content", kind: "batch_content", valid: false},
 		{name: "sku payload", skuCode: "SKU-001", valid: true},
 		{name: "empty sku payload", valid: false},
 		{name: "box mark", kind: "manufacturer_box_mark", items: []printing.BoxMark{{BoxUID: "BOX-1"}}, valid: true},
@@ -117,41 +182,60 @@ func TestValidClaimPayload(t *testing.T) {
 	}
 }
 
+func TestBatchContentUsesTextLabelValidation(t *testing.T) {
+	template := printing.Template{LayoutStyle: "qr_left_text_right"}
+	request := printing.Request{Kind: "batch_content", Text: strings.Repeat("A", 13)}
+	text, message := validateLabelDisplayText(request, template)
+	if text != request.Text || message == "" {
+		t.Fatalf("batch content did not use text-label validation: text=%q message=%q", text, message)
+	}
+	if isTextLabelKind("sku_qr") || !isTextLabelKind("BATCH_CONTENT") || !isTextLabelKind("manual_text") {
+		t.Fatal("unexpected text-label kind classification")
+	}
+}
+
 func TestAvailableLabelTemplatesRequiresOnlineLabelPrinter(t *testing.T) {
 	availability := &printerAvailability{printers: map[string]struct{}{"Label Printer": {}}}
 	templates := []printing.Template{
-		{ID: "other", Type: "label", Printer: "Label Printer", WidthMillimeters: 75, HeightMillimeters: 50},
-		{ID: "large", Type: "label", Printer: "Label Printer", WidthMillimeters: 100, HeightMillimeters: 150, Orientation: "portrait"},
-		{ID: "label", Type: "label", Printer: "Label Printer", WidthMillimeters: 60, HeightMillimeters: 40},
+		{ID: "other", Type: "label", Printer: "Label Printer", SortOrder: 2, WidthMillimeters: 75, HeightMillimeters: 50},
+		{ID: "large", Type: "label", Printer: "Label Printer", SortOrder: 3, WidthMillimeters: 100, HeightMillimeters: 150, Orientation: "portrait"},
+		{ID: "label", Type: "label", Printer: "Label Printer", SortOrder: 1, WidthMillimeters: 60, HeightMillimeters: 40},
 		{ID: "shipping", Type: "shipping", Printer: "Label Printer"},
 		{ID: "offline", Type: "label", Printer: "Offline Printer"},
 	}
 	available := availableLabelTemplates(templates, availability)
-	if len(available) != 3 || available[0].ID != "label" || available[1].ID != "large" || available[2].ID != "other" {
+	if len(available) != 3 || available[0].ID != "label" || available[1].ID != "other" || available[2].ID != "large" {
 		t.Fatalf("unexpected available templates: %+v", available)
 	}
 }
 
-func TestPrintInventoryOrdersPreferredLabelTemplates(t *testing.T) {
+func TestPrintInventoryUsesConfiguredTemplateOrder(t *testing.T) {
 	availability := &printerAvailability{printers: map[string]struct{}{"Label Printer": {}}}
 	inventory := printInventory([]printing.Template{
-		{ID: "shipping", Type: "shipping", Printer: "Label Printer", WidthMillimeters: 100, HeightMillimeters: 150},
-		{ID: "other", Type: "label", Printer: "Label Printer", WidthMillimeters: 75, HeightMillimeters: 50},
-		{ID: "large", Type: "label", Printer: "Label Printer", WidthMillimeters: 100, HeightMillimeters: 150, Orientation: "portrait"},
-		{ID: "small", TemplateNumber: "T01", Type: "label", Printer: "Label Printer", WidthMillimeters: 60, HeightMillimeters: 40},
+		{ID: "shipping", Type: "shipping", Printer: "Label Printer", SortOrder: 4, WidthMillimeters: 100, HeightMillimeters: 150},
+		{ID: "other", Type: "label", Printer: "Label Printer", SortOrder: 1, WidthMillimeters: 75, HeightMillimeters: 50},
+		{ID: "large", Type: "label", Printer: "Label Printer", SortOrder: 3, WidthMillimeters: 100, HeightMillimeters: 150, Orientation: "portrait"},
+		{ID: "small", TemplateNumber: "T01", Type: "label", Printer: "Label Printer", SortOrder: 2, WidthMillimeters: 60, HeightMillimeters: 40},
 	}, "", availability)
 	templates := inventory["templates"].([]map[string]interface{})
-	if templates[0]["code"] != "small" || templates[1]["code"] != "large" || templates[2]["code"] != "other" || templates[3]["code"] != "shipping" {
+	if templates[0]["code"] != "other" || templates[1]["code"] != "small" || templates[2]["code"] != "large" || templates[3]["code"] != "shipping" {
 		t.Fatalf("unexpected inventory order: %+v", templates)
 	}
-	if inventory["schema_version"] != 2 || templates[0]["layout_style"] != "stacked" || templates[0]["text_font_size_pt"] != float64(16) {
+	if inventory["schema_version"] != 2 || templates[0]["sort_order"] != 1 || templates[1]["sort_order"] != 2 {
 		t.Fatalf("unexpected inventory contract: %+v", inventory)
 	}
-	if templates[0]["number"] != "T01" {
-		t.Fatalf("unexpected template number: %+v", templates[0])
+	if templates[1]["number"] != "T01" {
+		t.Fatalf("unexpected template number: %+v", templates[1])
 	}
-	if templates[0]["version"] == "1" || len(templates[0]["version"].(string)) != 12 {
-		t.Fatalf("unexpected template version: %+v", templates[0])
+	if templates[1]["version"] == "1" || len(templates[1]["version"].(string)) != 12 {
+		t.Fatalf("unexpected template version: %+v", templates[1])
+	}
+}
+
+func TestOrderPrintTemplatesKeepsFileOrderWhenSortOrderIsMissing(t *testing.T) {
+	templates := orderPrintTemplates([]printing.Template{{ID: "third"}, {ID: "first"}, {ID: "second"}})
+	if templates[0].ID != "third" || templates[1].ID != "first" || templates[2].ID != "second" {
+		t.Fatalf("unexpected fallback order: %+v", templates)
 	}
 }
 
@@ -179,6 +263,18 @@ func TestPrintInventoryPublishesLocationCodeLayout(t *testing.T) {
 	}
 	if template["label_qr_prefix"] != "" || len(template["version"].(string)) != 12 {
 		t.Fatalf("unexpected location template contract: %+v", template)
+	}
+}
+
+func TestPrintInventoryPublishesQuadBoxMarkLayout(t *testing.T) {
+	availability := &printerAvailability{printers: map[string]struct{}{"Box Printer": {}}}
+	inventory := printInventory([]printing.Template{{
+		ID: "manufacturer_box_mark_quad_100x150mm", Name: "Quad", Type: "manufacturer_box_mark", Printer: "Box Printer",
+		WidthMillimeters: 100, HeightMillimeters: 150, Orientation: "portrait", LayoutStyle: "box_mark_quad_qr",
+	}}, "", availability)
+	template := inventory["templates"].([]map[string]interface{})[0]
+	if template["layout_style"] != "box_mark_quad_qr" || template["type"] != "manufacturer_box_mark" {
+		t.Fatalf("unexpected quad box mark inventory: %+v", template)
 	}
 }
 

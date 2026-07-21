@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"sort"
 	"strings"
 
 	"fscm-edge/internal/printing"
@@ -21,7 +20,7 @@ const labelPrintPage = `<!doctype html>
 <body><main class="shell"><h1>标签打印</h1><p class="sub">选择局域网边缘节点上的标签模板，提交后由本机打印机执行。</p>
 <label for="template">打印模板</label><select id="template" disabled><option>正在加载可用模板...</option></select>
 <label for="text">标签内容</label><input id="text" maxlength="2000" autocomplete="off" placeholder="输入任意字符串">
-<div class="row"><div><label for="prefix">二维码前缀</label><input id="prefix" maxlength="20" autocomplete="off" placeholder="留空表示不添加前缀"><div class="hint">二维码使用“前缀 + 标签内容”，下方文字保持原始内容。</div></div><div><label for="copies">份数</label><input id="copies" type="number" min="1" max="100" value="1"></div></div>
+<div class="row"><div><label for="prefix">二维码前缀</label><input id="prefix" maxlength="20" autocomplete="off" placeholder="留空表示不添加前缀"><div class="hint">二维码使用“前缀 + 标签内容”，下方文字保持原始内容。</div></div><div><label for="copies">份数（最多 5 份）</label><input id="copies" type="number" min="1" max="5" value="1"></div></div>
 <button id="submit" type="button" disabled>提交打印任务</button><div id="status" role="status"></div></main>
 <script>
 const template=document.querySelector('#template'),prefix=document.querySelector('#prefix'),text=document.querySelector('#text'),copies=document.querySelector('#copies'),button=document.querySelector('#submit'),status=document.querySelector('#status');
@@ -47,15 +46,12 @@ func serveLabelPrintPage(c *gin.Context) {
 
 func availableLabelTemplates(templates []printing.Template, availability *printerAvailability) []printing.Template {
 	available := make([]printing.Template, 0, len(templates))
-	for _, template := range templates {
+	for _, template := range orderPrintTemplates(templates) {
 		if strings.EqualFold(strings.TrimSpace(template.Type), "label") &&
 			strings.TrimSpace(template.Printer) != "" && availability.Has(template.Printer) {
 			available = append(available, template)
 		}
 	}
-	sort.SliceStable(available, func(left, right int) bool {
-		return labelTemplatePriority(available[left]) < labelTemplatePriority(available[right])
-	})
 	return available
 }
 
@@ -131,8 +127,8 @@ func createDirectPrintJob(c *gin.Context, service *printing.Service, availabilit
 		writeDirectPrintError(c, http.StatusBadRequest, "IDEMPOTENCY_KEY_REQUIRED", "idempotency_key is required.")
 		return
 	}
-	if request.Copies < 1 || request.Copies > 100 {
-		writeDirectPrintError(c, http.StatusBadRequest, "INVALID_LABEL_COPIES", "copies must be between 1 and 100.")
+	if request.Copies < 1 || request.Copies > printing.MaxCopiesPerContent {
+		writeDirectPrintError(c, http.StatusBadRequest, "INVALID_LABEL_COPIES", "copies must be between 1 and 5.")
 		return
 	}
 	if len(request.PayloadSnapshot) == 0 || string(request.PayloadSnapshot) == "null" {
@@ -211,14 +207,21 @@ func createDirectPrintJob(c *gin.Context, service *printing.Service, availabilit
 		printRequest.Items = []printing.Item{{SKUCode: text, QRCodeContent: qrPayload, Quantity: request.Copies}}
 	case "manufacturer_box_mark":
 		var payload directBoxMarkPayload
-		if err := json.Unmarshal(request.PayloadSnapshot, &payload); err != nil || payload.DocumentVersion != "manufacturer_box_mark.v1" || len(payload.Items) == 0 {
-			writeDirectPrintError(c, http.StatusBadRequest, "INVALID_BOX_MARK_PAYLOAD", "manufacturer_box_mark.v1 and at least one item are required.")
+		if err := json.Unmarshal(request.PayloadSnapshot, &payload); err != nil ||
+			(payload.DocumentVersion != "manufacturer_box_mark.v1" && payload.DocumentVersion != "manufacturer_box_mark.v2") || len(payload.Items) == 0 {
+			writeDirectPrintError(c, http.StatusBadRequest, "INVALID_BOX_MARK_PAYLOAD", "A supported manufacturer box mark payload and at least one item are required.")
 			return
 		}
 		printRequest.Kind = "manufacturer_box_mark"
 		printRequest.BoxMarks = payload.Items
 		if code := validateManufacturerBoxMarkRequest(printRequest, service.Templates(), availability); code != "" {
-			writeDirectPrintError(c, http.StatusConflict, code, "The box mark template or printer is unavailable.")
+			status := http.StatusConflict
+			message := "The box mark template or printer is unavailable."
+			if code == "INVALID_BOX_MARK_PAYLOAD" || code == "INVALID_BOX_MARK_SKU_CONTENT" {
+				status = http.StatusBadRequest
+				message = "The box mark payload does not contain the SKU fields required by this template."
+			}
+			writeDirectPrintError(c, status, code, message)
 			return
 		}
 	default:
@@ -234,6 +237,10 @@ func createDirectPrintJob(c *gin.Context, service *printing.Service, availabilit
 	if err != nil {
 		if errors.Is(err, printing.ErrIdempotencyConflict) {
 			writeDirectPrintError(c, http.StatusConflict, "IDEMPOTENCY_CONFLICT", err.Error())
+			return
+		}
+		if errors.Is(err, printing.ErrPrintCopiesExceeded) {
+			writeDirectPrintError(c, http.StatusBadRequest, "PRINT_COPIES_LIMIT_EXCEEDED", err.Error())
 			return
 		}
 		writeDirectPrintError(c, http.StatusInternalServerError, "PRINT_JOB_PERSIST_FAILED", "Failed to save print job.")
@@ -263,8 +270,8 @@ func createManualTextJob(c *gin.Context, service *printing.Service, availability
 	if request.Copies < 1 {
 		request.Copies = 1
 	}
-	if request.Copies > 100 {
-		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_LABEL_COPIES", "message": "打印份数必须在 1 到 100 之间。"})
+	if request.Copies > printing.MaxCopiesPerContent {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_LABEL_COPIES", "message": "打印份数必须在 1 到 5 之间。"})
 		return
 	}
 
@@ -299,6 +306,10 @@ func createManualTextJob(c *gin.Context, service *printing.Service, availability
 		}},
 	})
 	if err != nil {
+		if errors.Is(err, printing.ErrPrintCopiesExceeded) {
+			c.JSON(http.StatusBadRequest, gin.H{"code": "PRINT_COPIES_LIMIT_EXCEEDED", "message": err.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"code": "PRINT_JOB_PERSIST_FAILED", "message": "打印历史保存失败。"})
 		return
 	}

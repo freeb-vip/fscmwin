@@ -12,7 +12,12 @@ import (
 	"time"
 )
 
-var ErrIdempotencyConflict = errors.New("idempotency key already belongs to a different print request")
+const MaxCopiesPerContent = 5
+
+var (
+	ErrIdempotencyConflict = errors.New("idempotency key already belongs to a different print request")
+	ErrPrintCopiesExceeded = errors.New("print protection blocked more than 5 copies of the same content")
+)
 
 type Config struct {
 	DefaultPrinter, Template, Orientation, Mode string
@@ -26,6 +31,7 @@ type Template struct {
 	ID                 string  `json:"Id"`
 	TemplateNumber     string  `json:"TemplateNumber,omitempty"`
 	Name               string  `json:"Name"`
+	SortOrder          int     `json:"SortOrder,omitempty"`
 	Printer            string  `json:"Printer"`
 	WidthMillimeters   float64 `json:"WidthMillimeters"`
 	HeightMillimeters  float64 `json:"HeightMillimeters"`
@@ -60,6 +66,10 @@ type Job struct {
 	RequestFingerprint string          `json:"request_fingerprint,omitempty"`
 	Copies             int             `json:"copies"`
 	BoxMarks           []BoxMark       `json:"box_marks,omitempty"`
+	RemoteBatchID      *uint           `json:"remote_batch_id,omitempty"`
+	RemoteSequenceNo   int             `json:"remote_sequence_no,omitempty"`
+	RemoteJobType      string          `json:"remote_job_type,omitempty"`
+	RemoteAttemptCount int             `json:"remote_attempt_count,omitempty"`
 	RemoteJobID        uint            `json:"-"`
 	RemoteLeaseToken   string          `json:"-"`
 }
@@ -80,33 +90,41 @@ type BoxMark struct {
 	SKUBoxs      string   `json:"sku_boxs"`
 	Batch        string   `json:"batch"`
 	SKUQRPayload string   `json:"sku_qr_payload"`
+	SKUCode      string   `json:"sku_code"`
+	SKUName      string   `json:"sku_name"`
+	QtyPerBox    int      `json:"qty_per_box"`
 	BoxQRPayload string   `json:"box_qr_payload"`
 	BoxUID       string   `json:"box_uid"`
 	InboundCode  string   `json:"inbound_code"`
 }
 type Request struct {
-	JobID           string          `json:"job_id"`
-	IdempotencyKey  string          `json:"idempotency_key"`
-	Source          string          `json:"source"`
-	Printer         string          `json:"printer"`
-	Template        string          `json:"template"`
-	TemplateID      string          `json:"template_id"`
-	Items           []Item          `json:"items"`
-	Kind            string          `json:"kind"`
-	Text            string          `json:"text"`
-	QRCodeContent   string          `json:"qr_code_content"`
-	PayloadSnapshot json.RawMessage `json:"payload_snapshot"`
-	Copies          int             `json:"copies"`
-	BoxMarks        []BoxMark       `json:"box_marks"`
+	JobID              string          `json:"job_id"`
+	IdempotencyKey     string          `json:"idempotency_key"`
+	Source             string          `json:"source"`
+	Printer            string          `json:"printer"`
+	Template           string          `json:"template"`
+	TemplateID         string          `json:"template_id"`
+	Items              []Item          `json:"items"`
+	Kind               string          `json:"kind"`
+	Text               string          `json:"text"`
+	QRCodeContent      string          `json:"qr_code_content"`
+	PayloadSnapshot    json.RawMessage `json:"payload_snapshot"`
+	Copies             int             `json:"copies"`
+	BoxMarks           []BoxMark       `json:"box_marks"`
+	RemoteBatchID      *uint           `json:"remote_batch_id,omitempty"`
+	RemoteSequenceNo   int             `json:"remote_sequence_no,omitempty"`
+	RemoteJobType      string          `json:"remote_job_type,omitempty"`
+	RemoteAttemptCount int             `json:"remote_attempt_count,omitempty"`
 }
 
 type Service struct {
-	cfg           Config
-	mu            sync.RWMutex
-	jobs          []Job
-	keys          map[string]string
-	templatesPath string
-	store         *Store
+	cfg            Config
+	mu             sync.RWMutex
+	jobs           []Job
+	keys           map[string]string
+	templatesPath  string
+	store          *Store
+	remoteClaiming bool
 }
 
 func New(cfg Config) (*Service, error) {
@@ -243,7 +261,13 @@ func (s *Service) SetStatusWithError(id, status, jobError string) (Job, bool, er
 			if status == "completed" || status == "failed" || status == "cancelled" {
 				job.FinishedAt = &now
 			}
-			if err := s.store.Save(job, job.RemoteJobID == 0); err != nil {
+			var err error
+			if job.RemoteJobID > 0 && (status == "completed" || status == "failed" || status == "cancelled" || status == "interrupted") {
+				err = s.store.SaveWithRemoteCompletion(job, remoteCompletionForJob(job))
+			} else {
+				err = s.store.Save(job, job.RemoteJobID == 0)
+			}
+			if err != nil {
 				return Job{}, false, err
 			}
 			s.jobs[i] = job
@@ -279,15 +303,48 @@ func (s *Service) create(req Request, remoteJobID uint, leaseToken string) (Job,
 	fingerprint := fingerprintPrintRequest(req)
 	if key != "" {
 		if id, ok := s.keys[key]; ok {
-			for _, job := range s.jobs {
-				if job.ID == id {
+			for index := range s.jobs {
+				if s.jobs[index].ID == id {
+					job := s.jobs[index]
 					if job.RequestFingerprint != "" && job.RequestFingerprint != fingerprint {
 						return Job{}, false, ErrIdempotencyConflict
+					}
+					if remoteJobID > 0 && job.RemoteJobID == remoteJobID {
+						job.RemoteLeaseToken = leaseToken
+						job.RemoteBatchID = req.RemoteBatchID
+						job.RemoteSequenceNo = req.RemoteSequenceNo
+						job.RemoteJobType = req.RemoteJobType
+						job.RemoteAttemptCount = req.RemoteAttemptCount
+						var err error
+						if isTerminalPrintStatus(job.Status) {
+							err = s.store.SaveWithRemoteCompletion(job, remoteCompletionForJob(job))
+						} else {
+							err = s.store.Save(job, false)
+						}
+						if err != nil {
+							return Job{}, false, err
+						}
+						s.jobs[index] = job
 					}
 					return job, true, nil
 				}
 			}
 		}
+	}
+	protectedRequest := req
+	protectedRequest.Items = append([]Item(nil), req.Items...)
+	for index := range protectedRequest.Items {
+		item := &protectedRequest.Items[index]
+		if strings.TrimSpace(item.QRCodeContent) == "" {
+			item.QRCodeContent = first(qrPrefix, "T") + strings.TrimSpace(item.SKUCode)
+		}
+	}
+	requestedCopies, err := requestContentCopies(protectedRequest)
+	if err != nil {
+		return Job{}, false, err
+	}
+	if s.exceedsActiveOrBatchCopyLimit(req.RemoteBatchID, requestedCopies) {
+		return Job{}, false, ErrPrintCopiesExceeded
 	}
 	id := strings.TrimSpace(req.JobID)
 	if id == "" {
@@ -299,7 +356,7 @@ func (s *Service) create(req Request, remoteJobID uint, leaseToken string) (Job,
 	if copies < 1 {
 		copies = 1
 	}
-	job := Job{ID: id, IdempotencyKey: key, Source: first(req.Source, "lan"), Printer: first(printer, s.cfg.DefaultPrinter), TemplateID: req.TemplateID, Template: first(template, s.cfg.Template), Status: "queued", SubmittedAt: time.Now(), RemoteJobID: remoteJobID, RemoteLeaseToken: leaseToken, Kind: req.Kind, Text: strings.TrimSpace(req.Text), QRCodeContent: strings.TrimSpace(req.QRCodeContent), PayloadSnapshot: append(json.RawMessage(nil), req.PayloadSnapshot...), RequestFingerprint: fingerprint, Copies: copies, BoxMarks: req.BoxMarks}
+	job := Job{ID: id, IdempotencyKey: key, Source: first(req.Source, "lan"), Printer: first(printer, s.cfg.DefaultPrinter), TemplateID: req.TemplateID, Template: first(template, s.cfg.Template), Status: "queued", SubmittedAt: time.Now(), RemoteJobID: remoteJobID, RemoteLeaseToken: leaseToken, RemoteBatchID: req.RemoteBatchID, RemoteSequenceNo: req.RemoteSequenceNo, RemoteJobType: req.RemoteJobType, RemoteAttemptCount: req.RemoteAttemptCount, Kind: req.Kind, Text: strings.TrimSpace(req.Text), QRCodeContent: strings.TrimSpace(req.QRCodeContent), PayloadSnapshot: append(json.RawMessage(nil), req.PayloadSnapshot...), RequestFingerprint: fingerprint, Copies: copies, BoxMarks: req.BoxMarks}
 	job.Items = make([]Item, 0, len(req.Items))
 	for _, item := range req.Items {
 		item.SKUCode = strings.TrimSpace(item.SKUCode)
@@ -319,6 +376,91 @@ func (s *Service) create(req Request, remoteJobID uint, leaseToken string) (Job,
 		s.keys[key] = id
 	}
 	return job, false, nil
+}
+
+func requestContentCopies(req Request) (map[string]int, error) {
+	result := make(map[string]int)
+	add := func(content string, copies int) error {
+		if copies < 1 {
+			copies = 1
+		}
+		if copies > MaxCopiesPerContent {
+			return ErrPrintCopiesExceeded
+		}
+		content = strings.TrimSpace(content)
+		if content == "" {
+			return nil
+		}
+		result[content] += copies
+		if result[content] > MaxCopiesPerContent {
+			return ErrPrintCopiesExceeded
+		}
+		return nil
+	}
+
+	if req.Copies > MaxCopiesPerContent {
+		return nil, ErrPrintCopiesExceeded
+	}
+	kind := strings.ToLower(strings.TrimSpace(req.Kind))
+	if kind == "manual_text" || kind == "batch_content" {
+		if err := add(first(req.QRCodeContent, req.Text), req.Copies); err != nil {
+			return nil, err
+		}
+		return result, nil
+	}
+	if kind == "manufacturer_box_mark" {
+		for _, mark := range req.BoxMarks {
+			identity := first(mark.BoxQRPayload, mark.BoxUID, mark.InboundCode, mark.Shop, mark.SKUQRPayload, mark.SKUCode)
+			if identity == "" {
+				payload, _ := json.Marshal(mark)
+				identity = string(payload)
+			}
+			if err := add("box-mark:"+identity, req.Copies); err != nil {
+				return nil, err
+			}
+		}
+		return result, nil
+	}
+	for _, item := range req.Items {
+		content := first(strings.TrimSpace(item.QRCodeContent), strings.TrimSpace(item.SKUCode))
+		if err := add(content, item.Quantity); err != nil {
+			return nil, err
+		}
+	}
+	if len(result) == 0 {
+		if err := add(first(req.QRCodeContent, req.Text), req.Copies); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func jobContentCopies(job Job) map[string]int {
+	result, _ := requestContentCopies(Request{
+		Kind: job.Kind, Text: job.Text, QRCodeContent: job.QRCodeContent, Copies: job.Copies,
+		Items: job.Items, BoxMarks: job.BoxMarks,
+	})
+	return result
+}
+
+func (s *Service) exceedsActiveOrBatchCopyLimit(batchID *uint, requested map[string]int) bool {
+	accumulated := make(map[string]int)
+	for _, job := range s.jobs {
+		sameBatch := batchID != nil && job.RemoteBatchID != nil && *batchID == *job.RemoteBatchID
+		active := job.Status == "queued" || job.Status == "printing"
+		if !sameBatch && !active {
+			continue
+		}
+		for content, copies := range jobContentCopies(job) {
+			accumulated[content] += copies
+		}
+	}
+	for content, copies := range requested {
+		if accumulated[content]+copies > MaxCopiesPerContent {
+			return true
+		}
+	}
+	return false
 }
 
 func fingerprintPrintRequest(req Request) string {
@@ -344,6 +486,60 @@ func (s *Service) MarkAuditSynced(jobID string) error { return s.store.MarkAudit
 
 func (s *Service) MarkAuditFailed(jobID string, err error) error {
 	return s.store.MarkAuditFailed(jobID, err)
+}
+
+func (s *Service) BeginRemoteClaim() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.remoteClaiming {
+		return false
+	}
+	for _, job := range s.jobs {
+		if job.Status == "queued" || job.Status == "printing" {
+			return false
+		}
+	}
+	s.remoteClaiming = true
+	return true
+}
+
+func (s *Service) EndRemoteClaim() {
+	s.mu.Lock()
+	s.remoteClaiming = false
+	s.mu.Unlock()
+}
+
+func (s *Service) EnqueueRemoteFailure(remoteJobID uint, leaseToken, errorCode, errorMessage string, result interface{}) error {
+	payload, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+	return s.store.EnqueueRemoteCompletion(RemoteCompletion{RemoteJobID: remoteJobID, LeaseToken: leaseToken, Status: "failed", ErrorCode: errorCode, ErrorMessage: errorMessage, Result: payload})
+}
+
+func (s *Service) PendingRemoteCompletions(limit int) ([]RemoteCompletion, error) {
+	return s.store.PendingRemoteCompletions(limit)
+}
+
+func (s *Service) MarkRemoteCompletionSynced(remoteJobID uint) error {
+	return s.store.MarkRemoteCompletionSynced(remoteJobID)
+}
+
+func (s *Service) MarkRemoteCompletionFailed(remoteJobID uint, syncErr error, retryAt time.Time) error {
+	return s.store.MarkRemoteCompletionFailed(remoteJobID, syncErr, retryAt)
+}
+
+func (s *Service) RemoteCompletionStatus() (RemoteCompletionStatus, error) {
+	return s.store.RemoteCompletionStatus()
+}
+
+func isTerminalPrintStatus(status string) bool {
+	switch status {
+	case "completed", "done", "success", "failed", "cancelled", "interrupted":
+		return true
+	default:
+		return false
+	}
 }
 func first(values ...string) string {
 	for _, value := range values {

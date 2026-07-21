@@ -39,6 +39,27 @@ func newDirectPrintTestService(t *testing.T) (*printing.Service, *printerAvailab
 	return service, &printerAvailability{printers: map[string]struct{}{"Zebra": {}}}
 }
 
+func newQuadBoxMarkTestService(t *testing.T) (*printing.Service, *printerAvailability) {
+	t.Helper()
+	templatesPath := filepath.Join(t.TempDir(), "print-templates.json")
+	templates, err := json.Marshal([]printing.Template{{
+		ID: "manufacturer_box_mark_quad_100x150mm", Name: "Quad box mark", Type: "manufacturer_box_mark",
+		Printer: "Zebra", WidthMillimeters: 100, HeightMillimeters: 150, Orientation: "portrait", LayoutStyle: "box_mark_quad_qr",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(templatesPath, templates, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service, err := printing.New(printing.Config{TemplatesPath: templatesPath, JobsPath: filepath.Join(t.TempDir(), "edge.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = service.Close() })
+	return service, &printerAvailability{printers: map[string]struct{}{"Zebra": {}}}
+}
+
 func performDirectPrintRequest(t *testing.T, service *printing.Service, availability *printerAvailability, payload interface{}) *httptest.ResponseRecorder {
 	t.Helper()
 	body, err := json.Marshal(payload)
@@ -205,7 +226,7 @@ func TestDirectPrintRejectsInvalidContract(t *testing.T) {
 		{name: "missing template", mutate: func(value map[string]interface{}) { delete(value, "template_code") }},
 		{name: "missing idempotency", mutate: func(value map[string]interface{}) { delete(value, "idempotency_key") }},
 		{name: "zero copies", mutate: func(value map[string]interface{}) { value["copies"] = 0 }},
-		{name: "too many copies", mutate: func(value map[string]interface{}) { value["copies"] = 101 }},
+		{name: "too many copies", mutate: func(value map[string]interface{}) { value["copies"] = 6 }},
 		{name: "missing snapshot", mutate: func(value map[string]interface{}) { delete(value, "payload_snapshot") }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -283,5 +304,49 @@ func TestDirectPrintCreatesManufacturerBoxMarkJob(t *testing.T) {
 	job := service.Jobs()[0]
 	if job.Kind != "manufacturer_box_mark" || len(job.BoxMarks) != 1 || job.BoxMarks[0].BoxPlanID != 7 {
 		t.Fatalf("unexpected box mark job: %+v", job)
+	}
+}
+
+func TestDirectPrintCreatesQuadBoxMarkV2Job(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service, availability := newQuadBoxMarkTestService(t)
+	response := performDirectPrintRequest(t, service, availability, map[string]interface{}{
+		"source": "mobile-app", "template_code": "manufacturer_box_mark_quad_100x150mm", "copies": 1,
+		"type": "manufacturer_box_mark", "idempotency_key": "quad-box-mark-1",
+		"payload_snapshot": map[string]interface{}{
+			"kind": "manufacturer_box_mark", "document_version": "manufacturer_box_mark.v2",
+			"items": []map[string]interface{}{{
+				"box_plan_id": 7, "shop": "BX-7", "box_qr_payload": "BOX-7",
+				"sku_code": "SKU-7", "sku_name": "Test SKU", "qty_per_box": 24, "sku_qr_payload": "SKU-7",
+			}},
+		},
+	})
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	job := service.Jobs()[0]
+	if len(job.BoxMarks) != 1 || job.BoxMarks[0].SKUName != "Test SKU" || job.BoxMarks[0].QtyPerBox != 24 {
+		t.Fatalf("unexpected quad box mark job: %+v", job)
+	}
+}
+
+func TestDirectPrintRejectsIncompleteQuadBoxMarkWithoutPersisting(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service, availability := newQuadBoxMarkTestService(t)
+	response := performDirectPrintRequest(t, service, availability, map[string]interface{}{
+		"source": "mobile-app", "template_code": "manufacturer_box_mark_quad_100x150mm", "copies": 1,
+		"type": "manufacturer_box_mark", "idempotency_key": "quad-box-mark-invalid",
+		"payload_snapshot": map[string]interface{}{
+			"kind": "manufacturer_box_mark", "document_version": "manufacturer_box_mark.v2",
+			"items": []map[string]interface{}{{
+				"shop": "BX-7", "box_qr_payload": "BOX-7", "sku_code": "SKU-7", "sku_name": "Test SKU",
+			}},
+		},
+	})
+	if response.Code != http.StatusBadRequest || !bytes.Contains(response.Body.Bytes(), []byte("INVALID_BOX_MARK_SKU_CONTENT")) {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if len(service.Jobs()) != 0 {
+		t.Fatalf("invalid quad box mark persisted jobs: %+v", service.Jobs())
 	}
 }

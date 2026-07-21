@@ -57,6 +57,7 @@ internal static class PrintTargetService
 
     public static PreparedPrintTarget Prepare(PrintQueue queue, EdgeSettings settings)
     {
+        PrintJobDispatchPolicy.EnsureCopiesAllowed(settings.PrintCopies);
         Exception wpfFailure;
         try
         {
@@ -76,7 +77,7 @@ internal static class PrintTargetService
                 null,
                 0,
                 0,
-                Math.Clamp(settings.PrintCopies, 1, 99),
+                settings.PrintCopies,
                 diagnostic);
         }
         catch (Exception ex) when (ex is InvalidOperationException or PrintSystemException or Win32Exception)
@@ -100,6 +101,7 @@ internal static class PrintTargetService
 
     public static void Print(PrintQueue queue, PreparedPrintTarget target, FixedDocument document, string documentName)
     {
+        PrintJobDispatchPolicy.EnsureCopiesAllowed(target.Copies);
         if (target.TransportKind == PrintTransportKind.WpfXps)
         {
             PrintDialog dialog = new()
@@ -238,7 +240,7 @@ internal static class PrintTargetService
             paper,
             dpiX,
             dpiY,
-            Math.Clamp(settings.PrintCopies, 1, 99),
+            settings.PrintCopies,
             context.Diagnostic);
     }
 
@@ -263,7 +265,7 @@ internal static class PrintTargetService
             throw new InvalidOperationException($"GDI 无法访问打印机 {target.PrinterName}。");
         }
 
-        printDocument.PrinterSettings.Copies = (short)Math.Clamp(target.Copies, 1, 99);
+        printDocument.PrinterSettings.Copies = (short)target.Copies;
         printDocument.PrinterSettings.Collate = true;
         printDocument.DocumentName = documentName;
         printDocument.OriginAtMargins = false;

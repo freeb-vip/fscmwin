@@ -17,20 +17,24 @@ namespace Fscm.Edge.Win.UnitTests;
 public sealed class PrintTemplatePolicyTests
 {
     [Fact]
-    public void SelectAutomaticLabelTemplate_Prefers60x40Before100x150AndOtherLabels()
+    public void LabelTemplates_UseConfiguredOrderAndStillSelectDefault()
     {
         PrintTemplateProfile other = Label("other", 75, 50);
+        other.SortOrder = 1;
         PrintTemplateProfile large = Label("large", 100, 150);
+        large.SortOrder = 2;
         PrintTemplateProfile small = Label("small", 60, 40);
+        small.SortOrder = 3;
 
         PrintTemplateProfile? selected = PrintTemplatePolicy.SelectAutomaticLabelTemplate(
-            [other, large, small],
+            [small, large, other],
             explicitTemplateId: null,
             defaultTemplateId: "large");
 
-        Assert.Same(small, selected);
-        Assert.Same(large, PrintTemplatePolicy.SelectAutomaticLabelTemplate([other, large], null, null));
-        Assert.Same(other, PrintTemplatePolicy.SelectAutomaticLabelTemplate([other, large, small], "other", null));
+        Assert.Same(large, selected);
+        Assert.Equal([other, large, small], PrintTemplatePolicy.OrderLabelTemplates([small, large, other]));
+        Assert.Same(other, PrintTemplatePolicy.SelectAutomaticLabelTemplate([small, large, other], null, null));
+        Assert.Same(small, PrintTemplatePolicy.SelectAutomaticLabelTemplate([other, large, small], "small", "large"));
     }
 
     [Fact]
@@ -78,7 +82,7 @@ public sealed class PrintTemplatePolicyTests
         bool changed = PrintTemplatePolicy.MigrateBuiltInTemplates(templates, sourceVersion: 1);
 
         Assert.True(changed);
-        Assert.Equal(4, templates.Count);
+        Assert.Equal(5, templates.Count);
         Assert.Equal("Warehouse four-up", existing.Name);
         Assert.Equal("Configured Printer", existing.Printer);
         Assert.Contains(templates, template => template.Id == "manufacturer_box_mark_100x150mm");
@@ -279,6 +283,35 @@ public sealed class PrintTemplatePolicyTests
     }
 
     [Fact]
+    public void MigrateBuiltInTemplates_V12AssignsStableOrderFromStoredSequence()
+    {
+        PrintTemplateProfile third = Label("third", 60, 40);
+        PrintTemplateProfile first = Label("first", 100, 150);
+        PrintTemplateProfile second = Label("second", 80, 50);
+        var templates = new List<PrintTemplateProfile> { third, first, second };
+
+        bool changed = PrintTemplatePolicy.MigrateBuiltInTemplates(templates, sourceVersion: 13);
+
+        Assert.True(changed);
+        Assert.Equal(1, third.SortOrder);
+        Assert.Equal(2, first.SortOrder);
+        Assert.Equal(3, second.SortOrder);
+        Assert.Equal([third, first, second], PrintTemplatePolicy.OrderTemplates(templates));
+    }
+
+    [Fact]
+    public void TemplateVersion_DoesNotChangeWhenOnlyOrderChanges()
+    {
+        PrintTemplateProfile template = Label("label", 60, 40);
+        template.SortOrder = 1;
+        string firstVersion = PrintTemplatePolicy.GetTemplateVersion(template);
+
+        template.SortOrder = 5;
+
+        Assert.Equal(firstVersion, PrintTemplatePolicy.GetTemplateVersion(template));
+    }
+
+    [Fact]
     public void MigrateBuiltInTemplates_AddsLocationTemplateAndCopies100x150PrinterCalibration()
     {
         PrintTemplateProfile source = Label("label_100x150mm", 100, 150);
@@ -344,7 +377,38 @@ public sealed class PrintTemplatePolicyTests
         Assert.Equal("T01", stacked.TemplateNumber);
         Assert.Equal("T05", shipping.TemplateNumber);
         Assert.Equal("T08", custom.TemplateNumber);
-        Assert.Equal("T09", PrintTemplatePolicy.NextTemplateNumber(templates));
+        Assert.Equal("T10", PrintTemplatePolicy.NextTemplateNumber(templates));
+    }
+
+    [Fact]
+    public void MigrateBuiltInTemplates_V13AddsQuadBoxMarkAndAvoidsT08Conflict()
+    {
+        PrintTemplateProfile classic = BoxMark("manufacturer_box_mark_100x150mm", "Box Printer");
+        classic.TemplateNumber = "T06";
+        classic.OffsetXMillimeters = 1.25;
+        classic.OffsetYMillimeters = -0.75;
+        classic.SafetyInsetMillimeters = 2;
+        classic.SortOrder = 1;
+        PrintTemplateProfile existingT08 = Label("custom-t08", 60, 40);
+        existingT08.TemplateNumber = "T08";
+        existingT08.SortOrder = 2;
+        var templates = new List<PrintTemplateProfile> { classic, existingT08 };
+
+        bool changed = PrintTemplatePolicy.MigrateBuiltInTemplates(templates, sourceVersion: 12);
+
+        Assert.True(changed);
+        PrintTemplateProfile quad = Assert.Single(templates, template => template.Id == "manufacturer_box_mark_quad_100x150mm");
+        Assert.Equal("T09", quad.TemplateNumber);
+        Assert.Equal("Box Printer", quad.Printer);
+        Assert.Equal(1.25, quad.OffsetXMillimeters);
+        Assert.Equal(-0.75, quad.OffsetYMillimeters);
+        Assert.Equal(2, quad.SafetyInsetMillimeters);
+        Assert.Equal(PrintTemplatePolicy.BoxMarkQuadLayoutStyle, quad.LayoutStyle);
+        Assert.Equal("portrait", quad.Orientation);
+        Assert.Equal(3, quad.SortOrder);
+
+        Assert.False(PrintTemplatePolicy.MigrateBuiltInTemplates(templates, sourceVersion: 13));
+        Assert.Single(templates, template => template.Id == "manufacturer_box_mark_quad_100x150mm");
     }
 
     [Fact]

@@ -90,6 +90,24 @@ func TestCreatePrintJobAllowsAvailableTemplatePrinter(t *testing.T) {
 	}
 }
 
+func TestCreatePrintJobRejectsMoreThanFiveCopiesWithoutPersisting(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service := newPrintAvailabilityTestService(t)
+	availability := &printerAvailability{printers: map[string]struct{}{"Zebra": {}}}
+
+	response := performPrintJobRequest(t, service, availability, printing.Request{
+		TemplateID: "sku",
+		Items:      []printing.Item{{SKUCode: "SKU-1", Quantity: 6}},
+	})
+
+	if response.Code != http.StatusBadRequest || !bytes.Contains(response.Body.Bytes(), []byte("PRINT_COPIES_LIMIT_EXCEEDED")) {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if len(service.Jobs()) != 0 {
+		t.Fatalf("blocked print persisted jobs: %+v", service.Jobs())
+	}
+}
+
 func TestCreatePrintJobRejectsLongHorizontalTextWithoutPersisting(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	service := newPrintAvailabilityTestService(t)
@@ -105,6 +123,29 @@ func TestCreatePrintJobRejectsLongHorizontalTextWithoutPersisting(t *testing.T) 
 	}
 	if len(service.Jobs()) != 0 {
 		t.Fatalf("long label persisted jobs: %+v", service.Jobs())
+	}
+}
+
+func TestCreatePrintJobRejectsQuadBoxMarkWithoutV2Snapshot(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service, availability := newQuadBoxMarkTestService(t)
+	request := printing.Request{
+		TemplateID: "manufacturer_box_mark_quad_100x150mm",
+		Kind:       "manufacturer_box_mark",
+		Copies:     1,
+		BoxMarks: []printing.BoxMark{{
+			Shop: "BX-1", BoxQRPayload: "BOX-1", SKUCode: "SKU-1", SKUName: "Test SKU", QtyPerBox: 12,
+		}},
+		PayloadSnapshot: json.RawMessage(`{"document_version":"manufacturer_box_mark.v1"}`),
+	}
+
+	response := performPrintJobRequest(t, service, availability, request)
+
+	if response.Code != http.StatusBadRequest || !bytes.Contains(response.Body.Bytes(), []byte("INVALID_BOX_MARK_PAYLOAD")) {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if len(service.Jobs()) != 0 {
+		t.Fatalf("invalid local quad box mark persisted jobs: %+v", service.Jobs())
 	}
 }
 

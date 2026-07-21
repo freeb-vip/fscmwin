@@ -81,7 +81,7 @@ internal static class PrintPageContextFactory
         {
             PageMediaSize = requestedMedia,
             PageOrientation = landscape ? PageOrientation.Landscape : PageOrientation.Portrait,
-            CopyCount = Math.Clamp(settings.PrintCopies, 1, 99),
+            CopyCount = settings.PrintCopies,
             PageScalingFactor = 100,
         };
         System.Printing.ValidationResult validation = queue.MergeAndValidatePrintTicket(baseTicket, delta);

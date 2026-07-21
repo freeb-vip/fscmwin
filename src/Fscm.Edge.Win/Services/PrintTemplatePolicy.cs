@@ -29,11 +29,13 @@ public static class PrintTemplatePolicy
             ["shipping_100x150mm"] = "T05",
             ["manufacturer_box_mark_100x150mm"] = "T06",
             ["custom"] = "T07",
+            ["manufacturer_box_mark_quad_100x150mm"] = "T08",
         };
 
     public const string StackedLayoutStyle = "stacked";
     public const string HorizontalLayoutStyle = "qr_left_text_right";
     public const string LocationCodeLayoutStyle = "location_code_quad_qr";
+    public const string BoxMarkQuadLayoutStyle = "box_mark_quad_qr";
     public const int RestrictedDisplayTextLength = 12;
     public const double Stacked60x40FontSizePoints = 14;
     public const double Horizontal60x40FontSizePoints = 16;
@@ -73,6 +75,7 @@ public static class PrintTemplatePolicy
             .Where(item => IsManufacturerBoxMark(item.Template))
             .OrderBy(item => IsExplicitPrinterAvailable(item.Template, availablePrinters) ? 0 : 1)
             .ThenBy(item => string.IsNullOrWhiteSpace(item.Template.Printer) ? 1 : 0)
+            .ThenBy(item => item.Template.SortOrder > 0 ? item.Template.SortOrder : int.MaxValue)
             .ThenBy(item => item.Index)
             .Select(item => item.Template)
             .ToList();
@@ -90,6 +93,11 @@ public static class PrintTemplatePolicy
         if (string.Equals(layoutStyle, LocationCodeLayoutStyle, StringComparison.OrdinalIgnoreCase))
         {
             return LocationCodeLayoutStyle;
+        }
+
+        if (string.Equals(layoutStyle, BoxMarkQuadLayoutStyle, StringComparison.OrdinalIgnoreCase))
+        {
+            return BoxMarkQuadLayoutStyle;
         }
 
         return string.Equals(layoutStyle, HorizontalLayoutStyle, StringComparison.OrdinalIgnoreCase)
@@ -209,11 +217,16 @@ public static class PrintTemplatePolicy
         IEnumerable<PrintTemplateProfile> templates,
         string? defaultTemplateId = null)
     {
+        return OrderTemplates(templates)
+            .Where(IsLabel)
+            .ToList();
+    }
+
+    public static IReadOnlyList<PrintTemplateProfile> OrderTemplates(IEnumerable<PrintTemplateProfile> templates)
+    {
         return templates
             .Select((template, index) => new { Template = template, Index = index })
-            .Where(item => IsLabel(item.Template))
-            .OrderBy(item => GetAutomaticPriority(item.Template))
-            .ThenBy(item => MatchesId(item.Template, defaultTemplateId) ? 0 : 1)
+            .OrderBy(item => item.Template.SortOrder > 0 ? item.Template.SortOrder : int.MaxValue)
             .ThenBy(item => item.Index)
             .Select(item => item.Template)
             .ToList();
@@ -226,6 +239,7 @@ public static class PrintTemplatePolicy
     {
         var ordered = OrderLabelTemplates(availableTemplates, defaultTemplateId);
         return ordered.FirstOrDefault(template => MatchesId(template, explicitTemplateId))
+            ?? ordered.FirstOrDefault(template => MatchesId(template, defaultTemplateId))
             ?? ordered.FirstOrDefault();
     }
 
@@ -374,6 +388,29 @@ public static class PrintTemplatePolicy
             }
         }
 
+        if (sourceVersion < 13 && !templates.Any(template => MatchesId(template, "manufacturer_box_mark_quad_100x150mm")))
+        {
+            PrintTemplateProfile? source = templates.FirstOrDefault(template => MatchesId(template, "manufacturer_box_mark_100x150mm"));
+            templates.Add(CreateQuadManufacturerBoxMarkTemplate(source));
+            changed = true;
+            changed |= AssignStableTemplateNumbers(templates);
+        }
+
+        if (sourceVersion < 12 || templates.Any(template => template.SortOrder <= 0) ||
+            templates.Select(template => template.SortOrder).Distinct().Count() != templates.Count)
+        {
+            IReadOnlyList<PrintTemplateProfile> ordered = OrderTemplates(templates);
+            for (int index = 0; index < ordered.Count; index++)
+            {
+                int sortOrder = index + 1;
+                if (ordered[index].SortOrder != sortOrder)
+                {
+                    ordered[index].SortOrder = sortOrder;
+                    changed = true;
+                }
+            }
+        }
+
         return changed;
     }
 
@@ -408,16 +445,23 @@ public static class PrintTemplatePolicy
 
     internal static IReadOnlyList<PrintTemplateProfile> CreateDefaultTemplates()
     {
-        return
+        List<PrintTemplateProfile> templates =
         [
             new() { Id = "label_60x40mm", TemplateNumber = "T01", Name = "标签 60 x 40 mm", Type = "label", WidthMillimeters = 60, HeightMillimeters = 40, Orientation = "portrait", SkuQrPrefix = "T", LayoutStyle = StackedLayoutStyle, TextFontSizePoints = Stacked60x40FontSizePoints, MaxDisplayLength = 16 },
             CreateHorizontal60x40LabelTemplate(),
             Create100x150LabelTemplate(),
             CreateLocationCodeTemplate(),
             CreateManufacturerBoxMarkTemplate(),
+            CreateQuadManufacturerBoxMarkTemplate(),
             new() { Id = "shipping_100x150mm", TemplateNumber = "T05", Name = "面单 100 x 150 mm", Type = "shipping", WidthMillimeters = 100, HeightMillimeters = 150, Orientation = "portrait", SkuQrPrefix = "T", MaxDisplayLength = 16 },
             new() { Id = "custom", TemplateNumber = "T07", Name = "自定义", Type = "custom", WidthMillimeters = 60, HeightMillimeters = 40, Orientation = "portrait", SkuQrPrefix = "T", MaxDisplayLength = 16 },
         ];
+        for (int index = 0; index < templates.Count; index++)
+        {
+            templates[index].SortOrder = index + 1;
+        }
+        AssignStableTemplateNumbers(templates);
+        return templates;
     }
 
     private static PrintTemplateProfile CreateLocationCodeTemplate(PrintTemplateProfile? source = null)
@@ -491,6 +535,27 @@ public static class PrintTemplatePolicy
         };
     }
 
+    private static PrintTemplateProfile CreateQuadManufacturerBoxMarkTemplate(PrintTemplateProfile? source = null)
+    {
+        return new PrintTemplateProfile
+        {
+            Id = "manufacturer_box_mark_quad_100x150mm",
+            Name = "箱唛 100 x 150 mm（横向四码）",
+            Type = "manufacturer_box_mark",
+            Printer = source?.Printer ?? string.Empty,
+            WidthMillimeters = 100,
+            HeightMillimeters = 150,
+            Orientation = "portrait",
+            Mode = "fit",
+            Copies = 1,
+            OffsetXMillimeters = source?.OffsetXMillimeters ?? 0,
+            OffsetYMillimeters = source?.OffsetYMillimeters ?? 0,
+            SafetyInsetMillimeters = source is { SafetyInsetMillimeters: > 0 } ? source.SafetyInsetMillimeters : PrintPageContextFactory.DefaultSafetyInsetMillimeters,
+            LayoutStyle = BoxMarkQuadLayoutStyle,
+            MaxDisplayLength = 16,
+        };
+    }
+
     private static bool IsExplicitPrinterAvailable(PrintTemplateProfile template, IReadOnlySet<string> availablePrinters)
     {
         return !string.IsNullOrWhiteSpace(template.Printer) && availablePrinters.Contains(template.Printer.Trim());
@@ -512,16 +577,6 @@ public static class PrintTemplatePolicy
             SkuQrPrefix = "T",
             MaxDisplayLength = 16,
         };
-    }
-
-    private static int GetAutomaticPriority(PrintTemplateProfile template)
-    {
-        if (Is60x40Label(template))
-        {
-            return 0;
-        }
-
-        return Is100x150PortraitLabel(template) ? 1 : 2;
     }
 
     private static bool MatchesSize(PrintTemplateProfile template, double width, double height)

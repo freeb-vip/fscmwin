@@ -69,6 +69,7 @@ public partial class PrintPreviewWindow : Window
         {
             PrintTemplatePolicy.HorizontalLayoutStyle => "左右排版",
             PrintTemplatePolicy.LocationCodeLayoutStyle => "库位码四码排版",
+            PrintTemplatePolicy.BoxMarkQuadLayoutStyle => "箱唛横向四码排版",
             _ => "上下排版",
         };
         string fontSize = layoutStyle == PrintTemplatePolicy.LocationCodeLayoutStyle

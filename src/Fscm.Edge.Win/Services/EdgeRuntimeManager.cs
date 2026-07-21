@@ -15,19 +15,21 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Fscm.Edge.Win.Models;
 
 namespace Fscm.Edge.Win.Services;
 
 public sealed class EdgeRuntimeManager : IDisposable
 {
-    private const int PrintTemplatesSchemaVersion = 11;
+    private const int PrintTemplatesSchemaVersion = 13;
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true,
     };
 
     private readonly HttpClient _httpClient = new() { Timeout = TimeSpan.FromSeconds(3) };
+    private readonly HttpClient _batchHttpClient = new() { Timeout = TimeSpan.FromSeconds(15) };
     private Process? _process;
 
     public string LastCenterQueryMessage { get; private set; } = string.Empty;
@@ -265,13 +267,13 @@ public sealed class EdgeRuntimeManager : IDisposable
         var inventory = new
         {
             printers,
-            templates = PrintTemplatePolicy.OrderLabelTemplates(templates)
-                .Concat(templates.Where(template => !PrintTemplatePolicy.IsLabel(template)))
+            templates = PrintTemplatePolicy.OrderTemplates(templates)
                 .Select(template => new
             {
                 code = template.Id,
                 number = template.TemplateNumber,
                 name = template.Name,
+                sort_order = template.SortOrder,
                 type = template.Type,
                 printer_name = template.Printer,
                 width_mm = template.WidthMillimeters,
@@ -569,7 +571,13 @@ public sealed class EdgeRuntimeManager : IDisposable
         {
             using var request = CreateLocalAdminRequest(HttpMethod.Post, "/edge/print-jobs/pull");
             using var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
-            return response.IsSuccessStatusCode;
+            if (!response.IsSuccessStatusCode)
+            {
+                return false;
+            }
+
+            var payload = await response.Content.ReadFromJsonAsync<Dictionary<string, bool>>(JsonOptions).ConfigureAwait(false);
+            return payload?.TryGetValue("claimed", out bool claimed) == true && claimed;
         }
         catch
         {
@@ -853,9 +861,21 @@ public sealed class EdgeRuntimeManager : IDisposable
         return GetCenterListAsync<ConsolidationOrderSummary>("/api/consolidation-orders", keyword, "&page_size=20");
     }
 
-    public async Task<bool> SubmitBoxMarkPrintJobAsync(string templateId, IReadOnlyList<BoxLabelSummary> labels, int copies)
+    public async Task<bool> SubmitBoxMarkPrintJobAsync(PrintTemplateProfile template, IReadOnlyList<BoxLabelSummary> labels, int copies)
     {
-        var marks = labels.Where(label => label.PrintSnapshot is not null).Select(label => label.PrintSnapshot!).ToList();
+        if (!PrintJobDispatchPolicy.IsCopiesAllowed(copies))
+        {
+            return false;
+        }
+        List<ManufacturerBoxMark> marks;
+        try
+        {
+            marks = ManufacturerBoxMarkPrintService.PrepareMarksForTemplate(template, labels).ToList();
+        }
+        catch
+        {
+            return false;
+        }
         if (marks.Count == 0 || marks.Count > 100)
         {
             return false;
@@ -866,14 +886,20 @@ public sealed class EdgeRuntimeManager : IDisposable
             var idempotencyKey = $"box-mark-{Guid.NewGuid():N}";
             var payload = new
             {
-                template_id = templateId,
+                template_id = template.Id,
                 source = "windows-box-label-management",
                 job_id = idempotencyKey,
                 idempotency_key = idempotencyKey,
                 kind = "manufacturer_box_mark",
-                copies = Math.Clamp(copies, 1, 100),
+                copies,
                 box_marks = marks,
-                payload_snapshot = new { document_version = "manufacturer_box_mark.v1", items = marks },
+                payload_snapshot = new
+                {
+                    document_version = PrintTemplatePolicy.NormalizeLayoutStyle(template.LayoutStyle) == PrintTemplatePolicy.BoxMarkQuadLayoutStyle
+                        ? "manufacturer_box_mark.v2"
+                        : "manufacturer_box_mark.v1",
+                    items = marks,
+                },
             };
             using var request = CreateLocalAdminRequest(HttpMethod.Post, "/edge/print-jobs");
             request.Content = JsonContent.Create(payload);
@@ -1645,7 +1671,7 @@ edge:
             ? "landscape"
             : "portrait";
         settings.PrintMode = "fit";
-        settings.PrintCopies = Math.Clamp(settings.PrintCopies, 1, 99);
+        settings.PrintCopies = Math.Clamp(settings.PrintCopies, 1, PrintJobDispatchPolicy.MaxCopiesPerContent);
         settings.PrintOffsetXMillimeters = Math.Clamp(settings.PrintOffsetXMillimeters, -5, 5);
         settings.PrintOffsetYMillimeters = Math.Clamp(settings.PrintOffsetYMillimeters, -5, 5);
         settings.PrintSafetyInsetMillimeters = settings.PrintSafetyInsetMillimeters > 0
@@ -1737,6 +1763,123 @@ edge:
         return candidates.Count == 0 ? null : $"http://{candidates[0].Address}:{port}";
     }
 
+    public async Task<BatchPrintResult<uint>> ResolveCurrentCenterNodeIdAsync()
+    {
+        try
+        {
+            EdgeSettings settings = LoadEdgeSettings();
+            if (string.IsNullOrWhiteSpace(settings.CenterUrl) || string.IsNullOrWhiteSpace(settings.ApiToken) || string.IsNullOrWhiteSpace(settings.NodeId))
+            {
+                return new BatchPrintResult<uint> { Message = "请先在高级设置中配置中心地址、API Token 和 Node ID。" };
+            }
+            if (settings.NamespaceId == 0)
+            {
+                settings.NamespaceId = await DetectNamespaceIdAsync(settings).ConfigureAwait(false);
+                if (settings.NamespaceId > 0)
+                {
+                    SaveEdgeSettings(settings);
+                }
+            }
+            using var request = CreateCenterManagementRequest(HttpMethod.Get, "/api/edge/nodes?page=1&page_size=100&include_offline=true", settings);
+            using var response = await _batchHttpClient.SendAsync(request).ConfigureAwait(false);
+            string body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                return new BatchPrintResult<uint> { Message = CenterBatchError(response, body, "读取中心边缘节点失败") };
+            }
+            using var document = JsonDocument.Parse(body);
+            JsonElement data = EnvelopeData(document.RootElement);
+            if (!data.TryGetProperty("items", out JsonElement items) || items.ValueKind != JsonValueKind.Array)
+            {
+                return new BatchPrintResult<uint> { Message = "中心返回的节点列表格式无效。" };
+            }
+#pragma warning disable IDISP004
+            foreach (JsonElement item in items.EnumerateArray())
+            {
+                if (item.TryGetProperty("node_id", out JsonElement identity) &&
+                    string.Equals(identity.GetString(), settings.NodeId, StringComparison.OrdinalIgnoreCase) &&
+                    item.TryGetProperty("id", out JsonElement id) && id.TryGetUInt32(out uint nodeId))
+                {
+                    return new BatchPrintResult<uint> { Succeeded = true, Data = nodeId };
+                }
+            }
+#pragma warning restore IDISP004
+            return new BatchPrintResult<uint> { Message = $"中心未找到当前节点 {settings.NodeId}，请确认节点已注册。" };
+        }
+        catch (Exception ex)
+        {
+            return new BatchPrintResult<uint> { Message = $"读取中心节点失败：{ex.Message}" };
+        }
+    }
+
+    public Task<BatchPrintResult<BatchPrintPreview>> PreviewBatchPrintAsync(BatchPrintRequest payload)
+    {
+        return SendCenterBatchRequestAsync<BatchPrintPreview>(HttpMethod.Post, "/api/edge/print-batches/preview", payload);
+    }
+
+    public Task<BatchPrintResult<CenterPrintBatch>> CreateBatchPrintAsync(BatchPrintRequest payload, string idempotencyKey)
+    {
+        return SendCenterBatchRequestAsync<CenterPrintBatch>(HttpMethod.Post, "/api/edge/print-batches", payload, idempotencyKey);
+    }
+
+    public async Task<BatchPrintResult<IReadOnlyList<CenterPrintBatch>>> GetCenterPrintBatchesAsync()
+    {
+        BatchPrintResult<CenterPrintBatchList> result = await SendCenterBatchRequestAsync<CenterPrintBatchList>(HttpMethod.Get, "/api/edge/print-batches?page=1&page_size=100").ConfigureAwait(false);
+        return new BatchPrintResult<IReadOnlyList<CenterPrintBatch>> { Succeeded = result.Succeeded, Message = result.Message, Data = result.Data?.Items ?? [] };
+    }
+
+    public Task<BatchPrintResult<CenterPrintBatch>> UpdateCenterPrintBatchAsync(uint batchId, string action)
+    {
+        return SendCenterBatchRequestAsync<CenterPrintBatch>(HttpMethod.Post, $"/api/edge/print-batches/{batchId}/{Uri.EscapeDataString(action)}");
+    }
+
+    private async Task<BatchPrintResult<T>> SendCenterBatchRequestAsync<T>(HttpMethod method, string path, object? payload = null, string? idempotencyKey = null)
+    {
+        try
+        {
+            EdgeSettings settings = LoadEdgeSettings();
+            using var request = CreateCenterManagementRequest(method, path, settings);
+            if (payload is not null)
+            {
+                request.Content = JsonContent.Create(payload);
+            }
+            if (!string.IsNullOrWhiteSpace(idempotencyKey))
+            {
+                request.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
+            }
+            using var response = await _batchHttpClient.SendAsync(request).ConfigureAwait(false);
+            string body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                return new BatchPrintResult<T> { Message = CenterBatchError(response, body, "中心批量打印请求失败") };
+            }
+            using var document = JsonDocument.Parse(body);
+            JsonElement data = EnvelopeData(document.RootElement);
+            T? value = data.Deserialize<T>(JsonOptions);
+            return value is null
+                ? new BatchPrintResult<T> { Message = "中心批量打印响应没有有效数据。" }
+                : new BatchPrintResult<T> { Succeeded = true, Data = value };
+        }
+        catch (Exception ex)
+        {
+            return new BatchPrintResult<T> { Message = $"中心批量打印请求异常：{ex.Message}" };
+        }
+    }
+
+    private static JsonElement EnvelopeData(JsonElement root)
+    {
+        return root.TryGetProperty("data", out JsonElement data) ? data : root;
+    }
+
+    private static string CenterBatchError(HttpResponseMessage response, string body, string fallback)
+    {
+        string detail = ExtractErrorMessage(body);
+        string status = $"{(int)response.StatusCode} {response.ReasonPhrase}".TrimEnd();
+        return string.IsNullOrWhiteSpace(detail)
+            ? $"{fallback}：{status}"
+            : $"{fallback}：{status}，{detail}";
+    }
+
     private static bool IsPublishableLanAddress(IPAddress address)
     {
         return address.AddressFamily == AddressFamily.InterNetwork
@@ -1792,6 +1935,17 @@ edge:
         }
 
         return request;
+    }
+
+    internal static HttpRequestMessage CreateCenterManagementRequest(HttpMethod method, string path, EdgeSettings settings)
+    {
+        if (string.IsNullOrWhiteSpace(settings.CenterUrl))
+        {
+            throw new InvalidOperationException("请先配置中心地址。");
+        }
+
+        string endpoint = $"{settings.CenterUrl.TrimEnd('/')}/{path.TrimStart('/')}";
+        return CreateAuthorizedRequest(method, endpoint, settings);
     }
 
     private static HttpRequestMessage CreateAuthorizedRequest(HttpMethod method, string endpoint, EdgeSettings settings)
@@ -1853,6 +2007,7 @@ edge:
     public void Dispose()
     {
         _httpClient.Dispose();
+        _batchHttpClient.Dispose();
         _process?.Dispose();
     }
 
@@ -1869,5 +2024,11 @@ edge:
     private sealed class EdgePrintJobResponse
     {
         public EdgePrintJob? Job { get; set; }
+    }
+
+    private sealed class CenterPrintBatchList
+    {
+        [JsonPropertyName("items")]
+        public List<CenterPrintBatch> Items { get; set; } = [];
     }
 }

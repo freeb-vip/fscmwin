@@ -15,6 +15,8 @@ public sealed class PrintTemplateProfile
 
     public string Name { get; set; } = string.Empty;
 
+    public int SortOrder { get; set; }
+
     public string Type { get; set; } = "label";
 
     public string Printer { get; set; } = string.Empty;
@@ -53,6 +55,12 @@ public sealed class PrintTemplateProfile
 
     [JsonIgnore]
     public bool IsSelectedForLabelPrint { get; set; }
+
+    [JsonIgnore]
+    public bool CanMoveUp { get; set; }
+
+    [JsonIgnore]
+    public bool CanMoveDown { get; set; }
 
     [JsonIgnore]
     public string PaperDisplayText => $"{WidthMillimeters:0.##} x {HeightMillimeters:0.##} mm";
