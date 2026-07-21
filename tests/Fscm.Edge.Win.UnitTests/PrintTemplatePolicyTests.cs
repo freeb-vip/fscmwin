@@ -38,6 +38,20 @@ public sealed class PrintTemplatePolicyTests
     }
 
     [Fact]
+    public void SelectPrintJobTemplate_UsesDefaultOnlyWhenTemplateIsOmitted()
+    {
+        PrintTemplateProfile defaultTemplate = Label("default", 60, 40);
+        PrintTemplateProfile explicitTemplate = Label("explicit", 100, 150);
+
+        Assert.Same(defaultTemplate, PrintTemplatePolicy.SelectPrintJobTemplate(
+            [explicitTemplate, defaultTemplate], null, "default"));
+        Assert.Same(explicitTemplate, PrintTemplatePolicy.SelectPrintJobTemplate(
+            [explicitTemplate, defaultTemplate], "explicit", "default"));
+        Assert.Null(PrintTemplatePolicy.SelectPrintJobTemplate(
+            [explicitTemplate, defaultTemplate], "missing", "default"));
+    }
+
+    [Fact]
     public void GetLabelSheetLayout_UsesFourUpOnlyFor100x150PortraitLabels()
     {
         Assert.Equal(LabelSheetLayout.FourUpRepeated, PrintTemplatePolicy.GetLabelSheetLayout(Label("large", 100.05, 149.95)));

@@ -1193,7 +1193,7 @@ public partial class MainWindow : Window
         PrintHeightTextBox.Text = FormatMillimeters(preset.HeightMillimeters);
     }
 
-    private void OnSavePrintSettingsClick(object sender, RoutedEventArgs e)
+    private async void OnSavePrintSettingsClick(object sender, RoutedEventArgs e)
     {
         if (!TryReadPrintSettings(out var settings))
         {
@@ -1201,7 +1201,10 @@ public partial class MainWindow : Window
         }
 
         _runtime.SaveEdgeSettings(settings);
-        PrintConfigStatusText.Text = $"已保存：{settings.DefaultPrinter}，{FormatMillimeters(settings.PrintWidthMillimeters)} x {FormatMillimeters(settings.PrintHeightMillimeters)} mm。重启边缘服务后，局域网任务将使用新默认配置。";
+        bool applied = await _runtime.UpdatePrintDefaultsAsync(settings);
+        PrintConfigStatusText.Text = applied
+            ? $"已保存并生效：默认打印机 {settings.DefaultPrinter}，{FormatMillimeters(settings.PrintWidthMillimeters)} x {FormatMillimeters(settings.PrintHeightMillimeters)} mm。"
+            : $"已保存：默认打印机 {settings.DefaultPrinter}。边缘服务当前不可用，请在服务启动后重启一次使配置生效。";
     }
 
     private void OnPrintPreviewClick(object sender, RoutedEventArgs e)
@@ -1573,14 +1576,19 @@ public partial class MainWindow : Window
 
                 try
                 {
-                    var template = _printTemplates.FirstOrDefault(item =>
-                        string.Equals(item.Id, job.TemplateId, StringComparison.OrdinalIgnoreCase));
+                    var settings = _runtime.LoadEdgeSettings();
+                    var template = PrintTemplatePolicy.SelectPrintJobTemplate(
+                        _printTemplates,
+                        job.TemplateId,
+                        settings.PrintTemplate);
                     if (template is null)
                     {
-                        throw new InvalidOperationException($"打印模板不存在: {job.TemplateId}");
+                        string templateId = string.IsNullOrWhiteSpace(job.TemplateId)
+                            ? settings.PrintTemplate
+                            : job.TemplateId;
+                        throw new InvalidOperationException($"打印模板不存在: {templateId}");
                     }
 
-                    var settings = _runtime.LoadEdgeSettings();
                     settings.DefaultPrinter = string.IsNullOrWhiteSpace(template.Printer)
                         ? (string.IsNullOrWhiteSpace(job.Printer) ? ResolveEffectivePrinter(settings) : job.Printer)
                         : template.Printer;
@@ -2389,7 +2397,7 @@ public partial class MainWindow : Window
         PrintConfigStatusText.Text = $"模板已复制，新模板编号：{copy.TemplateNumber}。";
     }
 
-    private void OnDeletePrintTemplateClick(object sender, RoutedEventArgs e)
+    private async void OnDeletePrintTemplateClick(object sender, RoutedEventArgs e)
     {
         SelectTemplateFromAction(sender);
         if (PrintTemplatesList.SelectedItem is not PrintTemplateProfile template)
@@ -2412,13 +2420,18 @@ public partial class MainWindow : Window
         var settings = _runtime.LoadEdgeSettings();
         _printTemplates = NormalizeTemplateSortOrders(
             _printTemplates.Where(item => !string.Equals(item.Id, template.Id, StringComparison.OrdinalIgnoreCase)));
-        if (string.Equals(settings.PrintTemplate, template.Id, StringComparison.OrdinalIgnoreCase))
+        bool defaultChanged = string.Equals(settings.PrintTemplate, template.Id, StringComparison.OrdinalIgnoreCase);
+        if (defaultChanged)
         {
             settings.PrintTemplate = _printTemplates[0].Id;
             _runtime.SaveEdgeSettings(settings);
         }
 
         _runtime.SavePrintTemplates(_printTemplates);
+        if (defaultChanged)
+        {
+            await _runtime.UpdatePrintDefaultsAsync(settings);
+        }
         UpdateTemplateSortState();
         PrintTemplatesList.ItemsSource = _printTemplates;
         PrintTemplatesList.SelectedIndex = 0;
@@ -2489,7 +2502,7 @@ public partial class MainWindow : Window
         PrintTemplatesList.Items.Refresh();
     }
 
-    private void OnSetDefaultPrintTemplateClick(object sender, RoutedEventArgs e)
+    private async void OnSetDefaultPrintTemplateClick(object sender, RoutedEventArgs e)
     {
         SelectTemplateFromAction(sender);
         if (PrintTemplatesList.SelectedItem is not PrintTemplateProfile template)
@@ -2501,8 +2514,11 @@ public partial class MainWindow : Window
         var settings = _runtime.LoadEdgeSettings();
         settings.PrintTemplate = template.Id;
         _runtime.SaveEdgeSettings(settings);
+        bool applied = await _runtime.UpdatePrintDefaultsAsync(settings);
         LoadLabelTemplates();
-        PrintConfigStatusText.Text = $"已将“{template.DisplayName}”设为默认模板。";
+        PrintConfigStatusText.Text = applied
+            ? $"已将“{template.DisplayName}”设为默认模板，未指定模板的边缘任务将自动使用它。"
+            : $"已将“{template.DisplayName}”设为默认模板。边缘服务当前不可用，请在服务启动后重启一次使配置生效。";
     }
 
     private async void OnSearchProductsClick(object sender, RoutedEventArgs e)

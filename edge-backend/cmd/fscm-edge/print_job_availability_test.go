@@ -29,6 +29,7 @@ func newPrintAvailabilityTestService(t *testing.T) *printing.Service {
 	}
 	service, err := printing.New(printing.Config{
 		DefaultPrinter: "Default Printer",
+		Template:       "sku",
 		TemplatesPath:  templatesPath,
 		JobsPath:       filepath.Join(t.TempDir(), "edge.db"),
 	})
@@ -87,6 +88,24 @@ func TestCreatePrintJobAllowsAvailableTemplatePrinter(t *testing.T) {
 	}
 	if len(service.Jobs()) != 1 || service.Jobs()[0].Printer != "Zebra" {
 		t.Fatalf("unexpected jobs: %+v", service.Jobs())
+	}
+}
+
+func TestCreatePrintJobUsesDefaultTemplateWhenTemplateIsOmitted(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service := newPrintAvailabilityTestService(t)
+	availability := &printerAvailability{printers: map[string]struct{}{"Zebra": {}}}
+
+	response := performPrintJobRequest(t, service, availability, printing.Request{
+		Items: []printing.Item{{SKUCode: "SKU-1", Quantity: 1}},
+	})
+
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	jobs := service.Jobs()
+	if len(jobs) != 1 || jobs[0].TemplateID != "sku" || jobs[0].Printer != "Zebra" {
+		t.Fatalf("default template was not persisted: %+v", jobs)
 	}
 }
 
@@ -155,8 +174,8 @@ func TestResolvePrintRequestPrinterUsesTemplateThenDefault(t *testing.T) {
 	if actual := resolvePrintRequestPrinter(printing.Request{TemplateID: "sku", Printer: "Ignored"}, service); actual != "Zebra" {
 		t.Fatalf("template printer=%q", actual)
 	}
-	if actual := resolvePrintRequestPrinter(printing.Request{}, service); actual != "Default Printer" {
-		t.Fatalf("default printer=%q", actual)
+	if actual := resolvePrintRequestPrinter(printing.Request{}, service); actual != "Zebra" {
+		t.Fatalf("default template printer=%q", actual)
 	}
 }
 

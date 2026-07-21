@@ -243,6 +243,17 @@ public static class PrintTemplatePolicy
             ?? ordered.FirstOrDefault();
     }
 
+    public static PrintTemplateProfile? SelectPrintJobTemplate(
+        IEnumerable<PrintTemplateProfile> templates,
+        string? explicitTemplateId,
+        string? defaultTemplateId)
+    {
+        string? templateId = string.IsNullOrWhiteSpace(explicitTemplateId)
+            ? defaultTemplateId
+            : explicitTemplateId;
+        return templates.FirstOrDefault(template => MatchesId(template, templateId));
+    }
+
     internal static bool MigrateBuiltInTemplates(ICollection<PrintTemplateProfile> templates, int sourceVersion)
     {
         bool changed = false;

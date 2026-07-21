@@ -119,7 +119,9 @@ func main() {
 	}
 	defer func() { _ = mediaCache.Close() }()
 	availability := &printerAvailability{printers: make(map[string]struct{})}
-	reg := registry.New(registry.Config{CenterURL: cfg.CenterURL, APIToken: cfg.APIToken, NodeID: cfg.NodeID, NodeName: cfg.NodeName, LANBaseURL: cfg.LANBaseURL, Version: version.Version, APIVersion: version.APIVersion, CacheMode: cfg.Cache.Mode, NamespaceID: cfg.NamespaceID, Capabilities: []string{"proxy", "adaptive_cache", "catalog_cache", "catalog_media_cache", "box_label_catalog", "local_print", "print_templates", "batch_print_v1"}, Inventory: func() interface{} { return printInventory(printer.Templates(), cfg.DefaultPrinter, availability) }, HeartbeatInterval: time.Duration(cfg.HeartbeatSeconds) * time.Second, OnCatalogRevision: catalogManager.OnRemoteRevision, OnTicketPublicKey: catalogManager.SetTicketPublicKey})
+	reg := registry.New(registry.Config{CenterURL: cfg.CenterURL, APIToken: cfg.APIToken, NodeID: cfg.NodeID, NodeName: cfg.NodeName, LANBaseURL: cfg.LANBaseURL, Version: version.Version, APIVersion: version.APIVersion, CacheMode: cfg.Cache.Mode, NamespaceID: cfg.NamespaceID, Capabilities: []string{"proxy", "adaptive_cache", "catalog_cache", "catalog_media_cache", "box_label_catalog", "local_print", "print_templates", "batch_print_v1"}, Inventory: func() interface{} {
+		return printInventory(printer.Templates(), printer.Config().DefaultPrinter, availability)
+	}, HeartbeatInterval: time.Duration(cfg.HeartbeatSeconds) * time.Second, OnCatalogRevision: catalogManager.OnRemoteRevision, OnTicketPublicKey: catalogManager.SetTicketPublicKey})
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	startServiceAdvertisement(ctx, cfg)
@@ -148,7 +150,7 @@ func main() {
 	})
 	router.GET("/edge/print-inventory", func(c *gin.Context) {
 		terminals.recordProbe(c.ClientIP(), c.Request.UserAgent(), c.GetHeader("X-Edge-Terminal-Name"))
-		c.JSON(http.StatusOK, printInventory(printer.Templates(), cfg.DefaultPrinter, availability))
+		c.JSON(http.StatusOK, printInventory(printer.Templates(), printer.Config().DefaultPrinter, availability))
 	})
 	router.GET("/edge/terminals/connect", func(c *gin.Context) {
 		if err := catalogManager.AuthorizeTicket(c.GetHeader("X-Edge-Ticket")); err != nil {
@@ -328,6 +330,23 @@ func main() {
 		writeTerminalCommandResponse(c, result, err)
 	})
 	admin.GET("/print-config", func(c *gin.Context) { c.JSON(http.StatusOK, printer.Config()) })
+	admin.PUT("/print-config", func(c *gin.Context) {
+		var payload struct {
+			DefaultPrinter string `json:"default_printer"`
+			TemplateID     string `json:"template_id"`
+		}
+		if err := c.ShouldBindJSON(&payload); err != nil || !printer.HasTemplate(strings.TrimSpace(payload.TemplateID)) {
+			c.JSON(http.StatusBadRequest, gin.H{"code": "PRINT_TEMPLATE_NOT_FOUND"})
+			return
+		}
+		if name := strings.TrimSpace(payload.DefaultPrinter); name != "" && availability.Ready() && !availability.Has(name) {
+			c.JSON(http.StatusConflict, gin.H{"code": "PRINTER_UNAVAILABLE", "printer": name})
+			return
+		}
+		updated := printer.UpdatePrintDefaults(payload.DefaultPrinter, payload.TemplateID)
+		go reg.SyncNow(context.Background())
+		c.JSON(http.StatusOK, updated)
+	})
 	admin.PUT("/print-inventory", func(c *gin.Context) {
 		var payload struct {
 			Printers []string `json:"printers"`
@@ -564,6 +583,7 @@ func createPrintJob(c *gin.Context, printer *printing.Service, availability *pri
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PRINT_JOB"})
 		return
 	}
+	req.TemplateID = printer.ResolveTemplateID(req.TemplateID)
 	if req.TemplateID != "" && !printer.HasTemplate(req.TemplateID) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "PRINT_TEMPLATE_NOT_FOUND"})
 		return
@@ -596,9 +616,9 @@ func createPrintJob(c *gin.Context, printer *printing.Service, availability *pri
 }
 
 func resolvePrintRequestPrinter(req printing.Request, printer *printing.Service) string {
-	if req.TemplateID != "" {
+	if templateID := printer.ResolveTemplateID(req.TemplateID); templateID != "" {
 		for _, template := range printer.Templates() {
-			if template.ID == req.TemplateID {
+			if template.ID == templateID {
 				return strings.TrimSpace(first(template.Printer, printer.Config().DefaultPrinter))
 			}
 		}
@@ -983,6 +1003,7 @@ func claimRemotePrintJob(ctx context.Context, reg *registry.Client, printer *pri
 	}
 	localID := fmt.Sprintf("center-job-%d", claim.ID)
 	request := printing.Request{JobID: localID, IdempotencyKey: localID, Source: "center", Printer: claim.PrinterName, Template: claim.TemplateCode, TemplateID: claim.TemplateCode, Kind: payload.Kind, Text: payload.Text, QRCodeContent: first(payload.QRPayload, payload.Text), PayloadSnapshot: append(json.RawMessage(nil), claim.PayloadSnapshot...), Copies: claim.Copies, BoxMarks: payload.Items, RemoteBatchID: claim.BatchID, RemoteSequenceNo: claim.SequenceNo, RemoteJobType: claim.JobType, RemoteAttemptCount: claim.AttemptCount}
+	request.TemplateID = printer.ResolveTemplateID(request.TemplateID)
 	if payload.Kind == "manual_text" {
 		// Keep one item for older Windows workers that predate the manual_text
 		// dispatcher. New workers render Text directly; older workers print this QR item.

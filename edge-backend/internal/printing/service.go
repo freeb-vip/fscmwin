@@ -160,8 +160,20 @@ func New(cfg Config) (*Service, error) {
 	return service, nil
 }
 
-func (s *Service) Close() error   { return s.store.Close() }
-func (s *Service) Config() Config { return s.cfg }
+func (s *Service) Close() error { return s.store.Close() }
+func (s *Service) Config() Config {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg
+}
+
+func (s *Service) UpdatePrintDefaults(defaultPrinter, templateID string) Config {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cfg.DefaultPrinter = strings.TrimSpace(defaultPrinter)
+	s.cfg.Template = strings.TrimSpace(templateID)
+	return s.cfg
+}
 func (s *Service) Jobs() []Job {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -216,6 +228,16 @@ func (s *Service) HasTemplate(id string) bool {
 		}
 	}
 	return false
+}
+
+// ResolveTemplateID applies the edge default only when the caller omitted a template.
+// An explicit unknown ID is preserved so the API can report a configuration error.
+func (s *Service) ResolveTemplateID(id string) string {
+	id = strings.TrimSpace(id)
+	if id != "" {
+		return id
+	}
+	return strings.TrimSpace(s.Config().Template)
 }
 func (s *Service) SaveTemplate(template Template) error {
 	templates := s.Templates()
@@ -351,6 +373,7 @@ func (s *Service) CreateRemote(req Request, remoteJobID uint, leaseToken string)
 func (s *Service) create(req Request, remoteJobID uint, leaseToken string) (Job, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	req.TemplateID = resolveTemplateID(req.TemplateID, s.cfg.Template)
 	printer, template := req.Printer, req.Template
 	qrPrefix := s.cfg.QRCodePrefix
 	if req.TemplateID != "" {
@@ -439,6 +462,14 @@ func (s *Service) create(req Request, remoteJobID uint, leaseToken string) (Job,
 		s.keys[key] = id
 	}
 	return job, false, nil
+}
+
+func resolveTemplateID(id, defaultID string) string {
+	id = strings.TrimSpace(id)
+	if id != "" {
+		return id
+	}
+	return strings.TrimSpace(defaultID)
 }
 
 func requestContentCopies(req Request) (map[string]int, error) {

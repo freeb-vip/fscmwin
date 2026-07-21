@@ -52,6 +52,45 @@ func TestCreateUsesTemplatePrefixAndIdempotency(t *testing.T) {
 	}
 }
 
+func TestCreateUsesConfiguredDefaultTemplateWhenRequestOmitsTemplate(t *testing.T) {
+	t.Parallel()
+	templatesPath := filepath.Join(t.TempDir(), "print-templates.json")
+	data, err := json.Marshal([]Template{{ID: "default-label", Name: "Default Label", Printer: "Zebra", SkuQRPrefix: "BOX-"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(templatesPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service, err := New(Config{Template: "default-label", TemplatesPath: templatesPath, JobsPath: filepath.Join(t.TempDir(), "edge.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = service.Close() }()
+
+	job, _, err := service.Create(Request{Items: []Item{{SKUCode: "SKU-1"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.TemplateID != "default-label" || job.Template != "Default Label" || job.Printer != "Zebra" || job.Items[0].QRCodeContent != "BOX-SKU-1" {
+		t.Fatalf("default template was not applied: %+v", job)
+	}
+}
+
+func TestUpdatePrintDefaultsAppliesWithoutRestart(t *testing.T) {
+	t.Parallel()
+	service, err := New(Config{DefaultPrinter: "Old Printer", Template: "old", JobsPath: filepath.Join(t.TempDir(), "edge.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = service.Close() }()
+
+	updated := service.UpdatePrintDefaults(" New Printer ", " new-template ")
+	if updated.DefaultPrinter != "New Printer" || updated.Template != "new-template" || service.ResolveTemplateID("") != "new-template" {
+		t.Fatalf("defaults were not updated: %+v", updated)
+	}
+}
+
 func TestCreateRejectsMoreThanFiveCopiesOfSameContent(t *testing.T) {
 	t.Parallel()
 	service, err := New(Config{JobsPath: filepath.Join(t.TempDir(), "edge.db")})

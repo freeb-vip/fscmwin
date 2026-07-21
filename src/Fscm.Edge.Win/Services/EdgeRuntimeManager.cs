@@ -565,6 +565,25 @@ public sealed class EdgeRuntimeManager : IDisposable
         }
     }
 
+    public async Task<bool> UpdatePrintDefaultsAsync(EdgeSettings settings)
+    {
+        try
+        {
+            using var request = CreateLocalAdminRequest(HttpMethod.Put, "/edge/print-config");
+            request.Content = JsonContent.Create(new
+            {
+                default_printer = settings.DefaultPrinter,
+                template_id = settings.PrintTemplate,
+            });
+            using var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
+            return response.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     public async Task<bool> PullRemotePrintJobAsync(uint? batchId = null)
     {
         try
