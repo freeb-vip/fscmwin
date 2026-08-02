@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -236,15 +238,151 @@ func TestStoreAppliesBoxLabelUpsertAndDeleteChanges(t *testing.T) {
 	}
 }
 
-func TestManagerConfirmationIsBackgroundAndDeduplicated(t *testing.T) {
-	requests := make(chan struct{}, 1)
+func TestManagerStartRequiresManualRefreshWithoutCenterRequest(t *testing.T) {
+	var requests atomic.Int32
 	center := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		requests <- struct{}{}
-		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"code":0,"data":{"items":[],"next_revision":1,"catalog_revision":1,"full_sync_required":false},"msg":"ok"}`))
+		requests.Add(1)
+		writer.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer center.Close()
+	store, err := Open(filepath.Join(t.TempDir(), "edge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	manager := NewManager(Config{CenterURL: center.URL, APIToken: "token", NodeID: "edge-1", NamespaceID: 1}, store)
+	manager.Start(t.Context())
+	status, err := manager.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Ready || !status.ManualRefreshRequired || status.State != "manual_refresh_required" {
+		t.Fatalf("unexpected initial status: %+v", status)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("startup made %d center requests", requests.Load())
+	}
+}
 
+func TestManagerStartMarksInterruptedManualRefreshRequired(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "edge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	generation, err := store.BeginFullSync(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.FinishFullSync(1, generation, 4); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.BeginFullSync(1); err != nil {
+		t.Fatal(err)
+	}
+
+	manager := NewManager(Config{CenterURL: "http://center.invalid", APIToken: "token", NodeID: "edge-1", NamespaceID: 1}, store)
+	manager.Start(t.Context())
+	status, err := manager.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !status.Ready || !status.ManualRefreshRequired || status.ActiveGeneration != generation || status.Revision != 4 {
+		t.Fatalf("unexpected interrupted refresh status: %+v", status)
+	}
+}
+
+func TestManagerAutomaticRetryDelayStaysWithinConfiguredBounds(t *testing.T) {
+	manager := NewManager(Config{NodeID: "edge-delay"}, nil)
+	first := manager.automaticRetryDelay(1)
+	if first < 30*time.Second || first > 36*time.Second {
+		t.Fatalf("first retry delay=%v", first)
+	}
+	if maximum := manager.automaticRetryDelay(100); maximum > 15*time.Minute || maximum < 12*time.Minute {
+		t.Fatalf("maximum retry delay=%v", maximum)
+	}
+	if repeated := manager.automaticRetryDelay(1); repeated != first {
+		t.Fatalf("node jitter is not stable: first=%v repeated=%v", first, repeated)
+	}
+}
+func TestManagerRemoteRevisionAppliesOnlyIncrementalChanges(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "edge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	generation, err := store.BeginFullSync(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.UpsertProducts(1, generation, []Product{{ID: 11, Code: "OLD"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.FinishFullSync(1, generation, 1); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(Product{ID: 11, Code: "NEW"})
+	var pathsMu sync.Mutex
+	paths := make([]string, 0, 2)
+	center := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		pathsMu.Lock()
+		paths = append(paths, request.URL.Path)
+		pathsMu.Unlock()
+		writer.Header().Set("Content-Type", "application/json")
+		if request.URL.Query().Get("after_revision") == "1" {
+			_ = json.NewEncoder(writer).Encode(map[string]any{"code": 0, "data": map[string]any{"items": []Change{{Revision: 2, EntityType: "product", Action: "upsert", EntityID: 11, Payload: payload}}, "next_revision": 2, "catalog_revision": 2, "full_sync_required": false}})
+			return
+		}
+		_, _ = writer.Write([]byte(`{"code":0,"data":{"items":[],"next_revision":2,"catalog_revision":2,"full_sync_required":false},"msg":"ok"}`))
+	}))
+	defer center.Close()
+	manager := NewManager(Config{CenterURL: center.URL, APIToken: "token", NodeID: "edge-1", NamespaceID: 1}, store)
+	manager.OnRemoteRevision(2)
+	waitForCatalogStatus(t, manager, func(status Status) bool { return status.Revision == 2 })
+	products, err := store.SearchProducts(1, "NEW")
+	if err != nil || len(products) != 1 || products[0].ID != 11 {
+		t.Fatalf("incremental product=%+v err=%v", products, err)
+	}
+	pathsMu.Lock()
+	defer pathsMu.Unlock()
+	for _, path := range paths {
+		if path != "/api/edge/catalog/changes" {
+			t.Fatalf("automatic sync requested non-incremental path %q", path)
+		}
+	}
+}
+
+func TestManagerFullSyncRequiredStopsAutomaticRetries(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "edge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	generation, _ := store.BeginFullSync(1)
+	if err = store.FinishFullSync(1, generation, 1); err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	center := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"code":0,"data":{"items":[],"next_revision":1,"catalog_revision":2,"full_sync_required":true},"msg":"ok"}`))
+	}))
+	defer center.Close()
+	manager := NewManager(Config{CenterURL: center.URL, APIToken: "token", NodeID: "edge-1", NamespaceID: 1}, store)
+	manager.OnRemoteRevision(2)
+	waitForCatalogStatus(t, manager, func(status Status) bool { return status.ManualRefreshRequired })
+	for index := 0; index < 5; index++ {
+		manager.OnRemoteRevision(2)
+	}
+	time.Sleep(50 * time.Millisecond)
+	status, _ := manager.Status()
+	if requests.Load() != 1 || status.Revision != 1 || status.ActiveGeneration != generation {
+		t.Fatalf("requests=%d status=%+v", requests.Load(), status)
+	}
+}
+
+func TestManagerRevisionGapRequiresManualRefreshWithoutApplyingChanges(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "edge.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -257,18 +395,206 @@ func TestManagerConfirmationIsBackgroundAndDeduplicated(t *testing.T) {
 	if err = store.FinishFullSync(1, generation, 1); err != nil {
 		t.Fatal(err)
 	}
-	manager := NewManager(Config{CenterURL: center.URL, APIToken: "token", NodeID: "edge-1", NamespaceID: 1}, store)
-	if !manager.ConfirmChangesIfDue(time.Hour) {
-		t.Fatal("first center confirmation was not scheduled")
+
+	payload, _ := json.Marshal(Product{ID: 13, Code: "GAP"})
+	var requests atomic.Int32
+	center := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(map[string]any{"code": 0, "data": map[string]any{
+			"items":         []Change{{Revision: 3, EntityType: "product", Action: "upsert", EntityID: 13, Payload: payload}},
+			"next_revision": 3, "catalog_revision": 3, "full_sync_required": false,
+		}})
+	}))
+	defer center.Close()
+
+	manager := NewManager(Config{CenterURL: center.URL, APIToken: "token", NodeID: "edge-gap", NamespaceID: 1}, store)
+	manager.OnRemoteRevision(3)
+	waitForCatalogStatus(t, manager, func(status Status) bool { return status.ManualRefreshRequired })
+	status, err := manager.Status()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if manager.ConfirmChangesIfDue(time.Hour) {
-		t.Fatal("duplicate center confirmation was scheduled")
+	products, err := store.SearchProducts(1, "GAP")
+	if err != nil {
+		t.Fatal(err)
 	}
-	select {
-	case <-requests:
-	case <-time.After(3 * time.Second):
-		t.Fatal("center confirmation request was not sent")
+	if status.Revision != 1 || status.ActiveGeneration != generation || len(products) != 0 || requests.Load() != 1 {
+		t.Fatalf("gap changed active catalog: status=%+v products=%+v requests=%d", status, products, requests.Load())
 	}
+}
+func TestManagerAutomaticChangesBackoffAndRecovery(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "edge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	generation, err := store.BeginFullSync(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.FinishFullSync(1, generation, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	payload, _ := json.Marshal(Product{ID: 12, Code: "RECOVERED"})
+	var requests atomic.Int32
+	var fail atomic.Bool
+	fail.Store(true)
+	center := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		if fail.Load() {
+			writer.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		items := []Change{}
+		if request.URL.Query().Get("after_revision") == "1" {
+			items = []Change{{Revision: 2, EntityType: "product", Action: "upsert", EntityID: 12, Payload: payload}}
+		}
+		_ = json.NewEncoder(writer).Encode(map[string]any{"code": 0, "data": map[string]any{
+			"items": items, "next_revision": 2, "catalog_revision": 2, "full_sync_required": false,
+		}})
+	}))
+	defer center.Close()
+
+	manager := NewManager(Config{CenterURL: center.URL, APIToken: "token", NodeID: "edge-backoff", NamespaceID: 1}, store)
+	manager.OnRemoteRevision(2)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		manager.mu.Lock()
+		backingOff := !manager.running && manager.autoFailures == 1 && manager.nextAutoAt.After(time.Now())
+		manager.mu.Unlock()
+		if backingOff {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	manager.mu.Lock()
+	backingOff := !manager.running && manager.autoFailures == 1 && manager.nextAutoAt.After(time.Now())
+	manager.mu.Unlock()
+	if !backingOff || requests.Load() != 1 {
+		t.Fatalf("automatic retry was not backed off: requests=%d", requests.Load())
+	}
+	for index := 0; index < 5; index++ {
+		manager.OnRemoteRevision(2)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if requests.Load() != 1 {
+		t.Fatalf("backoff allowed repeated requests: %d", requests.Load())
+	}
+
+	fail.Store(false)
+	manager.mu.Lock()
+	manager.nextAutoAt = time.Time{}
+	manager.mu.Unlock()
+	manager.OnRemoteRevision(2)
+	waitForCatalogStatus(t, manager, func(status Status) bool { return status.Revision == 2 })
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		manager.mu.Lock()
+		finished := !manager.running
+		manager.mu.Unlock()
+		if finished {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	manager.mu.Lock()
+	failures, nextAutoAt, running := manager.autoFailures, manager.nextAutoAt, manager.running
+	manager.mu.Unlock()
+	status, statusErr := manager.Status()
+	if running || failures != 0 || !nextAutoAt.IsZero() || requests.Load() != 3 || statusErr != nil || status.ManualRefreshRequired {
+		t.Fatalf("successful sync did not clear backoff: running=%t failures=%d next=%v requests=%d status=%+v err=%v", running, failures, nextAutoAt, requests.Load(), status, statusErr)
+	}
+}
+
+func TestManagerManualFullRefreshDownloadsSnapshotsAndClearsRequiredState(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "edge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var pathsMu sync.Mutex
+	paths := make([]string, 0, 4)
+	center := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		pathsMu.Lock()
+		paths = append(paths, request.URL.Path)
+		pathsMu.Unlock()
+		writer.Header().Set("Content-Type", "application/json")
+		var data any
+		switch request.URL.Path {
+		case "/api/edge/catalog/products/snapshot":
+			data = map[string]any{"items": []Product{{ID: 11, Code: "P-11"}}, "done": true, "catalog_revision": 5}
+		case "/api/edge/catalog/skus/snapshot":
+			data = map[string]any{"items": []SKU{{ID: 12, Code: "SKU-12", ProductID: 11, ProductCode: "P-11"}}, "done": true, "catalog_revision": 5}
+		case "/api/edge/catalog/box-labels/snapshot":
+			data = map[string]any{"items": []BoxLabel{}, "done": true, "catalog_revision": 5}
+		case "/api/edge/catalog/changes":
+			data = map[string]any{"items": []Change{}, "next_revision": 5, "catalog_revision": 5, "full_sync_required": false}
+		default:
+			http.NotFound(writer, request)
+			return
+		}
+		_ = json.NewEncoder(writer).Encode(map[string]any{"code": 0, "data": data})
+	}))
+	defer center.Close()
+
+	manager := NewManager(Config{CenterURL: center.URL, APIToken: "token", NodeID: "edge-manual", NamespaceID: 1}, store)
+	manager.Start(t.Context())
+	before, err := manager.Status()
+	if err != nil || !before.ManualRefreshRequired {
+		t.Fatalf("expected manual refresh state before refresh: status=%+v err=%v", before, err)
+	}
+	if err = manager.RefreshFull(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	after, err := manager.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.Ready || after.ManualRefreshRequired || after.State != "ready" || after.Revision != 5 || after.ActiveGeneration == 0 || after.LastError != "" {
+		t.Fatalf("unexpected status after manual refresh: %+v", after)
+	}
+	products, err := store.SearchProducts(1, "P-11")
+	if err != nil || len(products) != 1 {
+		t.Fatalf("manual product snapshot items=%+v err=%v", products, err)
+	}
+	skus, err := store.SearchSKUs(1, "SKU-12", "", nil)
+	if err != nil || len(skus) != 1 {
+		t.Fatalf("manual SKU snapshot items=%+v err=%v", skus, err)
+	}
+
+	pathsMu.Lock()
+	defer pathsMu.Unlock()
+	expected := []string{
+		"/api/edge/catalog/products/snapshot",
+		"/api/edge/catalog/skus/snapshot",
+		"/api/edge/catalog/box-labels/snapshot",
+		"/api/edge/catalog/changes",
+	}
+	if len(paths) != len(expected) {
+		t.Fatalf("manual refresh paths=%v", paths)
+	}
+	for index := range expected {
+		if paths[index] != expected[index] {
+			t.Fatalf("manual refresh paths=%v", paths)
+		}
+	}
+}
+func waitForCatalogStatus(t *testing.T, manager *Manager, ready func(Status) bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		status, err := manager.Status()
+		if err == nil && ready(status) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	status, err := manager.Status()
+	t.Fatalf("catalog status did not converge: status=%+v err=%v", status, err)
 }
 
 func TestStoreAppliesDeleteChange(t *testing.T) {

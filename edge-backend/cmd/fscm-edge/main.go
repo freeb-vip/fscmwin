@@ -12,6 +12,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -30,6 +31,7 @@ import (
 	"fscm-edge/internal/printing"
 	edgeproxy "fscm-edge/internal/proxy"
 	"fscm-edge/internal/registry"
+	"fscm-edge/internal/storage"
 	"fscm-edge/internal/version"
 
 	"github.com/gin-gonic/gin"
@@ -43,23 +45,37 @@ type printerAvailability struct {
 	ready    bool
 }
 
-func (a *printerAvailability) Set(printers []string) {
+func (a *printerAvailability) Set(printers []string) bool {
 	updated := make(map[string]struct{}, len(printers))
 	for _, printer := range printers {
 		if name := strings.TrimSpace(printer); name != "" {
-			updated[name] = struct{}{}
+			updated[strings.ToLower(name)] = struct{}{}
 		}
 	}
 	a.Lock()
+	changed := !a.ready || len(a.printers) != len(updated)
+	if !changed {
+		for name := range updated {
+			if _, ok := a.printers[name]; !ok {
+				changed = true
+				break
+			}
+		}
+	}
 	a.printers = updated
 	a.ready = true
 	a.Unlock()
+	return changed
 }
 
 func (a *printerAvailability) Has(printer string) bool {
 	a.RLock()
 	defer a.RUnlock()
-	_, ok := a.printers[strings.TrimSpace(printer)]
+	name := strings.TrimSpace(printer)
+	_, ok := a.printers[name]
+	if !ok {
+		_, ok = a.printers[strings.ToLower(name)]
+	}
 	return ok
 }
 
@@ -72,10 +88,35 @@ func (a *printerAvailability) Ready() bool {
 func main() {
 	configPath := flag.String("config", "edge.config.yaml", "edge config yaml")
 	_ = flag.String("mode", "edge", "compatibility flag")
+	cleanupNAS := flag.Bool("cleanup-nas", false, "remove FSCM-managed NAS system objects")
+	serviceControl := flag.String("service-control", "", "install or uninstall the Windows service")
 	flag.Parse()
-	cfg, err := config.Load(*configPath)
-	if err != nil {
+	if *serviceControl != "" {
+		if err := controlPlatformService(*serviceControl, *configPath); err != nil {
+			panic(err)
+		}
+		if strings.EqualFold(strings.TrimSpace(*serviceControl), "uninstall") {
+			if err := cleanupNASSystemObjects(*configPath); err != nil {
+				panic(err)
+			}
+		}
+		return
+	}
+	if *cleanupNAS {
+		if err := cleanupNASSystemObjects(*configPath); err != nil {
+			panic(err)
+		}
+		return
+	}
+	if err := runPlatformService(*configPath, runEdge); err != nil {
 		panic(err)
+	}
+}
+
+func runEdge(parentContext context.Context, configPath string) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
 	}
 	hostname, _ := os.Hostname()
 	hostname = strings.TrimSpace(hostname)
@@ -87,7 +128,7 @@ func main() {
 		cfg.NodeName = first(hostname, cfg.NodeID)
 	}
 	if cfg.LANBaseURL == "" {
-		if address := localIPv4(); address != "" {
+		if address := localIPv4(cfg.CenterURL); address != "" {
 			cfg.LANBaseURL = "http://" + address + ":" + cfg.Port
 		}
 	}
@@ -95,17 +136,17 @@ func main() {
 	responseCache := cache.New(cache.Config{Mode: cache.Mode(cfg.Cache.Mode), MaxEntries: cfg.Cache.MaxEntries, MaxBytes: cfg.Cache.MaxMemoryMB << 20, MaxObjectBytes: cfg.Cache.MaxObjectMB << 20, MaxStale: time.Duration(cfg.Cache.MaxStaleHours) * time.Hour})
 	proxyHandler, err := edgeproxy.New(edgeproxy.Config{CenterURL: cfg.CenterURL, NodeID: cfg.NodeID, CacheWhitelist: cfg.Cache.Whitelist, StaleIfError: cfg.Cache.StaleIfError, MaxObjectBytes: cfg.Cache.MaxObjectMB << 20}, responseCache)
 	if err != nil {
-		panic(err)
+		return err
 	}
-	templatesPath := filepath.Join(filepath.Dir(*configPath), "print-templates.json")
+	templatesPath := filepath.Join(filepath.Dir(configPath), "print-templates.json")
 	printer, err := printing.New(printing.Config{DefaultPrinter: cfg.DefaultPrinter, Template: cfg.PrintTemplate, WidthMM: cfg.PrintWidthMM, HeightMM: cfg.PrintHeightMM, Orientation: cfg.PrintOrientation, Mode: cfg.PrintMode, Copies: cfg.PrintCopies, TemplatesPath: templatesPath, JobsPath: cfg.JobsPath, QRCodePrefix: cfg.SkuQRPrefix})
 	if err != nil {
-		panic(err)
+		return err
 	}
 	defer func() { _ = printer.Close() }()
 	catalogStore, err := catalog.Open(cfg.JobsPath)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	defer func() { _ = catalogStore.Close() }()
 	catalogManager := catalog.NewManager(catalog.Config{CenterURL: cfg.CenterURL, APIToken: cfg.APIToken, NodeID: cfg.NodeID, NamespaceID: cfg.NamespaceID, SKUQRPrefix: cfg.SkuQRPrefix}, catalogStore)
@@ -115,15 +156,35 @@ func main() {
 		APIToken: cfg.APIToken, NodeID: cfg.NodeID,
 	})
 	if err != nil {
-		panic(err)
+		return err
 	}
 	defer func() { _ = mediaCache.Close() }()
+	storageRuntime := storageRuntime{}
+	storageStore, storageErr := storage.Open(cfg.JobsPath)
+	if storageErr != nil {
+		storageRuntime = unavailableStorageRuntime(storageErr)
+	} else {
+		defer func() { _ = storageStore.Close() }()
+		storageManager, managerErr := storage.NewManager(storageStore, cfg.NodeID, storage.NewSystemProvisioner())
+		if managerErr != nil {
+			storageRuntime = unavailableStorageRuntime(managerErr)
+		} else {
+			storageRuntime.manager = storageManager
+		}
+	}
 	availability := &printerAvailability{printers: make(map[string]struct{})}
-	reg := registry.New(registry.Config{CenterURL: cfg.CenterURL, APIToken: cfg.APIToken, NodeID: cfg.NodeID, NodeName: cfg.NodeName, LANBaseURL: cfg.LANBaseURL, Version: version.Version, APIVersion: version.APIVersion, CacheMode: cfg.Cache.Mode, NamespaceID: cfg.NamespaceID, Capabilities: []string{"proxy", "adaptive_cache", "catalog_cache", "catalog_media_cache", "box_label_catalog", "local_print", "print_templates", "batch_print_v1"}, Inventory: func() interface{} {
+	capabilities := []string{"proxy", "adaptive_cache", "catalog_cache", "catalog_media_cache", "box_label_catalog", "local_print", "print_templates", "batch_print_v1"}
+	if storageRuntime.Available() {
+		capabilities = append(capabilities, "nas_storage_smb_v1")
+	}
+	reg := registry.New(registry.Config{CenterURL: cfg.CenterURL, APIToken: cfg.APIToken, NodeID: cfg.NodeID, NodeName: cfg.NodeName, LANBaseURL: cfg.LANBaseURL, Version: version.Version, APIVersion: version.APIVersion, CacheMode: cfg.Cache.Mode, NamespaceID: cfg.NamespaceID, Capabilities: capabilities, Inventory: func() interface{} {
 		return printInventory(printer.Templates(), printer.Config().DefaultPrinter, availability)
 	}, HeartbeatInterval: time.Duration(cfg.HeartbeatSeconds) * time.Second, OnCatalogRevision: catalogManager.OnRemoteRevision, OnTicketPublicKey: catalogManager.SetTicketPublicKey})
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := signal.NotifyContext(parentContext, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	if storageRuntime.manager != nil {
+		storageRuntime.manager.Start(ctx)
+	}
 	startServiceAdvertisement(ctx, cfg)
 	reg.Start(ctx)
 	catalogManager.Start(ctx)
@@ -137,7 +198,8 @@ func main() {
 	router.GET("/edge/health", func(c *gin.Context) {
 		catalogStatus, _ := catalogManager.Status()
 		completionStatus, _ := printer.RemoteCompletionStatus()
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "mode": "proxy", "backend_version": version.Version, "backend_commit": version.Commit, "edge_api_version": version.APIVersion, "center": proxyHandler.CenterStatus(), "cache": responseCache.Status(), "catalog": catalogStatus, "catalog_media_cache": mediaCache.Status(), "catalog_ticket_key_ready": catalogManager.TicketKeyReady(), "registration": reg.Status(), "remote_print_completions": completionStatus})
+		nasStatus := storageRuntime.Status(c.Request.Context())
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "mode": "proxy", "backend_version": version.Version, "backend_commit": version.Commit, "edge_api_version": version.APIVersion, "center": proxyHandler.CenterStatus(), "cache": responseCache.Status(), "catalog": catalogStatus, "catalog_media_cache": mediaCache.Status(), "catalog_ticket_key_ready": catalogManager.TicketKeyReady(), "registration": reg.Status(), "remote_print_completions": completionStatus, "nas_storage": nasStatus, "optional_components": gin.H{"nas_storage": nasStatus}})
 	})
 	router.GET("/edge/probe", func(c *gin.Context) {
 		terminals.recordProbe(c.ClientIP(), c.Request.UserAgent(), c.GetHeader("X-Edge-Terminal-Name"))
@@ -185,16 +247,17 @@ func main() {
 		serveCatalogMedia(c, catalogManager, mediaCache, cfg.NamespaceID)
 	})
 	router.GET("/api/box-labels", func(c *gin.Context) {
-		serveCatalogBoxLabels(c, catalogManager, proxyHandler, centerRecentlyReachable(proxyHandler, reg))
+		serveCatalogBoxLabels(c, catalogManager, proxyHandler)
 	})
 	router.GET("/api/box-labels/:id/resolve", func(c *gin.Context) {
-		serveCatalogBoxLabelResolve(c, catalogManager, proxyHandler, centerRecentlyReachable(proxyHandler, reg))
+		serveCatalogBoxLabelResolve(c, catalogManager, proxyHandler)
 	})
 	router.GET("/api/box-labels/:id", func(c *gin.Context) {
-		serveCatalogBoxLabel(c, catalogManager, proxyHandler, centerRecentlyReachable(proxyHandler, reg))
+		serveCatalogBoxLabel(c, catalogManager, proxyHandler)
 	})
 
 	admin := router.Group("/edge", adminMiddleware(cfg.AdminToken))
+	registerStorageRoutes(admin, storageRuntime)
 	admin.GET("/capabilities", func(c *gin.Context) {
 		catalogStatus, _ := catalogManager.Status()
 		c.JSON(http.StatusOK, gin.H{"capabilities": catalogCapabilities(catalogStatus)})
@@ -209,7 +272,7 @@ func main() {
 	})
 	admin.POST("/catalog/refresh", func(c *gin.Context) {
 		go func() { _ = catalogManager.RefreshFull(context.Background()) }()
-		c.JSON(http.StatusAccepted, gin.H{"status": "syncing"})
+		c.JSON(http.StatusAccepted, gin.H{"status": "syncing", "mode": "full"})
 	})
 	admin.GET("/catalog/products/search", func(c *gin.Context) {
 		page, ok := readCatalogPage(c)
@@ -355,9 +418,11 @@ func main() {
 			c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PRINT_INVENTORY"})
 			return
 		}
-		availability.Set(payload.Printers)
-		go reg.SyncNow(context.Background())
-		c.JSON(http.StatusOK, gin.H{"printers": len(payload.Printers)})
+		changed := availability.Set(payload.Printers)
+		if changed {
+			go reg.SyncNow(context.Background())
+		}
+		c.JSON(http.StatusOK, gin.H{"printers": len(payload.Printers), "changed": changed})
 	})
 	router.GET("/edge/print-templates", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"templates": printer.Templates()}) })
 	admin.POST("/print-templates", func(c *gin.Context) {
@@ -501,8 +566,26 @@ func main() {
 	}()
 	fmt.Printf("FSCM edge proxy %s listening on %s\n", version.Version, server.Addr)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		panic(err)
+		return err
 	}
+	return nil
+}
+
+func cleanupNASSystemObjects(configPath string) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	store, err := storage.Open(cfg.JobsPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = store.Close() }()
+	manager, err := storage.NewManager(store, cfg.NodeID, storage.NewSystemProvisioner())
+	if err != nil {
+		return err
+	}
+	return manager.RemoveSystemObjects(context.Background())
 }
 
 func startServiceAdvertisement(ctx context.Context, cfg *config.Config) {
@@ -1081,7 +1164,7 @@ func serveCatalogProducts(c *gin.Context, catalogManager *catalog.Manager, proxy
 	status, err := catalogManager.Status()
 	if err == nil && status.Ready && localCompatible {
 		items, total, searchErr := catalogManager.SearchProductsPage(c.Query("keyword"), page)
-		if searchErr == nil && (len(items) > 0 || strings.TrimSpace(c.Query("keyword")) == "") {
+		if searchErr == nil {
 			writeCatalogPageState(c, items, total, page, "CATALOG-HIT")
 			return
 		}
@@ -1126,7 +1209,7 @@ func serveCatalogSKUs(c *gin.Context, catalogManager *catalog.Manager, proxyHand
 			matchMode,
 			catalog.PageFilter{Page: 1, PageSize: 100},
 		)
-		if searchErr == nil && len(items) > 0 {
+		if searchErr == nil {
 			writeCatalogList(c, items)
 			return
 		}
@@ -1212,7 +1295,7 @@ func validMediaVersion(version string) bool {
 	return true
 }
 
-func serveCatalogBoxLabels(c *gin.Context, catalogManager *catalog.Manager, proxyHandler *edgeproxy.Handler, confirmCenter bool) {
+func serveCatalogBoxLabels(c *gin.Context, catalogManager *catalog.Manager, proxyHandler *edgeproxy.Handler) {
 	filter, ok := readBoxLabelFilter(c)
 	if !ok {
 		return
@@ -1225,9 +1308,6 @@ func serveCatalogBoxLabels(c *gin.Context, catalogManager *catalog.Manager, prox
 		proxyHandler.ServeHTTP(c.Writer, c.Request)
 		return
 	}
-	if confirmCenter && catalogManager.ConfirmChangesIfDue(30*time.Second) {
-		c.Header("X-FSCM-Catalog-Refresh", "scheduled")
-	}
 	items, total, err := catalogManager.SearchBoxLabels(filter)
 	if err != nil {
 		proxyHandler.ServeHTTP(c.Writer, c.Request)
@@ -1238,7 +1318,7 @@ func serveCatalogBoxLabels(c *gin.Context, catalogManager *catalog.Manager, prox
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"data": items, "total": total, "page": filter.Page, "page_size": filter.PageSize}, "msg": "ok"})
 }
 
-func serveCatalogBoxLabel(c *gin.Context, catalogManager *catalog.Manager, proxyHandler *edgeproxy.Handler, confirmCenter bool) {
+func serveCatalogBoxLabel(c *gin.Context, catalogManager *catalog.Manager, proxyHandler *edgeproxy.Handler) {
 	if !catalogRequestAuthorized(c, catalogManager, proxyHandler) {
 		return
 	}
@@ -1252,9 +1332,6 @@ func serveCatalogBoxLabel(c *gin.Context, catalogManager *catalog.Manager, proxy
 		proxyHandler.ServeHTTP(c.Writer, c.Request)
 		return
 	}
-	if confirmCenter && catalogManager.ConfirmChangesIfDue(30*time.Second) {
-		c.Header("X-FSCM-Catalog-Refresh", "scheduled")
-	}
 	item, err := catalogManager.GetBoxLabel(uint(id))
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"code": http.StatusNotFound, "data": nil, "msg": "box label not found"})
@@ -1265,7 +1342,7 @@ func serveCatalogBoxLabel(c *gin.Context, catalogManager *catalog.Manager, proxy
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": item, "msg": "ok"})
 }
 
-func serveCatalogBoxLabelResolve(c *gin.Context, catalogManager *catalog.Manager, proxyHandler *edgeproxy.Handler, confirmCenter bool) {
+func serveCatalogBoxLabelResolve(c *gin.Context, catalogManager *catalog.Manager, proxyHandler *edgeproxy.Handler) {
 	if !catalogRequestAuthorized(c, catalogManager, proxyHandler) {
 		return
 	}
@@ -1273,9 +1350,6 @@ func serveCatalogBoxLabelResolve(c *gin.Context, catalogManager *catalog.Manager
 	if err != nil || !status.Ready || !status.BoxLabelsReady {
 		proxyHandler.ServeHTTP(c.Writer, c.Request)
 		return
-	}
-	if confirmCenter && catalogManager.ConfirmChangesIfDue(30*time.Second) {
-		c.Header("X-FSCM-Catalog-Refresh", "scheduled")
 	}
 	item, err := catalogManager.ResolveBoxLabel(c.Param("id"))
 	if err != nil {
@@ -1289,6 +1363,7 @@ func serveCatalogBoxLabelResolve(c *gin.Context, catalogManager *catalog.Manager
 
 func buildBoxLabelResolvePayload(item *catalog.BoxLabel) gin.H {
 	valid := boxLabelStatusActive(item.Status) && item.Receiving.ReceivingRecord == nil
+	printable := item.PrintSnapshot != nil
 	warningCode, warningMessage := "", ""
 	warnings := make([]string, 0, 2)
 	if !boxLabelStatusActive(item.Status) {
@@ -1310,7 +1385,7 @@ func buildBoxLabelResolvePayload(item *catalog.BoxLabel) gin.H {
 		supplierOrder["purchase_order"] = item.PurchaseOrder
 	}
 	payload := gin.H{
-		"id": item.ID, "printable": item.Printable, "print_snapshot": item.PrintSnapshot,
+		"id": item.ID, "printable": printable, "print_snapshot": item.PrintSnapshot,
 		"recognized": true, "valid_for_current_context": valid,
 		"box_uid": item.BoxUID, "label_code": item.LabelCode, "box_no": item.BoxNo,
 		"status": item.Status, "tracking_status": item.Status,
@@ -1362,14 +1437,6 @@ func boxLabelStatusActive(status string) bool {
 	default:
 		return true
 	}
-}
-
-func centerRecentlyReachable(proxyHandler *edgeproxy.Handler, reg *registry.Client) bool {
-	if proxyHandler.CenterStatus().Reachable {
-		return true
-	}
-	status := reg.Status()
-	return status.LastError == "" && !status.LastSuccessAt.IsZero() && time.Since(status.LastSuccessAt) < 2*time.Minute
 }
 
 func isCompatibleCatalogSearch(c *gin.Context, sku bool) bool {
@@ -1425,7 +1492,7 @@ func writeCatalogObject(c *gin.Context, item interface{}, state string) {
 }
 
 func catalogCapabilities(status catalog.Status) []string {
-	capabilities := []string{"proxy", "adaptive_cache", "local_print", "print_templates", "batch_print_v1"}
+	capabilities := []string{"proxy", "adaptive_cache", "local_print", "print_templates", "batch_print_v1", "nas_storage_smb_v1"}
 	if status.Ready {
 		capabilities = append(capabilities, "catalog_cache", "catalog_media_cache")
 	}
@@ -1456,7 +1523,10 @@ func adminMiddleware(token string) gin.HandlerFunc {
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"code": "EDGE_ADMIN_UNAUTHORIZED"})
 	}
 }
-func localIPv4() string {
+func localIPv4(centerURL string) string {
+	if address := routedIPv4ForCenter(centerURL); address != "" {
+		return address
+	}
 	type candidate struct {
 		ip    net.IP
 		score int
@@ -1496,6 +1566,33 @@ func localIPv4() string {
 	return best.ip.String()
 }
 
+// routedIPv4ForCenter asks the operating system which local address it would
+// use to reach the center. This avoids advertising VPN and virtual-adapter
+// addresses when a physical LAN adapter is also present.
+func routedIPv4ForCenter(centerURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(centerURL))
+	if err != nil || parsed.Hostname() == "" {
+		return ""
+	}
+	port := parsed.Port()
+	if port == "" {
+		if strings.EqualFold(parsed.Scheme, "https") {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	connection, err := net.DialTimeout("udp4", net.JoinHostPort(parsed.Hostname(), port), 500*time.Millisecond)
+	if err != nil {
+		return ""
+	}
+	defer connection.Close()
+	address, ok := connection.LocalAddr().(*net.UDPAddr)
+	if !ok || !isPublishableLANIPv4(address.IP) {
+		return ""
+	}
+	return address.IP.To4().String()
+}
 func isPublishableLANIPv4(ip net.IP) bool {
 	return ip != nil && !ip.IsLoopback() && !ip.IsUnspecified() && !ip.IsMulticast() && !ip.IsLinkLocalUnicast()
 }

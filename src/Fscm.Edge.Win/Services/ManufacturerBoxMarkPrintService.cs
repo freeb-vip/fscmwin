@@ -296,28 +296,32 @@ public sealed class ManufacturerBoxMarkPrintService
             StringComparison.Ordinal))
         {
             return source
-                .Where(label => label.PrintSnapshot is not null)
-                .Select(label => label.PrintSnapshot!)
+                .Select(label => label.PrintSnapshot
+                    ?? throw new InvalidOperationException($"箱唛 {label.LabelCode} 缺少完整打印快照，请改用横向四码简化模板。"))
                 .ToList();
         }
 
         List<ManufacturerBoxMark> pages = [];
         foreach (BoxLabelSummary label in source)
         {
-            ManufacturerBoxMark snapshot = label.PrintSnapshot
-                ?? throw new InvalidOperationException($"箱唛 {label.LabelCode} 缺少打印快照。");
             if (label.SkuItems.Count == 0)
             {
                 throw new InvalidOperationException($"箱唛 {label.LabelCode} 缺少 SKU 明细，无法使用横向四码模板。");
             }
 
+            ManufacturerBoxMark baseMark = label.PrintSnapshot is null
+                ? CreateSimplifiedMark(label)
+                : CloneMark(label.PrintSnapshot);
             foreach (BoxLabelSkuItem sku in label.SkuItems)
             {
                 string skuCode = sku.SkuCode.Trim();
                 string skuName = FirstNonEmpty(sku.SkuName, sku.ProductName, skuCode);
-                ManufacturerBoxMark page = CloneMark(snapshot);
-                page.Shop = FirstNonEmpty(snapshot.Shop, label.LabelCode, label.BoxUid);
-                page.BoxUid = FirstNonEmpty(snapshot.BoxUid, label.BoxUid);
+                ManufacturerBoxMark page = CloneMark(baseMark);
+                page.Shop = FirstNonEmpty(baseMark.Shop, label.LabelCode, label.BoxUid, label.BoxNo);
+                page.BoxUid = FirstNonEmpty(baseMark.BoxUid, label.BoxUid);
+                page.InboundCode = FirstNonEmpty(baseMark.InboundCode, label.BoxNo);
+                page.BoxQrPayload = FirstNonEmpty(baseMark.BoxQrPayload, label.LabelCode, label.BoxUid, label.BoxNo);
+                page.StyleCode = FirstNonEmpty(baseMark.StyleCode, sku.ProductCode, skuCode);
                 page.SkuCode = skuCode;
                 page.SkuName = skuName;
                 page.QuantityPerBox = sku.QuantityPerBox;
@@ -328,6 +332,20 @@ public sealed class ManufacturerBoxMarkPrintService
             }
         }
         return pages;
+    }
+
+    private static ManufacturerBoxMark CreateSimplifiedMark(BoxLabelSummary label)
+    {
+        string boxCode = FirstNonEmpty(label.LabelCode, label.BoxUid, label.BoxNo);
+        return new ManufacturerBoxMark
+        {
+            BoxPlanId = label.Id,
+            Shop = boxCode,
+            Spec = label.CaseSpecName,
+            BoxQrPayload = boxCode,
+            BoxUid = label.BoxUid,
+            InboundCode = label.BoxNo,
+        };
     }
 
     private static ManufacturerBoxMark CloneMark(ManufacturerBoxMark source)

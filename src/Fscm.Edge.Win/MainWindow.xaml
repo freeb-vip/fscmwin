@@ -214,6 +214,7 @@
           <ListBoxItem Tag="BatchPrint">批量打印</ListBoxItem>
           <ListBoxItem Tag="Print">打印任务</ListBoxItem>
           <ListBoxItem Tag="PrintConfig">打印配置</ListBoxItem>
+          <ListBoxItem Tag="Storage">NAS 存储</ListBoxItem>
           <ListBoxItem Tag="Advanced">高级设置</ListBoxItem>
         </ListBox>
       </DockPanel>
@@ -1140,9 +1141,9 @@
                 <DockPanel>
                   <StackPanel DockPanel.Dock="Left">
                     <TextBlock FontSize="18" FontWeight="SemiBold" Text="产品管理" />
-                    <TextBlock Margin="0,6,0,14" Foreground="{StaticResource MutedTextBrush}" Text="优先查询本地产品和 SKU，本地无结果时自动从中心同步；选择 SKU 后可直接打印。" />
+                    <TextBlock Margin="0,6,0,14" Foreground="{StaticResource MutedTextBrush}" Text="产品和 SKU 优先使用本地增量目录；选择 SKU 后可直接打印。" />
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
-                      <Button Click="OnRefreshCatalogClick" Content="刷新目录" />
+                      <Button Click="OnRefreshCatalogClick" Content="手动全量刷新" />
                       <TextBlock x:Name="CatalogStatusText" Margin="10,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" Text="本地目录等待同步" />
                     </StackPanel>
                   </StackPanel>
@@ -1249,7 +1250,7 @@
                     <TextBlock FontSize="18" FontWeight="SemiBold" Text="箱唛查询" />
                     <TextBlock Margin="0,6,0,0" Foreground="{StaticResource MutedTextBrush}" Text="本地查询箱唛、产品和 SKU；集运订单候选项从中心在线获取。" />
                   </StackPanel>
-                  <Button DockPanel.Dock="Right" Click="OnRefreshCatalogClick" Content="同步本地数据" />
+                  <Button DockPanel.Dock="Right" Click="OnRefreshCatalogClick" Content="手动全量刷新" />
                 </DockPanel>
 
                 <Grid Margin="0,0,0,10">
@@ -1415,6 +1416,94 @@
                 </StackPanel>
               </Border>
             </Grid>
+          </StackPanel>
+        </ScrollViewer>
+
+        <ScrollViewer x:Name="StoragePage" Visibility="Collapsed" VerticalScrollBarVisibility="Auto">
+          <StackPanel Margin="28">
+            <Border Style="{StaticResource CardStyle}">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <StackPanel>
+                  <TextBlock FontSize="18" FontWeight="SemiBold" Text="SMB 录像存储" />
+                  <TextBlock x:Name="StorageStatusDetailText" Margin="0,7,18,0" Foreground="{StaticResource MutedTextBrush}" Text="等待本地服务状态" TextWrapping="Wrap" />
+                </StackPanel>
+                <Border x:Name="StorageStatusBadge" Grid.Column="1" MinWidth="100" Padding="12,7" Background="#E2E8F0" CornerRadius="6">
+                  <TextBlock x:Name="StorageStatusText" HorizontalAlignment="Center" FontWeight="SemiBold" Foreground="#475569" Text="未配置" />
+                </Border>
+              </Grid>
+            </Border>
+
+            <Border Style="{StaticResource CardStyle}" Margin="0,18,0,0">
+              <StackPanel>
+                <CheckBox x:Name="StorageEnabledCheckBox" FontWeight="SemiBold" Content="启用 NAS 录像共享" />
+                <CheckBox x:Name="StorageXiaomiCompatibilityCheckBox" Margin="0,14,0,0" FontWeight="SemiBold" Content="小米摄像头兼容模式（SMB2/3）" />
+                <Border Margin="0,8,0,0" Padding="10" Background="#FFF7ED" BorderBrush="#FDBA74" BorderThickness="1" CornerRadius="4">
+                  <TextBlock Foreground="#9A3412" Text="此模式会修改整台电脑的 SMB 服务端签名要求。SMB1、访客访问和匿名访问仍保持关闭。" TextWrapping="Wrap" />
+                </Border>
+                <Grid Margin="0,18,0,0">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                  </Grid.ColumnDefinitions>
+                  <StackPanel>
+                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="本地存储目录" />
+                    <TextBox x:Name="StoragePathTextBox" Margin="0,6,0,0" />
+                  </StackPanel>
+                  <Button Grid.Column="1" Margin="10,25,0,0" Click="OnBrowseStoragePathClick" Content="选择目录" />
+                </Grid>
+                <Grid Margin="0,16,0,0">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="*" />
+                  </Grid.ColumnDefinitions>
+                  <StackPanel Grid.Column="0" Margin="0,0,10,0">
+                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="循环保留天数（1-90）" />
+                    <TextBox x:Name="StorageRetentionDaysTextBox" Margin="0,6,0,0" Text="7" />
+                  </StackPanel>
+                  <StackPanel Grid.Column="1" Margin="10,0,0,0">
+                    <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="最低剩余空间（GB）" />
+                    <TextBox x:Name="StorageReserveFreeTextBox" Margin="0,6,0,0" Text="10" />
+                  </StackPanel>
+                </Grid>
+                <StackPanel Margin="0,18,0,0" Orientation="Horizontal">
+                  <Button x:Name="StorageSaveButton" Click="OnSaveStorageClick" Content="保存并应用" Style="{StaticResource PrimaryButtonStyle}" />
+                  <Button Margin="8,0,0,0" Click="OnOpenStoragePathClick" Content="打开目录" />
+                  <Button Margin="8,0,0,0" Click="OnRunStorageCleanupClick" Content="立即清理" />
+                </StackPanel>
+              </StackPanel>
+            </Border>
+
+            <Border Style="{StaticResource CardStyle}" Margin="0,18,0,0">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0" Margin="0,0,20,0">
+                  <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="NAS 地址" />
+                  <TextBlock x:Name="StorageSharePathsText" Margin="0,6,0,0" FontWeight="SemiBold" Text="-" TextWrapping="Wrap" />
+                  <Button Margin="0,12,0,0" HorizontalAlignment="Left" Click="OnCopyStorageAddressClick" Content="复制首选地址" />
+                  <TextBlock Margin="0,18,0,0" Foreground="{StaticResource MutedTextBrush}" Text="访问账号" />
+                  <TextBlock x:Name="StorageUsernameText" Margin="0,6,0,0" FontWeight="SemiBold" Text="首次启用成功后自动生成" TextWrapping="Wrap" />
+                  <Button Margin="0,12,0,0" HorizontalAlignment="Left" Click="OnResetStoragePasswordClick" Content="重置密码" />
+                </StackPanel>
+                <StackPanel Grid.Column="1">
+                  <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="SMB 兼容状态" />
+                  <TextBlock x:Name="StorageSmbProtocolText" Margin="0,6,0,0" FontWeight="SemiBold" Text="-" TextWrapping="Wrap" />
+                  <TextBlock x:Name="StorageNetworkSecurityText" Margin="0,6,0,18" Foreground="{StaticResource MutedTextBrush}" Text="-" TextWrapping="Wrap" />
+                  <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="磁盘容量" />
+                  <TextBlock x:Name="StorageCapacityText" Margin="0,6,0,0" FontWeight="SemiBold" Text="-" TextWrapping="Wrap" />
+                  <TextBlock Margin="0,18,0,0" Foreground="{StaticResource MutedTextBrush}" Text="最近写入" />
+                  <TextBlock x:Name="StorageLastWriteText" Margin="0,6,0,0" Text="-" />
+                  <TextBlock Margin="0,18,0,0" Foreground="{StaticResource MutedTextBrush}" Text="最近清理" />
+                  <TextBlock x:Name="StorageLastCleanupText" Margin="0,6,0,0" Text="-" TextWrapping="Wrap" />
+                </StackPanel>
+              </Grid>
+            </Border>
           </StackPanel>
         </ScrollViewer>
 

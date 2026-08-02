@@ -94,6 +94,8 @@ public partial class MainWindow : Window
     private bool _checkingForUpdates;
     private bool _updatePromptShown;
     private bool _loadingStartupSetting;
+    private EdgeStorageConfig? _storageConfig;
+    private bool _storageBusy;
 
     public MainWindow()
     {
@@ -211,7 +213,7 @@ public partial class MainWindow : Window
         _printQueueTimer.Stop();
         _notifyIcon.Visible = false;
         _notifyIcon.Dispose();
-        await _runtime.StopAsync();
+        await _runtime.StopOwnedProcessAsync();
         _runtime.Dispose();
         _updates.Dispose();
         Close();
@@ -390,19 +392,19 @@ public partial class MainWindow : Window
 
     private async void OnStartClick(object sender, RoutedEventArgs e)
     {
-        await StartRuntimeAsync();
+        ApplyRuntimeStatus(await _runtime.StartManagedAsync());
         await RefreshAllAsync(forceRemoteCheck: true);
     }
 
     private async void OnStopClick(object sender, RoutedEventArgs e)
     {
-        await _runtime.StopAsync();
+        await _runtime.StopManagedAsync();
         await RefreshAllAsync();
     }
 
     private async void OnRestartClick(object sender, RoutedEventArgs e)
     {
-        await _runtime.RestartAsync();
+        await _runtime.RestartManagedAsync();
         await RefreshAllAsync(forceRemoteCheck: true);
     }
 
@@ -1026,12 +1028,18 @@ public partial class MainWindow : Window
             BatchPrintStatusText.Text = result.Message;
             return;
         }
-        List<CenterPrintBatch> batches = result.Data.Where(batch => batch.EdgeNodeId == _batchCenterNodeId).ToList();
+
+        ApplyBatchHistory(result.Data);
+    }
+
+    private void ApplyBatchHistory(IReadOnlyList<CenterPrintBatch> values)
+    {
+        List<CenterPrintBatch> batches = values.Where(batch => batch.EdgeNodeId == _batchCenterNodeId).ToList();
         BatchHistoryGrid.ItemsSource = batches;
         _activePrintBatch = _printingBatchId is uint printingBatchId
             ? batches.FirstOrDefault(batch => batch.Id == printingBatchId && IsActiveBatchStatus(batch.Status))
             : batches.FirstOrDefault(batch => IsActiveBatchStatus(batch.Status));
-        BatchStopButton.IsEnabled = !_batchPrintBusy && _activePrintBatch is not null;
+        UpdateBatchPrintActionState();
     }
 
     private BatchPrintRequest BuildBatchPrintRequest()
@@ -1134,14 +1142,18 @@ public partial class MainWindow : Window
     {
         _batchPrintBusy = busy;
         BatchPreviewButton.IsEnabled = !busy;
-        BatchSubmitButton.IsEnabled = !busy && _batchPreviewItems.Count > 0 && _activePrintBatch is null && !_printingBatchId.HasValue;
-        BatchStopButton.IsEnabled = !busy && _activePrintBatch is not null;
+        UpdateBatchPrintActionState();
+    }
+
+    private void UpdateBatchPrintActionState()
+    {
+        BatchSubmitButton.IsEnabled = !_batchPrintBusy && _batchPreviewItems.Count > 0 && _activePrintBatch is null && !_printingBatchId.HasValue;
+        BatchStopButton.IsEnabled = !_batchPrintBusy && _activePrintBatch is not null;
     }
 
     private static bool IsActiveBatchStatus(string? status)
     {
-        return string.Equals(status, "running", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(status, "paused", StringComparison.OrdinalIgnoreCase);
+        return PrintJobDispatchPolicy.IsActiveBatchStatus(status);
     }
 
     private string SelectedBatchSource()
@@ -1311,6 +1323,312 @@ public partial class MainWindow : Window
         SetPage(tag);
     }
 
+    private async Task LoadStoragePageAsync(bool forceConfig)
+    {
+        if (_storageBusy)
+        {
+            return;
+        }
+
+        try
+        {
+            _storageBusy = true;
+            EdgeStorageStatus? storageStatus = await _runtime.GetStorageStatusAsync();
+            ApplyStorageStatus(storageStatus);
+            if (storageStatus is null || string.Equals(storageStatus.State, "degraded", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            if (forceConfig || _storageConfig is null)
+            {
+                EdgeStorageConfigResponse response = await _runtime.GetStorageConfigAsync();
+                _storageConfig = response.Config;
+                StorageEnabledCheckBox.IsChecked = response.Config.Enabled;
+                StorageXiaomiCompatibilityCheckBox.IsChecked = string.Equals(response.Config.SmbCompatibilityMode, "xiaomi_smb2", StringComparison.Ordinal);
+                StoragePathTextBox.Text = response.Config.LocalPath;
+                StorageRetentionDaysTextBox.Text = response.Config.RetentionDays.ToString(CultureInfo.InvariantCulture);
+                StorageReserveFreeTextBox.Text = response.Config.ReserveFreeGigabytes.ToString(CultureInfo.InvariantCulture);
+                StorageUsernameText.Text = string.IsNullOrWhiteSpace(response.Config.Username) ? "首次启用成功后自动生成" : response.Config.Username;
+                StorageSharePathsText.Text = response.SharePaths.Count == 0 ? "-" : string.Join(Environment.NewLine, response.SharePaths);
+            }
+        }
+        catch (Exception ex)
+        {
+            SetBadge(StorageStatusBadge, StorageStatusText, "不可用", BadgeKind.Error);
+            StorageStatusDetailText.Text = ex.Message;
+        }
+        finally
+        {
+            _storageBusy = false;
+        }
+    }
+
+    private async void OnSaveStorageClick(object sender, RoutedEventArgs e)
+    {
+        if (_storageBusy)
+        {
+            return;
+        }
+
+        if (!int.TryParse(StorageRetentionDaysTextBox.Text.Trim(), out int retentionDays) || retentionDays is < 1 or > 90)
+        {
+            MessageBox.Show("循环保留天数需为 1-90。", "NAS 存储", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        if (!int.TryParse(StorageReserveFreeTextBox.Text.Trim(), out int reserveFree) || reserveFree is < 1 or > 1024)
+        {
+            MessageBox.Show("最低剩余空间需为 1-1024 GB。", "NAS 存储", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        string requestedPath = StoragePathTextBox.Text.Trim();
+        bool enabled = StorageEnabledCheckBox.IsChecked == true;
+        bool xiaomiCompatibility = StorageXiaomiCompatibilityCheckBox.IsChecked == true;
+        bool enablingCompatibility = xiaomiCompatibility &&
+            !string.Equals(_storageConfig?.SmbCompatibilityMode, "xiaomi_smb2", StringComparison.Ordinal);
+        if (enablingCompatibility)
+        {
+            string passwordNotice = !enabled
+                ? "NAS 当前关闭，只保存兼容模式；系统策略会在下次启用 NAS 时应用。"
+                : string.IsNullOrWhiteSpace(_storageConfig?.Username)
+                    ? "首次启用成功后会生成一次性 NAS 凭据。"
+                    : "现有 NAS 密码将自动重置，所有设备都需要使用新密码重新连接。";
+            MessageBoxResult compatibilityChoice = MessageBox.Show(
+                $"小米兼容模式会修改整台电脑的 SMB 服务端签名要求。{Environment.NewLine}{Environment.NewLine}{passwordNotice}{Environment.NewLine}{Environment.NewLine}SMB1、访客访问和匿名访问仍保持关闭。是否继续？",
+                "启用小米摄像头兼容模式",
+                MessageBoxButton.OKCancel,
+                MessageBoxImage.Warning);
+            if (compatibilityChoice != MessageBoxResult.OK)
+            {
+                return;
+            }
+        }
+        if (enabled && string.IsNullOrWhiteSpace(requestedPath))
+        {
+            MessageBox.Show("启用 NAS 存储前请选择本地目录。", "NAS 存储", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        if (_storageConfig is { Enabled: true } current &&
+            !string.IsNullOrWhiteSpace(current.LocalPath) &&
+            !string.IsNullOrWhiteSpace(requestedPath) &&
+            !StoragePathsEqual(current.LocalPath, requestedPath) &&
+            HasDirectoryEntries(current.LocalPath))
+        {
+            MessageBoxResult choice = MessageBox.Show(
+                $"共享将切换到新目录，旧录像不会迁移或删除。\n\n旧目录：{current.LocalPath}",
+                "切换 NAS 存储目录",
+                MessageBoxButton.OKCancel,
+                MessageBoxImage.Warning);
+            if (choice != MessageBoxResult.OK)
+            {
+                return;
+            }
+        }
+
+        try
+        {
+            SetStorageBusy(true);
+            EdgeStorageApplyResponse response = await _runtime.SaveStorageConfigAsync(new EdgeStorageConfig
+            {
+                Enabled = enabled,
+                LocalPath = requestedPath,
+                RetentionDays = retentionDays,
+                ReserveFreeGigabytes = reserveFree,
+                SmbCompatibilityMode = xiaomiCompatibility ? "xiaomi_smb2" : "system_default",
+            });
+            _storageConfig = response.Config;
+            StorageXiaomiCompatibilityCheckBox.IsChecked = string.Equals(response.Config.SmbCompatibilityMode, "xiaomi_smb2", StringComparison.Ordinal);
+            ApplyStorageStatus(response.Status);
+            StorageUsernameText.Text = string.IsNullOrWhiteSpace(response.Config.Username) ? "首次启用成功后自动生成" : response.Config.Username;
+            StorageSharePathsText.Text = response.Status.SharePaths.Count == 0 ? "-" : string.Join(Environment.NewLine, response.Status.SharePaths);
+            if (response.Credentials is not null)
+            {
+                ShowStorageCredentials(response.Credentials);
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(ex.Message, "NAS 配置失败", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            SetStorageBusy(false);
+        }
+    }
+
+    private void OnBrowseStoragePathClick(object sender, RoutedEventArgs e)
+    {
+        using var dialog = new System.Windows.Forms.FolderBrowserDialog
+        {
+            Description = "选择 NAS 录像存储目录",
+            UseDescriptionForTitle = true,
+            InitialDirectory = Directory.Exists(StoragePathTextBox.Text.Trim()) ? StoragePathTextBox.Text.Trim() : string.Empty,
+        };
+        if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
+        {
+            StoragePathTextBox.Text = dialog.SelectedPath;
+        }
+    }
+
+    private void OnOpenStoragePathClick(object sender, RoutedEventArgs e)
+    {
+        string path = StoragePathTextBox.Text.Trim();
+        if (Directory.Exists(path))
+        {
+            OpenPath(path);
+        }
+    }
+
+    private void OnCopyStorageAddressClick(object sender, RoutedEventArgs e)
+    {
+        string address = StorageSharePathsText.Text.Split(["\r\n", "\n"], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? string.Empty;
+        if (!string.IsNullOrWhiteSpace(address) && address != "-")
+        {
+            Clipboard.SetText(address);
+        }
+    }
+
+    private async void OnRunStorageCleanupClick(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            await _runtime.TriggerStorageCleanupAsync();
+            StorageStatusDetailText.Text = "清理任务已启动。";
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(ex.Message, "NAS 清理", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private async void OnResetStoragePasswordClick(object sender, RoutedEventArgs e)
+    {
+        if (MessageBox.Show("重置后，所有监控设备都需要更新 NAS 密码。", "重置 NAS 密码", MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK)
+        {
+            return;
+        }
+
+        try
+        {
+            SetStorageBusy(true);
+            ShowStorageCredentials(await _runtime.ResetStorageCredentialsAsync());
+            _storageConfig = null;
+            SetStorageBusy(false);
+            await LoadStoragePageAsync(forceConfig: true);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(ex.Message, "重置 NAS 密码失败", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            SetStorageBusy(false);
+        }
+    }
+
+    private void ApplyStorageStatus(EdgeStorageStatus? status)
+    {
+        if (status is null)
+        {
+            SetBadge(StorageStatusBadge, StorageStatusText, "不可用", BadgeKind.Error);
+            StorageStatusDetailText.Text = "本地服务未返回 NAS 状态。";
+            return;
+        }
+
+        BadgeKind badge = status.State switch
+        {
+            "ready" => BadgeKind.Success,
+            "disabled" => BadgeKind.Neutral,
+            "critical" => BadgeKind.Error,
+            "degraded" => BadgeKind.Warning,
+            _ => BadgeKind.Warning,
+        };
+        string text = status.State switch
+        {
+            "ready" => "运行正常",
+            "disabled" => "未启用",
+            "critical" => "空间告警",
+            "degraded" => "服务运行，NAS 降级",
+            _ => "配置异常",
+        };
+        SetBadge(StorageStatusBadge, StorageStatusText, text, badge);
+        StorageStatusDetailText.Text = string.IsNullOrWhiteSpace(status.Error)
+            ? status.Ready ? "SMB 共享、专用账号和局域网防火墙均已就绪。" : "NAS 存储尚未启用。"
+            : status.Error;
+        StorageSharePathsText.Text = status.SharePaths.Count == 0 ? "-" : string.Join(Environment.NewLine, status.SharePaths);
+        StorageUsernameText.Text = string.IsNullOrWhiteSpace(status.Username) ? "首次启用成功后自动生成" : status.Username;
+        StorageSmbProtocolText.Text = $"SMB1 {(status.Smb1Enabled ? "已启用（不兼容）" : "已关闭")} · SMB2/3 {(status.Smb2Enabled ? "已启用" : "未启用")}";
+        string signingState = status.SmbSigningRequired ? "强制签名" : "不强制签名";
+        string compatibilityState = status.SmbCompatibilityMode == "xiaomi_smb2"
+            ? status.CompatibilityReady ? "小米兼容已就绪" : "小米兼容未就绪"
+            : "系统默认模式";
+        StorageNetworkSecurityText.Text = $"{signingState} · 防火墙 {(status.FirewallReady ? "局域网规则正常" : "规则异常")} · {compatibilityState}";
+        StorageCapacityText.Text = status.VolumeTotalBytes > 0
+            ? $"可用 {FormatBytes(status.VolumeFreeBytes)} / 共 {FormatBytes(status.VolumeTotalBytes)}"
+            : "-";
+        StorageLastWriteText.Text = status.LastWriteAt?.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) ?? "-";
+        StorageLastCleanupText.Text = status.LastCleanup is null
+            ? "-"
+            : $"{status.LastCleanup.FinishedAt.ToLocalTime():yyyy-MM-dd HH:mm:ss} · 删除 {status.LastCleanup.DeletedFiles} 个文件 · 释放 {FormatBytes(status.LastCleanup.FreedBytes)}";
+    }
+
+    private void SetStorageBusy(bool busy)
+    {
+        _storageBusy = busy;
+        StorageSaveButton.IsEnabled = !busy;
+    }
+
+    private void ShowStorageCredentials(EdgeStorageCredentials credentials)
+    {
+        var window = new StorageCredentialsWindow(credentials) { Owner = this };
+        window.ShowDialog();
+    }
+
+    private static bool HasDirectoryEntries(string path)
+    {
+        try
+        {
+            return Directory.Exists(path) && Directory.EnumerateFileSystemEntries(path).Any();
+        }
+        catch (IOException)
+        {
+            return true;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return true;
+        }
+    }
+
+    private static bool StoragePathsEqual(string left, string right)
+    {
+        try
+        {
+            return string.Equals(Path.GetFullPath(left), Path.GetFullPath(right), StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
+        }
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        string[] units = ["B", "KB", "MB", "GB", "TB"];
+        double value = Math.Max(0, bytes);
+        int unit = 0;
+        while (value >= 1024 && unit < units.Length - 1)
+        {
+            value /= 1024;
+            unit++;
+        }
+
+        return $"{value:0.##} {units[unit]}";
+    }
+
     private void MoveRemoteSettingsIntoAdvancedPage()
     {
         if (RemotePage.Parent is Panel parent)
@@ -1385,6 +1703,10 @@ public partial class MainWindow : Window
             await RefreshTerminalsAsync();
             await RefreshPrintJobsAsync();
             await RefreshCacheStatusAsync();
+            if (StoragePage.Visibility == Visibility.Visible)
+            {
+                await LoadStoragePageAsync(forceConfig: false);
+            }
             succeeded = true;
             return true;
         }
@@ -1558,13 +1880,22 @@ public partial class MainWindow : Window
 
                     BatchPrintResult<IReadOnlyList<CenterPrintBatch>> batches = await _runtime.GetCenterPrintBatchesAsync();
                     CenterPrintBatch? activeBatch = batches.Data?.FirstOrDefault(batch => batch.Id == activeBatchId);
-                    if (!batches.Succeeded || activeBatch is null || string.Equals(activeBatch.Status, "running", StringComparison.OrdinalIgnoreCase))
+                    if (!PrintJobDispatchPolicy.ShouldReleasePrintingBatch(batches.Succeeded, activeBatch))
                     {
                         break;
                     }
 
                     _printingBatchId = null;
                     _printQueueTimer.Interval = TimeSpan.FromSeconds(2);
+                    ApplyBatchHistory(batches.Data ?? []);
+                    if (activeBatch is not null && !IsActiveBatchStatus(activeBatch.Status))
+                    {
+                        BatchPrintStatusText.Text = $"批次 {activeBatch.Id} {activeBatch.StatusText}，可以配置新的批量打印。";
+                    }
+                    else if (activeBatch is null)
+                    {
+                        BatchPrintStatusText.Text = $"批次 {activeBatchId} 已结束，可以配置新的批量打印。";
+                    }
                     continue;
                 }
 
@@ -2762,7 +3093,7 @@ public partial class MainWindow : Window
     private async void OnRefreshCatalogClick(object sender, RoutedEventArgs e)
     {
         var started = await _runtime.RefreshCatalogAsync();
-        CatalogStatusText.Text = started ? "目录正在刷新，当前查询继续使用已同步数据。" : "目录刷新未启动，请确认边缘服务已运行。";
+        CatalogStatusText.Text = started ? "正在进行手动全量刷新，当前查询继续使用已有本地数据。" : "目录刷新未启动，请确认边缘服务已运行。";
     }
 
     private async Task RefreshCatalogStatusAsync()
@@ -2774,9 +3105,20 @@ public partial class MainWindow : Window
             return;
         }
 
+        if (status.ManualRefreshRequired)
+        {
+            CatalogStatusText.Text = status.Ready
+                ? $"本地目录版本 {status.Revision}，增量记录不完整，正在继续使用已有数据；请手动全量刷新。"
+                : "本地目录尚未初始化，请手动全量刷新。";
+            BoxLabelCatalogStatusText.Text = status.Ready
+                ? $"正在使用本地旧目录，共 {status.BoxLabelCount} 个箱唛"
+                : "箱唛目录尚未初始化";
+            return;
+        }
+
         if (!status.Ready)
         {
-            CatalogStatusText.Text = status.State == "syncing" ? "本地目录正在首次同步。" : "本地目录等待首次同步。";
+            CatalogStatusText.Text = status.State == "syncing" ? "本地目录正在进行手动全量刷新。" : "本地目录不可用。";
             return;
         }
 
@@ -3265,9 +3607,9 @@ public partial class MainWindow : Window
             MessageBox.Show("请先勾选或高亮要预览的箱唛。", "箱唛管理", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
-        if (selected.Count > 100 || selected.Any(label => label.PrintSnapshot is null))
+        if (selected.Count > 100)
         {
-            MessageBox.Show("单次最多预览 100 个箱唛，且箱唛必须包含完整打印快照。", "箱唛管理", MessageBoxButton.OK, MessageBoxImage.Warning);
+            MessageBox.Show("单次最多预览 100 个箱唛。", "箱唛管理", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
         if (BoxLabelPrintTemplateComboBox.SelectedItem is not PrintTemplateProfile template)
@@ -3316,12 +3658,11 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (selected.Count > 100 || selected.Any(label => !label.Printable || label.PrintSnapshot is null))
+        if (selected.Count > 100)
         {
-            MessageBox.Show("单次最多打印 100 个箱唛，且作废、短装、已收货、破损或异常箱唛不能打印。", "箱唛管理", MessageBoxButton.OK, MessageBoxImage.Warning);
+            MessageBox.Show("单次最多打印 100 个箱唛。", "箱唛管理", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
-
         if (BoxLabelPrintTemplateComboBox.SelectedItem is not PrintTemplateProfile template)
         {
             MessageBox.Show("没有 100 × 150 mm 厂家箱唛模板，请先在打印配置中创建。", "箱唛管理", MessageBoxButton.OK, MessageBoxImage.Warning);
@@ -3500,6 +3841,7 @@ public partial class MainWindow : Window
         BatchPrintPage.Visibility = tag == "BatchPrint" ? Visibility.Visible : Visibility.Collapsed;
         ProductsPage.Visibility = tag == "Products" ? Visibility.Visible : Visibility.Collapsed;
         BoxLabelsPage.Visibility = tag == "BoxLabels" ? Visibility.Visible : Visibility.Collapsed;
+        StoragePage.Visibility = tag == "Storage" ? Visibility.Visible : Visibility.Collapsed;
         PrintJobsCard.Visibility = tag == "Print" ? Visibility.Visible : Visibility.Collapsed;
         PrintConfigCard.Visibility = tag == "PrintConfig" ? Visibility.Visible : Visibility.Collapsed;
         AdvancedPage.Visibility = tag == "Advanced" ? Visibility.Visible : Visibility.Collapsed;
@@ -3511,8 +3853,9 @@ public partial class MainWindow : Window
             "BatchPrint" => ("批量打印", "生成并预览不同标签内容，提交中心批次后由当前边缘节点依次打印。"),
             "Print" => ("打印服务", "优先查看本地打印任务，打印机和规格在打印配置中管理。"),
             "PrintConfig" => ("打印配置", "管理打印模板、打印机、尺寸和二维码打印参数。"),
-            "Products" => ("产品管理", "本地优先分页查询产品和 SKU，缺失数据自动从中心同步。"),
+            "Products" => ("产品管理", "使用本地增量目录分页查询产品和 SKU，并支持创建打印任务。"),
             "BoxLabels" => ("箱唛管理", "离线查询箱唛关联单据，支持产品、SKU 和集运订单联合筛选及本地打印。"),
+            "Storage" => ("NAS 存储", "管理监控设备使用的 SMB 录像共享、磁盘空间和循环清理。"),
             "Advanced" => ("高级设置", "配置远端服务并管理边缘后端进程、运行文件和日志。"),
             _ => ("总览", "查看边缘节点最关键的运行状态。"),
         };
@@ -3531,6 +3874,10 @@ public partial class MainWindow : Window
             _selectedProductId = null;
             _selectedProductCode = string.Empty;
             _ = QuerySkusAsync(string.Empty, 1);
+        }
+        if (tag == "Storage")
+        {
+            _ = LoadStoragePageAsync(forceConfig: _storageConfig is null);
         }
     }
 

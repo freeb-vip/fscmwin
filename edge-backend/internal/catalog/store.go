@@ -135,14 +135,15 @@ type Change struct {
 }
 
 type Status struct {
-	Ready            bool      `json:"ready"`
-	State            string    `json:"state"`
-	Revision         uint64    `json:"revision"`
-	ActiveGeneration int64     `json:"active_generation"`
-	LastFullSyncAt   time.Time `json:"last_full_sync_at,omitempty"`
-	LastError        string    `json:"last_error,omitempty"`
-	BoxLabelCount    int64     `json:"box_label_count"`
-	BoxLabelsReady   bool      `json:"box_labels_ready"`
+	Ready                 bool      `json:"ready"`
+	State                 string    `json:"state"`
+	Revision              uint64    `json:"revision"`
+	ActiveGeneration      int64     `json:"active_generation"`
+	LastFullSyncAt        time.Time `json:"last_full_sync_at,omitempty"`
+	LastError             string    `json:"last_error,omitempty"`
+	BoxLabelCount         int64     `json:"box_label_count"`
+	BoxLabelsReady        bool      `json:"box_labels_ready"`
+	ManualRefreshRequired bool      `json:"manual_refresh_required"`
 }
 
 type Store struct{ db *sql.DB }
@@ -294,6 +295,7 @@ func (s *Store) Status(namespaceID uint) (Status, error) {
 	}
 	status.Ready = status.ActiveGeneration > 0 && status.State != "empty"
 	status.BoxLabelsReady = boxLabelsInitialized == 1
+	status.ManualRefreshRequired = status.State == "manual_refresh_required"
 	if status.ActiveGeneration > 0 {
 		_ = s.db.QueryRow(`SELECT COUNT(*) FROM catalog_box_labels WHERE namespace_id=? AND generation=?`, namespaceID, status.ActiveGeneration).Scan(&status.BoxLabelCount)
 	}
@@ -589,6 +591,14 @@ func (s *Store) RecordError(namespaceID uint, syncErr error) {
 		return
 	}
 	_, _ = s.db.Exec(`UPDATE catalog_meta SET state=CASE WHEN active_generation > 0 THEN 'ready' ELSE 'error' END, last_error=? WHERE namespace_id=?`, syncErr.Error(), namespaceID)
+}
+
+func (s *Store) MarkManualRefreshRequired(namespaceID uint, reason string) error {
+	if err := s.ensureMeta(namespaceID); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`UPDATE catalog_meta SET state='manual_refresh_required', last_error=? WHERE namespace_id=?`, strings.TrimSpace(reason), namespaceID)
+	return err
 }
 
 func (s *Store) SearchProducts(namespaceID uint, keyword string) ([]Product, error) {

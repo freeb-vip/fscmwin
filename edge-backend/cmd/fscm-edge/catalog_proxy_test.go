@@ -204,7 +204,7 @@ func TestCatalogProductsServeEmptyKeywordPageAndUseAuthenticatedCenterFill(t *te
 	}
 }
 
-func TestCatalogSKUMissFetchesCenterAndFillsLocalCache(t *testing.T) {
+func TestCatalogSKUListMissStaysLocalAndDetailMissFillsFromCenter(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store, err := catalog.Open(filepath.Join(t.TempDir(), "edge.db"))
 	if err != nil {
@@ -250,13 +250,13 @@ func TestCatalogSKUMissFetchesCenterAndFillsLocalCache(t *testing.T) {
 	request.Header.Set("X-Edge-Ticket", ticket)
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, request)
-	if response.Code != http.StatusOK || response.Header().Get("X-FSCM-Cache") != "CATALOG-FILL" || !bytes.Contains(response.Body.Bytes(), []byte("B5-GREEN")) {
-		t.Fatalf("center fill status=%d cache=%q body=%s", response.Code, response.Header().Get("X-FSCM-Cache"), response.Body.String())
+	if response.Code != http.StatusOK || response.Header().Get("X-FSCM-Cache") != "CATALOG-HIT" || centerCalls != 0 || !bytes.Contains(response.Body.Bytes(), []byte(`"items":[]`)) {
+		t.Fatalf("local empty status=%d cache=%q centerCalls=%d body=%s", response.Code, response.Header().Get("X-FSCM-Cache"), centerCalls, response.Body.String())
 	}
 	response = httptest.NewRecorder()
 	router.ServeHTTP(response, request)
-	if response.Code != http.StatusOK || response.Header().Get("X-FSCM-Cache") != "CATALOG-HIT" || centerCalls != 1 {
-		t.Fatalf("cached exact status=%d cache=%q centerCalls=%d", response.Code, response.Header().Get("X-FSCM-Cache"), centerCalls)
+	if response.Code != http.StatusOK || response.Header().Get("X-FSCM-Cache") != "CATALOG-HIT" || centerCalls != 0 {
+		t.Fatalf("repeated local empty status=%d cache=%q centerCalls=%d", response.Code, response.Header().Get("X-FSCM-Cache"), centerCalls)
 	}
 
 	request = httptest.NewRequest(http.MethodGet, "/api/skus/56", nil)
@@ -268,7 +268,7 @@ func TestCatalogSKUMissFetchesCenterAndFillsLocalCache(t *testing.T) {
 	}
 	response = httptest.NewRecorder()
 	router.ServeHTTP(response, request)
-	if response.Code != http.StatusOK || response.Header().Get("X-FSCM-Cache") != "CATALOG-HIT" || centerCalls != 2 {
+	if response.Code != http.StatusOK || response.Header().Get("X-FSCM-Cache") != "CATALOG-HIT" || centerCalls != 1 {
 		t.Fatalf("cached detail status=%d cache=%q centerCalls=%d", response.Code, response.Header().Get("X-FSCM-Cache"), centerCalls)
 	}
 }
@@ -318,9 +318,9 @@ func TestCatalogBoxLabelListAndDetailPreferLocalGeneration(t *testing.T) {
 	}
 
 	router := gin.New()
-	router.GET("/api/box-labels", func(c *gin.Context) { serveCatalogBoxLabels(c, manager, proxyHandler, false) })
-	router.GET("/api/box-labels/:id/resolve", func(c *gin.Context) { serveCatalogBoxLabelResolve(c, manager, proxyHandler, false) })
-	router.GET("/api/box-labels/:id", func(c *gin.Context) { serveCatalogBoxLabel(c, manager, proxyHandler, false) })
+	router.GET("/api/box-labels", func(c *gin.Context) { serveCatalogBoxLabels(c, manager, proxyHandler) })
+	router.GET("/api/box-labels/:id/resolve", func(c *gin.Context) { serveCatalogBoxLabelResolve(c, manager, proxyHandler) })
+	router.GET("/api/box-labels/:id", func(c *gin.Context) { serveCatalogBoxLabel(c, manager, proxyHandler) })
 	ticket := signedCatalogTicket(t, privateKey, 7, "edge-1")
 
 	request := httptest.NewRequest(http.MethodGet, "/api/box-labels?page=1&page_size=20&product_id=9", nil)
@@ -348,6 +348,25 @@ func TestCatalogBoxLabelListAndDetailPreferLocalGeneration(t *testing.T) {
 	}
 	if upstreamCalls != 0 {
 		t.Fatalf("center was called %d times for local box-label hits", upstreamCalls)
+	}
+}
+
+func TestBoxLabelResolvePrintabilityUsesGeneratedSnapshot(t *testing.T) {
+	withSnapshot := buildBoxLabelResolvePayload(&catalog.BoxLabel{
+		Status:        "voided",
+		Printable:     false,
+		PrintSnapshot: &catalog.BoxMark{BoxPlanID: 31},
+	})
+	if printable, ok := withSnapshot["printable"].(bool); !ok || !printable {
+		t.Fatalf("generated snapshot must remain printable, payload=%#v", withSnapshot)
+	}
+	if valid, ok := withSnapshot["valid_for_current_context"].(bool); !ok || valid {
+		t.Fatalf("voided label must remain invalid for receiving, payload=%#v", withSnapshot)
+	}
+
+	withoutSnapshot := buildBoxLabelResolvePayload(&catalog.BoxLabel{Printable: true})
+	if printable, ok := withoutSnapshot["printable"].(bool); !ok || printable {
+		t.Fatalf("label without a generated snapshot must not be printable, payload=%#v", withoutSnapshot)
 	}
 }
 

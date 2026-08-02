@@ -190,3 +190,16 @@ func TestPrinterAvailabilityBecomesReadyAfterFirstInventorySync(t *testing.T) {
 		t.Fatal("availability did not become ready after an empty inventory sync")
 	}
 }
+
+func TestPrinterAvailabilityReportsOnlyInventoryChanges(t *testing.T) {
+	availability := &printerAvailability{printers: make(map[string]struct{})}
+	if !availability.Set([]string{"Zebra", "Office"}) {
+		t.Fatal("first inventory must be reported as changed")
+	}
+	if availability.Set([]string{" office ", "ZEBRA", "Zebra"}) {
+		t.Fatal("equivalent inventory must not trigger a heartbeat")
+	}
+	if !availability.Set([]string{"Zebra"}) {
+		t.Fatal("removed printer must be reported as changed")
+	}
+}

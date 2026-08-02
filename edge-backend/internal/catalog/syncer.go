@@ -25,13 +25,14 @@ type Config struct {
 }
 
 type Manager struct {
-	cfg           Config
-	store         *Store
-	client        *http.Client
-	mu            sync.Mutex
-	running       bool
-	lastConfirmAt time.Time
-	ticketKey     ed25519.PublicKey
+	cfg          Config
+	store        *Store
+	client       *http.Client
+	mu           sync.Mutex
+	running      bool
+	ticketKey    ed25519.PublicKey
+	autoFailures int
+	nextAutoAt   time.Time
 }
 
 func NewManager(cfg Config, store *Store) *Manager {
@@ -39,28 +40,38 @@ func NewManager(cfg Config, store *Store) *Manager {
 }
 
 func (m *Manager) Start(ctx context.Context) {
-	go func() {
-		m.RefreshIfDue(ctx)
-		ticker := time.NewTicker(time.Hour)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				m.RefreshIfDue(ctx)
-			}
-		}
-	}()
+	_ = ctx
+	status, err := m.Status()
+	if err != nil {
+		return
+	}
+	if status.State == "syncing" {
+		_ = m.store.MarkManualRefreshRequired(m.cfg.NamespaceID, "manual full refresh was interrupted; run it again")
+		return
+	}
+	if !status.Ready {
+		_ = m.store.MarkManualRefreshRequired(m.cfg.NamespaceID, "catalog is not initialized; run a manual full refresh")
+	}
 }
 
 // OnRemoteRevision is called from the existing edge-node heartbeat response.
 func (m *Manager) OnRemoteRevision(revision uint64) {
 	status, err := m.Status()
-	if err != nil || revision <= status.Revision {
+	if err != nil || revision <= status.Revision || status.ManualRefreshRequired {
 		return
 	}
-	go func() { _ = m.SyncChanges(context.Background()) }()
+	now := time.Now()
+	m.mu.Lock()
+	if m.running || now.Before(m.nextAutoAt) {
+		m.mu.Unlock()
+		return
+	}
+	m.running = true
+	m.mu.Unlock()
+	go func() {
+		syncErr := m.syncChangesLocked(context.Background())
+		m.finishAutomaticSync(syncErr)
+	}()
 }
 
 func (m *Manager) SetTicketPublicKey(encoded string) {
@@ -140,9 +151,7 @@ func (m *Manager) FetchAndCacheProducts(ctx context.Context, query url.Values) (
 		normalizeProductMedia(&items[index])
 	}
 	if len(items) > 0 {
-		if err := m.CacheProducts(items); err != nil {
-			go func() { _ = m.RefreshFull(context.Background()) }()
-		}
+		_ = m.CacheProducts(items)
 	}
 	total := response.Total
 	if total == 0 {
@@ -167,9 +176,7 @@ func (m *Manager) FetchAndCacheSKUs(ctx context.Context, query url.Values) ([]SK
 		normalizeSKUMedia(&items[index])
 	}
 	if len(items) > 0 {
-		if err := m.CacheSKUs(items); err != nil {
-			go func() { _ = m.RefreshFull(context.Background()) }()
-		}
+		_ = m.CacheSKUs(items)
 	}
 	total := response.Total
 	if total == 0 {
@@ -187,9 +194,7 @@ func (m *Manager) FetchAndCacheSKU(ctx context.Context, idOrCode string) (*SKU, 
 		return nil, nil
 	}
 	normalizeSKUMedia(&item)
-	if err := m.CacheSKUs([]SKU{item}); err != nil {
-		go func() { _ = m.RefreshFull(context.Background()) }()
-	}
+	_ = m.CacheSKUs([]SKU{item})
 	return &item, nil
 }
 
@@ -261,28 +266,23 @@ func firstNonBlank(values ...string) string {
 	return ""
 }
 
-func (m *Manager) RefreshIfDue(ctx context.Context) {
-	status, err := m.Status()
-	if err != nil || !status.Ready || !status.BoxLabelsReady || time.Since(status.LastFullSyncAt) >= 24*time.Hour {
-		_ = m.RefreshFull(ctx)
-	}
-}
-
 func (m *Manager) RefreshFull(ctx context.Context) error {
 	if !m.begin() {
 		return nil
 	}
-	defer m.end()
-	return m.refreshFullLocked(ctx)
+	err := m.refreshFullLocked(ctx)
+	m.finishManualSync(err)
+	return err
 }
 
 func (m *Manager) refreshFullLocked(ctx context.Context) error {
 	if err := m.validateConfig(); err != nil {
-		m.store.RecordError(m.cfg.NamespaceID, err)
+		_ = m.store.MarkManualRefreshRequired(m.cfg.NamespaceID, "manual full refresh failed: "+err.Error())
 		return err
 	}
 	generation, err := m.store.BeginFullSync(m.cfg.NamespaceID)
 	if err != nil {
+		_ = m.store.MarkManualRefreshRequired(m.cfg.NamespaceID, "manual full refresh failed: "+err.Error())
 		return err
 	}
 	var revision uint64
@@ -293,11 +293,11 @@ func (m *Manager) refreshFullLocked(ctx context.Context) error {
 		revision, err = m.syncSnapshotBoxLabels(ctx, generation, revision)
 	}
 	if err != nil {
-		m.store.RecordError(m.cfg.NamespaceID, err)
+		_ = m.store.MarkManualRefreshRequired(m.cfg.NamespaceID, "manual full refresh failed: "+err.Error())
 		return err
 	}
 	if err = m.store.FinishFullSync(m.cfg.NamespaceID, generation, revision); err != nil {
-		m.store.RecordError(m.cfg.NamespaceID, err)
+		_ = m.store.MarkManualRefreshRequired(m.cfg.NamespaceID, "manual full refresh failed: "+err.Error())
 		return err
 	}
 	return m.syncChangesLocked(ctx)
@@ -307,29 +307,9 @@ func (m *Manager) SyncChanges(ctx context.Context) error {
 	if !m.begin() {
 		return nil
 	}
-	defer m.end()
-	return m.syncChangesLocked(ctx)
-}
-
-// ConfirmChangesIfDue checks the center in the background while callers keep
-// serving the active local generation. Concurrent and high-frequency terminal
-// requests collapse into one confirmation per interval.
-func (m *Manager) ConfirmChangesIfDue(minInterval time.Duration) bool {
-	m.mu.Lock()
-	if m.running || (!m.lastConfirmAt.IsZero() && time.Since(m.lastConfirmAt) < minInterval) {
-		m.mu.Unlock()
-		return false
-	}
-	m.running = true
-	m.lastConfirmAt = time.Now()
-	m.mu.Unlock()
-	go func() {
-		defer m.end()
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		_ = m.syncChangesLocked(ctx)
-	}()
-	return true
+	err := m.syncChangesLocked(ctx)
+	m.finishAutomaticSync(err)
+	return err
 }
 
 func (m *Manager) syncChangesLocked(ctx context.Context) error {
@@ -338,8 +318,14 @@ func (m *Manager) syncChangesLocked(ctx context.Context) error {
 		return err
 	}
 	status, err := m.Status()
-	if err != nil || !status.Ready {
-		return m.refreshFullLocked(ctx)
+	if err != nil {
+		return err
+	}
+	if !status.Ready {
+		return m.requireManualRefresh("catalog is not initialized; run a manual full refresh")
+	}
+	if status.ManualRefreshRequired {
+		return ErrManualRefreshRequired
 	}
 	for {
 		var response struct {
@@ -353,13 +339,19 @@ func (m *Manager) syncChangesLocked(ctx context.Context) error {
 			return err
 		}
 		if response.FullSyncRequired {
-			return m.refreshFullLocked(ctx)
+			return m.requireManualRefresh("center change history is incomplete; run a manual full refresh")
 		}
 		if len(response.Items) == 0 {
 			if response.CatalogRevision > status.Revision {
-				return fmt.Errorf("catalog revision advanced without changes")
+				return m.requireManualRefresh("catalog revision advanced without matching changes; run a manual full refresh")
 			}
 			return nil
+		}
+		if response.NextRevision <= status.Revision {
+			return m.requireManualRefresh("catalog change cursor did not advance; run a manual full refresh")
+		}
+		if !changeRevisionsContinuous(status.Revision, response.Items, response.NextRevision) {
+			return m.requireManualRefresh("catalog change revisions are not continuous; run a manual full refresh")
 		}
 		if err := m.store.ApplyChanges(m.cfg.NamespaceID, response.Items, response.NextRevision); err != nil {
 			m.store.RecordError(m.cfg.NamespaceID, err)
@@ -369,6 +361,19 @@ func (m *Manager) syncChangesLocked(ctx context.Context) error {
 	}
 }
 
+func changeRevisionsContinuous(current uint64, items []Change, next uint64) bool {
+	cursor := current
+	for index, item := range items {
+		if index > 0 && item.Revision == cursor {
+			continue
+		}
+		if item.Revision != cursor+1 {
+			return false
+		}
+		cursor = item.Revision
+	}
+	return cursor == next
+}
 func (m *Manager) syncSnapshotProducts(ctx context.Context, generation int64) (uint64, error) {
 	var after uint
 	var revision uint64
@@ -494,10 +499,61 @@ func (m *Manager) begin() bool {
 	m.running = true
 	return true
 }
-func (m *Manager) end() { m.mu.Lock(); m.running = false; m.mu.Unlock() }
+func (m *Manager) finishManualSync(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.running = false
+	if err == nil {
+		m.autoFailures = 0
+		m.nextAutoAt = time.Time{}
+	}
+}
+
+func (m *Manager) finishAutomaticSync(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.running = false
+	if err == nil || err == ErrManualRefreshRequired {
+		m.autoFailures = 0
+		m.nextAutoAt = time.Time{}
+		return
+	}
+	m.autoFailures++
+	m.nextAutoAt = time.Now().Add(m.automaticRetryDelay(m.autoFailures))
+}
+
+func (m *Manager) automaticRetryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := 30 * time.Second
+	for step := 1; step < attempt && delay < 15*time.Minute; step++ {
+		delay *= 2
+	}
+	if delay > 15*time.Minute {
+		delay = 15 * time.Minute
+	}
+	digest := sha256.Sum256([]byte(strings.TrimSpace(m.cfg.NodeID)))
+	percent := 100 + int(digest[0])*20/255
+	delay = delay * time.Duration(percent) / 100
+	if delay > 15*time.Minute {
+		return 15 * time.Minute
+	}
+	return delay
+}
+
+func (m *Manager) requireManualRefresh(reason string) error {
+	if err := m.store.MarkManualRefreshRequired(m.cfg.NamespaceID, reason); err != nil {
+		return err
+	}
+	return ErrManualRefreshRequired
+}
+
 func (m *Manager) validateConfig() error {
 	if strings.TrimSpace(m.cfg.CenterURL) == "" || strings.TrimSpace(m.cfg.APIToken) == "" || strings.TrimSpace(m.cfg.NodeID) == "" || m.cfg.NamespaceID == 0 {
 		return fmt.Errorf("catalog sync is not configured")
 	}
 	return nil
 }
+
+var ErrManualRefreshRequired = fmt.Errorf("catalog requires a manual full refresh")

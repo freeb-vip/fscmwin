@@ -56,4 +56,28 @@ public sealed class BoxLabelSummaryTests
         Assert.Equal(7u, label.PrintSnapshot?.BoxPlanId);
         Assert.Equal("BX-7", label.PrintSnapshot?.BoxQrPayload);
     }
+
+    [Theory]
+    [InlineData("received", "received")]
+    [InlineData("voided", "pending")]
+    public void GeneratedSnapshotRemainsPrintableRegardlessOfCurrentStatus(string statusGroup, string receivingStatus)
+    {
+        var label = new BoxLabelSummary
+        {
+            StatusGroup = statusGroup,
+            Receiving = new BoxLabelReceivingInfo { Status = receivingStatus },
+            Printable = false,
+            PrintSnapshot = new ManufacturerBoxMark { BoxPlanId = 7, BoxQrPayload = "BX-7" },
+        };
+
+        Assert.True(label.CanPrintFromSnapshot);
+    }
+
+    [Fact]
+    public void BoxLabelWithoutGeneratedSnapshotCannotPrint()
+    {
+        var label = new BoxLabelSummary { Printable = true };
+
+        Assert.False(label.CanPrintFromSnapshot);
+    }
 }

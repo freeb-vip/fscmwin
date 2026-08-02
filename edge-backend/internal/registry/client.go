@@ -41,10 +41,11 @@ type Status struct {
 }
 
 type Client struct {
-	cfg    Config
-	client *http.Client
-	mu     sync.RWMutex
-	status Status
+	cfg       Config
+	client    *http.Client
+	mu        sync.RWMutex
+	publishMu sync.Mutex
+	status    Status
 }
 
 func New(cfg Config) *Client {
@@ -79,14 +80,29 @@ func (c *Client) Status() Status { c.mu.RLock(); defer c.mu.RUnlock(); return c.
 func (c *Client) SyncNow(ctx context.Context) { c.heartbeat(ctx) }
 
 func (c *Client) register(ctx context.Context) {
+
+	if !c.publishMu.TryLock() {
+		return
+	}
+	defer c.publishMu.Unlock()
+	c.registerLocked(ctx)
+}
+
+func (c *Client) registerLocked(ctx context.Context) {
 	payload := map[string]interface{}{"node_id": c.cfg.NodeID, "node_name": c.cfg.NodeName, "lan_base_url": c.cfg.LANBaseURL, "backend_version": c.cfg.Version, "edge_api_version": c.cfg.APIVersion, "schema_version": 1, "capabilities": c.cfg.Capabilities, "cache_mode": c.cfg.CacheMode, "inventory": c.inventory()}
 	c.send(ctx, "/api/edge/nodes/register", payload, true)
 }
 
 func (c *Client) heartbeat(ctx context.Context) {
-	payload := map[string]interface{}{"node_id": c.cfg.NodeID, "cache_mode": c.cfg.CacheMode, "inventory": c.inventory()}
+	if !c.publishMu.TryLock() {
+		return
+	}
+	defer c.publishMu.Unlock()
+	// Send the full registration fields on every heartbeat. The center can then
+	// replace a stale LAN address after an adapter or network change.
+	payload := map[string]interface{}{"node_id": c.cfg.NodeID, "node_name": c.cfg.NodeName, "lan_base_url": c.cfg.LANBaseURL, "backend_version": c.cfg.Version, "edge_api_version": c.cfg.APIVersion, "schema_version": 1, "capabilities": c.cfg.Capabilities, "cache_mode": c.cfg.CacheMode, "inventory": c.inventory()}
 	if !c.send(ctx, "/api/edge/nodes/heartbeat", payload, false) {
-		c.register(ctx)
+		c.registerLocked(ctx)
 	}
 }
 

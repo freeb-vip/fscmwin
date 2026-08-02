@@ -30,17 +30,34 @@ public sealed class EdgeRuntimeManager : IDisposable
 
     private readonly HttpClient _httpClient = new() { Timeout = TimeSpan.FromSeconds(3) };
     private readonly HttpClient _batchHttpClient = new() { Timeout = TimeSpan.FromSeconds(15) };
+    private readonly HttpClient _storageHttpClient = new() { Timeout = TimeSpan.FromSeconds(60) };
     private Process? _process;
 
     public string LastCenterQueryMessage { get; private set; } = string.Empty;
 
-    public string RuntimeDirectory { get; } = Path.Combine(AppContext.BaseDirectory, "EdgeRuntime");
+    public string RuntimeDirectory { get; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+        "FSCM Edge",
+        "EdgeRuntime");
 
-    public string BinaryPath => Path.Combine(RuntimeDirectory, "fscm-edge.exe");
+    public string BinaryPath
+    {
+        get
+        {
+            string serviceBinary = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                "FSCM Edge",
+                "Service",
+                "fscm-edge.exe");
+            return File.Exists(serviceBinary)
+                ? serviceBinary
+                : Path.Combine(AppContext.BaseDirectory, "EdgeRuntime", "fscm-edge.exe");
+        }
+    }
 
     public string ConfigPath => Path.Combine(RuntimeDirectory, "edge.config.yaml");
 
-    public string ManifestPath => Path.Combine(RuntimeDirectory, "edge-runtime-manifest.json");
+    public string ManifestPath => Path.Combine(AppContext.BaseDirectory, "EdgeRuntime", "edge-runtime-manifest.json");
 
     public string PrintTemplatesPath => Path.Combine(RuntimeDirectory, "print-templates.json");
 
@@ -159,15 +176,45 @@ public sealed class EdgeRuntimeManager : IDisposable
         }
 
         var port = ReadConfiguredPort();
-        if (!IsPortAvailable(port) && !await CheckHealthAsync(port).ConfigureAwait(false))
+        if (await CheckHealthAsync(port).ConfigureAwait(false))
+        {
+            return await GetStatusAsync().ConfigureAwait(false);
+        }
+
+        if (!IsPortAvailable(port))
         {
             return new EdgeRuntimeStatus
             {
                 BinaryExists = true,
                 ConfigExists = true,
                 Port = port,
-                Message = $"Port {port} is already in use.",
+                Message = $"Port {port} is already in use by a process that is not an FSCM Edge service.",
             };
+        }
+
+        int? windowsServiceState = GetWindowsServiceState();
+        if (windowsServiceState is not null)
+        {
+            if (windowsServiceState is not 2 and not 4)
+            {
+                try
+                {
+                    await RunElevatedServiceCommandAsync(
+                        "if ((Get-Service -Name 'FscmEdge').Status -ne 'Running') { Start-Service -Name 'FscmEdge' }").ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    return new EdgeRuntimeStatus
+                    {
+                        BinaryExists = true,
+                        ConfigExists = File.Exists(ConfigPath),
+                        Port = ReadConfiguredPort(),
+                        Message = $"本机 FSCM Edge 后台服务未启动：{ex.Message}",
+                    };
+                }
+            }
+
+            return await WaitForHealthAsync(expectedHealthy: true).ConfigureAwait(false);
         }
 
         Directory.CreateDirectory(LogDirectory);
@@ -219,6 +266,61 @@ public sealed class EdgeRuntimeManager : IDisposable
     {
         await StopAsync().ConfigureAwait(false);
         return await StartAsync().ConfigureAwait(false);
+    }
+
+    public async Task<EdgeRuntimeStatus> StartManagedAsync()
+    {
+        if (!IsWindowsServiceInstalled())
+        {
+            return await StartAsync().ConfigureAwait(false);
+        }
+
+        var port = ReadConfiguredPort();
+        if (await CheckHealthAsync(port).ConfigureAwait(false))
+        {
+            return await GetStatusAsync().ConfigureAwait(false);
+        }
+
+        if (!IsPortAvailable(port))
+        {
+            return new EdgeRuntimeStatus
+            {
+                BinaryExists = File.Exists(BinaryPath),
+                ConfigExists = File.Exists(ConfigPath),
+                Port = port,
+                Message = $"Port {port} is already in use by a process that is not an FSCM Edge service.",
+            };
+        }
+
+        await RunElevatedServiceCommandAsync("Start-Service -Name 'FscmEdge'").ConfigureAwait(false);
+        return await WaitForHealthAsync(expectedHealthy: true).ConfigureAwait(false);
+    }
+
+    public async Task<EdgeRuntimeStatus> StopManagedAsync()
+    {
+        if (!IsWindowsServiceInstalled())
+        {
+            return await StopAsync().ConfigureAwait(false);
+        }
+
+        await RunElevatedServiceCommandAsync("Stop-Service -Name 'FscmEdge' -Force").ConfigureAwait(false);
+        return await WaitForHealthAsync(expectedHealthy: false).ConfigureAwait(false);
+    }
+
+    public async Task<EdgeRuntimeStatus> RestartManagedAsync()
+    {
+        if (!IsWindowsServiceInstalled())
+        {
+            return await RestartAsync().ConfigureAwait(false);
+        }
+
+        await RunElevatedServiceCommandAsync("Restart-Service -Name 'FscmEdge' -Force").ConfigureAwait(false);
+        return await WaitForHealthAsync(expectedHealthy: true).ConfigureAwait(false);
+    }
+
+    public Task<EdgeRuntimeStatus> StopOwnedProcessAsync()
+    {
+        return _process is { HasExited: false } ? StopAsync() : GetStatusAsync();
     }
 
     public async Task<EdgeCenterRegistrationResult> RegisterWithCenterAsync()
@@ -664,7 +766,7 @@ public sealed class EdgeRuntimeManager : IDisposable
         page = Math.Max(1, page);
         pageSize = Math.Clamp(pageSize, 1, 100);
         var local = await GetLocalCatalogPageAsync<ProductSummary>("/edge/catalog/products/search", keyword, page, pageSize).ConfigureAwait(false);
-        if (local.Succeeded && local.Result.Items.Count > 0)
+        if (local.Succeeded && (local.CatalogReady || local.Result.Items.Count > 0))
         {
             return local.Result;
         }
@@ -687,7 +789,7 @@ public sealed class EdgeRuntimeManager : IDisposable
             ? "/edge/catalog/skus/search"
             : $"/edge/catalog/skus/search?product_id={productId.Value}";
         var local = await GetLocalCatalogPageAsync<SkuSummary>(localPath, keyword, page, pageSize).ConfigureAwait(false);
-        if (local.Succeeded && local.Result.Items.Count > 0)
+        if (local.Succeeded && (local.CatalogReady || local.Result.Items.Count > 0))
         {
             return local.Result;
         }
@@ -1004,7 +1106,7 @@ public sealed class EdgeRuntimeManager : IDisposable
         }
     }
 
-    private async Task<(CatalogSearchResult<T> Result, bool Succeeded)> GetLocalCatalogPageAsync<T>(string path, string keyword, int page, int pageSize)
+    private async Task<(CatalogSearchResult<T> Result, bool Succeeded, bool CatalogReady)> GetLocalCatalogPageAsync<T>(string path, string keyword, int page, int pageSize)
     {
         LastCenterQueryMessage = string.Empty;
         try
@@ -1015,25 +1117,27 @@ public sealed class EdgeRuntimeManager : IDisposable
             using var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
             {
-                return (new CatalogSearchResult<T> { Page = page, PageSize = pageSize }, false);
+                return (new CatalogSearchResult<T> { Page = page, PageSize = pageSize }, false, false);
             }
 
             using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
             var root = document.RootElement;
+            var catalogReady = root.TryGetProperty("catalog", out var catalog) &&
+                catalog.TryGetProperty("ready", out var ready) && ready.ValueKind == JsonValueKind.True;
             if (!root.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array)
             {
-                return (new CatalogSearchResult<T> { Page = page, PageSize = pageSize, Source = "local" }, true);
+                return (new CatalogSearchResult<T> { Page = page, PageSize = pageSize, Source = "local" }, true, catalogReady);
             }
 
 #pragma warning disable IDISP004
             var result = DeserializeCatalogItems<T>(items);
 #pragma warning restore IDISP004
             var total = root.TryGetProperty("total", out var totalValue) && totalValue.TryGetInt64(out var parsedTotal) ? parsedTotal : result.Count;
-            return (new CatalogSearchResult<T> { Items = result, Total = total, Page = page, PageSize = pageSize, Source = "local" }, true);
+            return (new CatalogSearchResult<T> { Items = result, Total = total, Page = page, PageSize = pageSize, Source = "local" }, true, catalogReady);
         }
         catch
         {
-            return (new CatalogSearchResult<T> { Page = page, PageSize = pageSize }, false);
+            return (new CatalogSearchResult<T> { Page = page, PageSize = pageSize }, false, false);
         }
     }
 
@@ -1134,7 +1238,7 @@ public sealed class EdgeRuntimeManager : IDisposable
         }
     }
 
-    private CatalogSearchResult<T> CatalogFallback<T>((CatalogSearchResult<T> Result, bool Succeeded) local, string emptyMessage)
+    private CatalogSearchResult<T> CatalogFallback<T>((CatalogSearchResult<T> Result, bool Succeeded, bool CatalogReady) local, string emptyMessage)
     {
         return new CatalogSearchResult<T>
         {
@@ -1360,6 +1464,101 @@ public sealed class EdgeRuntimeManager : IDisposable
         catch
         {
             return false;
+        }
+    }
+
+    public async Task<EdgeStorageConfigResponse> GetStorageConfigAsync()
+    {
+        await EnsureStorageBackendReadyAsync().ConfigureAwait(false);
+        using var request = CreateLocalAdminRequest(HttpMethod.Get, "/edge/storage/config");
+        using var response = await _storageHttpClient.SendAsync(request).ConfigureAwait(false);
+        await EnsureStorageSuccessAsync(response, "读取 NAS 配置失败").ConfigureAwait(false);
+        return await response.Content.ReadFromJsonAsync<EdgeStorageConfigResponse>(JsonOptions).ConfigureAwait(false)
+            ?? throw new InvalidOperationException("NAS 配置响应为空。");
+    }
+
+    public async Task<EdgeStorageStatus?> GetStorageStatusAsync()
+    {
+        try
+        {
+            using var request = CreateLocalAdminRequest(HttpMethod.Get, "/edge/storage/status");
+            using var response = await _storageHttpClient.SendAsync(request).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                return null;
+            }
+
+            return (await response.Content.ReadFromJsonAsync<EdgeStorageStatusResponse>(JsonOptions).ConfigureAwait(false))?.Storage;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public async Task<EdgeStorageApplyResponse> SaveStorageConfigAsync(EdgeStorageConfig config)
+    {
+        await EnsureStorageBackendReadyAsync().ConfigureAwait(false);
+        using var request = CreateLocalAdminRequest(HttpMethod.Put, "/edge/storage/config");
+        request.Content = JsonContent.Create(new
+        {
+            enabled = config.Enabled,
+            local_path = config.LocalPath,
+            retention_days = config.RetentionDays,
+            reserve_free_gb = config.ReserveFreeGigabytes,
+            smb_compatibility_mode = config.SmbCompatibilityMode,
+        });
+        using var response = await _storageHttpClient.SendAsync(request).ConfigureAwait(false);
+        await EnsureStorageSuccessAsync(response, "保存 NAS 配置失败").ConfigureAwait(false);
+        return await response.Content.ReadFromJsonAsync<EdgeStorageApplyResponse>(JsonOptions).ConfigureAwait(false)
+            ?? throw new InvalidOperationException("NAS 配置响应为空。");
+    }
+
+    public async Task<EdgeStorageCredentials> ResetStorageCredentialsAsync()
+    {
+        await EnsureStorageBackendReadyAsync().ConfigureAwait(false);
+        using var request = CreateLocalAdminRequest(HttpMethod.Post, "/edge/storage/credentials/reset");
+        using var response = await _storageHttpClient.SendAsync(request).ConfigureAwait(false);
+        await EnsureStorageSuccessAsync(response, "重置 NAS 密码失败").ConfigureAwait(false);
+        return (await response.Content.ReadFromJsonAsync<EdgeStorageCredentialsResponse>(JsonOptions).ConfigureAwait(false))?.Credentials
+            ?? throw new InvalidOperationException("NAS 凭据响应为空。");
+    }
+
+    public async Task TriggerStorageCleanupAsync()
+    {
+        await EnsureStorageBackendReadyAsync().ConfigureAwait(false);
+        using var request = CreateLocalAdminRequest(HttpMethod.Post, "/edge/storage/cleanup");
+        using var response = await _storageHttpClient.SendAsync(request).ConfigureAwait(false);
+        await EnsureStorageSuccessAsync(response, "启动 NAS 清理失败").ConfigureAwait(false);
+    }
+
+    private static async Task EnsureStorageSuccessAsync(HttpResponseMessage response, string fallback)
+    {
+        if (response.IsSuccessStatusCode)
+        {
+            return;
+        }
+
+        string body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+        string detail = ExtractErrorMessage(body);
+        throw new InvalidOperationException(string.IsNullOrWhiteSpace(detail)
+            ? $"{fallback}：{(int)response.StatusCode} {response.ReasonPhrase}"
+            : $"{fallback}：{detail}");
+    }
+
+    private async Task EnsureStorageBackendReadyAsync()
+    {
+        int port = ReadConfiguredPort();
+        if (await CheckHealthAsync(port).ConfigureAwait(false))
+        {
+            return;
+        }
+
+        EdgeRuntimeStatus status = await StartAsync().ConfigureAwait(false);
+        if (!status.IsHealthy)
+        {
+            string detail = string.IsNullOrWhiteSpace(status.Message) ? "后台服务未就绪。" : status.Message;
+            throw new InvalidOperationException($"无法连接本机 FSCM Edge 后台服务（127.0.0.1:{port}）。{detail}");
         }
     }
 
@@ -1955,6 +2154,96 @@ edge:
         return $"http://127.0.0.1:{ReadConfiguredPort()}{path}";
     }
 
+    private static bool IsWindowsServiceInstalled()
+    {
+        return GetWindowsServiceState() is not null;
+    }
+
+    private static int? GetWindowsServiceState()
+    {
+        try
+        {
+            using Process process = Process.Start(new ProcessStartInfo
+            {
+                FileName = "sc.exe",
+                Arguments = "query FscmEdge",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            }) ?? throw new InvalidOperationException("Unable to query the FSCM Edge service.");
+            string output = process.StandardOutput.ReadToEnd();
+            process.WaitForExit(3000);
+            return process.HasExited && process.ExitCode == 0
+                ? ParseWindowsServiceState(output)
+                : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    internal static int? ParseWindowsServiceState(string output)
+    {
+        foreach (string line in output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (!line.Contains("STATE", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            int separator = line.IndexOf(':');
+            if (separator < 0)
+            {
+                continue;
+            }
+
+            string value = line[(separator + 1)..].TrimStart();
+            int end = value.IndexOfAny([' ', '\t']);
+            string number = end < 0 ? value : value[..end];
+            if (int.TryParse(number, CultureInfo.InvariantCulture, out int state) && state is >= 1 and <= 7)
+            {
+                return state;
+            }
+        }
+
+        return null;
+    }
+
+    private static async Task RunElevatedServiceCommandAsync(string command)
+    {
+        using Process process = Process.Start(new ProcessStartInfo
+        {
+            FileName = "powershell.exe",
+            Arguments = $"-NoLogo -NoProfile -NonInteractive -Command \"{command}\"",
+            UseShellExecute = true,
+            Verb = "runas",
+            WindowStyle = ProcessWindowStyle.Hidden,
+        }) ?? throw new InvalidOperationException("Unable to run the Windows service command.");
+        await process.WaitForExitAsync().ConfigureAwait(false);
+        if (process.ExitCode != 0)
+        {
+            throw new InvalidOperationException($"Windows service command failed with exit code {process.ExitCode}.");
+        }
+    }
+
+    private async Task<EdgeRuntimeStatus> WaitForHealthAsync(bool expectedHealthy)
+    {
+        for (int attempt = 0; attempt < 30; attempt++)
+        {
+            EdgeRuntimeStatus status = await GetStatusAsync().ConfigureAwait(false);
+            if (status.IsHealthy == expectedHealthy)
+            {
+                return status;
+            }
+
+            await Task.Delay(500).ConfigureAwait(false);
+        }
+
+        return await GetStatusAsync().ConfigureAwait(false);
+    }
+
     private HttpRequestMessage CreateLocalAdminRequest(HttpMethod method, string path)
     {
         var request = new HttpRequestMessage(method, LocalEndpoint(path));
@@ -2055,6 +2344,7 @@ edge:
     {
         _httpClient.Dispose();
         _batchHttpClient.Dispose();
+        _storageHttpClient.Dispose();
         _process?.Dispose();
     }
 

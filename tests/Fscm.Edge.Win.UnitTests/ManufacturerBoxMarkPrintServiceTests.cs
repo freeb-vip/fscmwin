@@ -183,6 +183,50 @@ public sealed class ManufacturerBoxMarkPrintServiceTests
     }
 
     [Fact]
+    public void PrepareMarksForTemplate_UsesSimplifiedQuadContentWhenSnapshotIsMissing()
+    {
+        BoxLabelSummary label = new()
+        {
+            Id = 42,
+            LabelCode = "BOX-SIMPLE-42",
+            BoxUid = "BOX-UID-42",
+            BoxNo = "42/80",
+            CaseSpecName = "60 x 40 x 40 cm",
+            SkuItems =
+            [
+                new() { SkuCode = "SKU-42", SkuName = "简化箱唛商品", ProductCode = "P-42", QuantityPerBox = 24 },
+            ],
+        };
+        PrintTemplateProfile template = new() { LayoutStyle = PrintTemplatePolicy.BoxMarkQuadLayoutStyle };
+
+        ManufacturerBoxMark page = Assert.Single(ManufacturerBoxMarkPrintService.PrepareMarksForTemplate(template, [label]));
+
+        Assert.Equal(42u, page.BoxPlanId);
+        Assert.Equal("BOX-SIMPLE-42", page.Shop);
+        Assert.Equal("BOX-SIMPLE-42", page.BoxQrPayload);
+        Assert.Equal("SKU-42", page.SkuCode);
+        Assert.Equal("简化箱唛商品", page.SkuName);
+        Assert.Equal(24, page.QuantityPerBox);
+        Assert.Equal(["SKU-42 x 24"], page.SkuLines);
+    }
+
+    [Fact]
+    public void PrepareMarksForTemplate_RequiresSnapshotForFullBoxMarkTemplate()
+    {
+        BoxLabelSummary label = new()
+        {
+            LabelCode = "BOX-FULL-01",
+            SkuItems = [new() { SkuCode = "SKU-1", QuantityPerBox = 10 }],
+        };
+        PrintTemplateProfile template = new() { LayoutStyle = PrintTemplatePolicy.StackedLayoutStyle };
+
+        InvalidOperationException error = Assert.Throws<InvalidOperationException>(() =>
+            ManufacturerBoxMarkPrintService.PrepareMarksForTemplate(template, [label]));
+
+        Assert.Contains("横向四码简化模板", error.Message);
+    }
+
+    [Fact]
     public void QuadLayout_RendersFourQrCodesAndUnderlinedSkuContent()
     {
         Exception? failure = null;

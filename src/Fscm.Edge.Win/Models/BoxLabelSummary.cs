@@ -78,6 +78,9 @@ public sealed class BoxLabelSummary : INotifyPropertyChanged
     public ManufacturerBoxMark? PrintSnapshot { get; set; }
 
     [JsonIgnore]
+    public bool CanPrintFromSnapshot => PrintSnapshot is not null;
+
+    [JsonIgnore]
     public bool IsSelected
     {
         get => _isSelected;

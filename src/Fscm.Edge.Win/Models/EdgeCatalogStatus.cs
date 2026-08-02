@@ -29,4 +29,7 @@ public sealed class EdgeCatalogStatus
 
     [JsonPropertyName("box_labels_ready")]
     public bool BoxLabelsReady { get; set; }
+
+    [JsonPropertyName("manual_refresh_required")]
+    public bool ManualRefreshRequired { get; set; }
 }

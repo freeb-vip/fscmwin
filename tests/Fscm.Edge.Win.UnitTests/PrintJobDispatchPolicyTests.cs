@@ -34,6 +34,33 @@ public sealed class PrintJobDispatchPolicyTests
         Assert.Equal(expected, PrintJobDispatchPolicy.IsCopiesAllowed(copies));
     }
 
+    [Theory]
+    [InlineData("running", true)]
+    [InlineData("RUNNING", true)]
+    [InlineData("paused", true)]
+    [InlineData("completed", false)]
+    [InlineData("cancelled", false)]
+    [InlineData("failed", false)]
+    [InlineData("", false)]
+    public void IsActiveBatchStatusOnlyKeepsRunningOrPausedBatchesLocked(string status, bool expected)
+    {
+        Assert.Equal(expected, PrintJobDispatchPolicy.IsActiveBatchStatus(status));
+    }
+
+    [Fact]
+    public void ShouldReleasePrintingBatchWaitsForSuccessfulCenterQueryAndRunningBatch()
+    {
+        var running = new CenterPrintBatch { Status = "running" };
+        var completed = new CenterPrintBatch { Status = "completed" };
+        var paused = new CenterPrintBatch { Status = "paused" };
+
+        Assert.False(PrintJobDispatchPolicy.ShouldReleasePrintingBatch(false, completed));
+        Assert.False(PrintJobDispatchPolicy.ShouldReleasePrintingBatch(true, running));
+        Assert.True(PrintJobDispatchPolicy.ShouldReleasePrintingBatch(true, paused));
+        Assert.True(PrintJobDispatchPolicy.ShouldReleasePrintingBatch(true, completed));
+        Assert.True(PrintJobDispatchPolicy.ShouldReleasePrintingBatch(true, null));
+    }
+
     [Fact]
     public void EnsureContentCopiesAllowedRejectsSplitDuplicateContent()
     {

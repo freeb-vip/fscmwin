@@ -22,6 +22,18 @@ public static class PrintJobDispatchPolicy
         return copies is >= 1 and <= MaxCopiesPerContent;
     }
 
+    public static bool IsActiveBatchStatus(string? status)
+    {
+        return string.Equals(status, "running", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(status, "paused", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool ShouldReleasePrintingBatch(bool centerQuerySucceeded, CenterPrintBatch? batch)
+    {
+        return centerQuerySucceeded &&
+            (batch is null || !string.Equals(batch.Status, "running", StringComparison.OrdinalIgnoreCase));
+    }
+
     public static void EnsureCopiesAllowed(int copies)
     {
         if (!IsCopiesAllowed(copies))
