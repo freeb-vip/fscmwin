@@ -125,6 +125,14 @@ finally {
     }
 }
 
+$publishedEdgeServiceExecutable = Join-Path (Resolve-FullPath $OutputDir) "EdgeRuntime\fscm-edge.exe"
+if (-not (Test-Path -LiteralPath $publishedEdgeServiceExecutable -PathType Leaf)) {
+    throw "dotnet publish completed without copying the edge service executable: $publishedEdgeServiceExecutable"
+}
+if ((Get-Item -LiteralPath $publishedEdgeServiceExecutable).Length -le 0) {
+    throw "The published edge service executable is empty: $publishedEdgeServiceExecutable"
+}
+
 $launcherOutputDir = Join-Path (Resolve-FullPath $OutputDir) "UpdateLauncher"
 $launcherPublishArgs = @(
     "publish",

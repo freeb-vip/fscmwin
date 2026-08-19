@@ -20,6 +20,7 @@ public sealed class EdgeRuntimeManagerBatchRequestTests
             CenterUrl = "https://center.example.test/root/",
             ApiToken = "batch-token",
             NamespaceId = 42,
+            NodeId = "edge-node-7",
         };
 
         using HttpRequestMessage request = EdgeRuntimeManager.CreateCenterManagementRequest(
@@ -32,6 +33,7 @@ public sealed class EdgeRuntimeManagerBatchRequestTests
         Assert.Equal("batch-token", Assert.Single(request.Headers.GetValues("X-Api-Token")));
         Assert.Equal("batch-token", Assert.Single(request.Headers.GetValues("X-Edge-Token")));
         Assert.Equal("42", Assert.Single(request.Headers.GetValues("X-Namespace-ID")));
+        Assert.Equal("edge-node-7", Assert.Single(request.Headers.GetValues("X-FSCM-Edge-Node-ID")));
     }
 
     [Fact]

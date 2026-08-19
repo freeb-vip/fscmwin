@@ -253,6 +253,7 @@ func (c *Client) request(ctx context.Context, method, path string, payload, outp
 	request.Header.Set("Authorization", "Bearer "+c.cfg.APIToken)
 	request.Header.Set("X-API-Token", c.cfg.APIToken)
 	if c.cfg.NamespaceID > 0 {
+		request.Header.Set("X-FSCM-Edge-Node-ID", c.cfg.NodeID)
 		request.Header.Set("X-Namespace-ID", strconv.FormatUint(uint64(c.cfg.NamespaceID), 10))
 	}
 	response, err := c.client.Do(request)
@@ -309,7 +310,154 @@ func (c *Client) send(ctx context.Context, path string, payload interface{}, reg
 		c.status.LastError = err.Error()
 		return false
 	}
+	// A successful heartbeat also proves that the node is registered.
 	c.status.Registered = c.status.Registered || registration
 	c.status.LastSuccessAt, c.status.LastError = time.Now(), ""
 	return true
+}
+
+type TerminalObservation struct {
+	TerminalID  string    `json:"terminal_id"`
+	State       string    `json:"state"`
+	LANIP       string    `json:"lan_ip,omitempty"`
+	ConnectedAt time.Time `json:"connected_at,omitempty"`
+	LastSeenAt  time.Time `json:"last_seen_at,omitempty"`
+}
+
+type TerminalStatus struct {
+	TerminalID             string     `json:"terminal_id"`
+	Name                   string     `json:"terminal_name"`
+	IP                     string     `json:"lan_ip"`
+	Status                 string     `json:"status"`
+	Capabilities           []string   `json:"capabilities"`
+	LastSeenAt             time.Time  `json:"last_seen_at"`
+	LANStatus              string     `json:"lan_status"`
+	HealthStatus           string     `json:"health_status"`
+	HealthReason           string     `json:"health_reason"`
+	IsAlert                bool       `json:"is_alert"`
+	LANOnlineSince         *time.Time `json:"lan_online_since"`
+	LANLastSeenAt          *time.Time `json:"lan_last_seen_at"`
+	AssignedEdgeNodeName   string     `json:"assigned_edge_node_name"`
+	ObservedEdgeNodeName   string     `json:"observed_edge_node_name"`
+	OnlineDurationSeconds  int64      `json:"online_duration_seconds"`
+	OfflineDurationSeconds int64      `json:"offline_duration_seconds"`
+}
+
+func (c *Client) ObserveTerminals(ctx context.Context, values []TerminalObservation) error {
+	if len(values) == 0 {
+		return nil
+	}
+	return c.request(ctx, http.MethodPost, "/api/edge/nodes/terminals/observations", map[string]interface{}{"node_id": c.cfg.NodeID, "observed_at": time.Now().UTC(), "terminals": values}, nil)
+}
+
+func (c *Client) TerminalSnapshot(ctx context.Context) ([]TerminalStatus, error) {
+	var result struct {
+		Data struct {
+			Items []TerminalStatus `json:"items"`
+		} `json:"data"`
+	}
+	if err := c.request(ctx, http.MethodGet, "/api/edge/nodes/terminals/snapshot", nil, &result); err != nil {
+		return nil, err
+	}
+	return result.Data.Items, nil
+}
+
+type ScannerBinding struct {
+	ID                uint   `json:"id"`
+	UserID            uint   `json:"user_id"`
+	BindingCode       string `json:"binding_code"`
+	DeviceFingerprint string `json:"device_fingerprint"`
+}
+
+type ScannerWorkSession struct {
+	ID                uint      `json:"id"`
+	BindingID         uint      `json:"binding_id"`
+	UserID            uint      `json:"user_id"`
+	OperationTypeCode string    `json:"operation_type_code"`
+	OperationTypeName string    `json:"operation_type_name"`
+	ExpiresAt         time.Time `json:"expires_at"`
+}
+
+func (c *Client) BindScanner(ctx context.Context, payload interface{}) (ScannerBinding, error) {
+	var response struct {
+		Data struct {
+			Binding ScannerBinding `json:"binding"`
+		} `json:"data"`
+	}
+	err := c.request(ctx, http.MethodPost, "/api/edge/scanners/bindings", payload, &response)
+	return response.Data.Binding, err
+}
+
+func (c *Client) ScannerBindings(ctx context.Context) ([]ScannerBinding, error) {
+	var response struct {
+		Data struct {
+			Items []ScannerBinding `json:"items"`
+		} `json:"data"`
+	}
+	err := c.request(ctx, http.MethodGet, "/api/edge/scanners/bindings/active", nil, &response)
+	return response.Data.Items, err
+}
+
+func (c *Client) ScannerWorkSessions(ctx context.Context) ([]ScannerWorkSession, error) {
+	var response struct {
+		Data struct {
+			Items        []ScannerWorkSession `json:"items"`
+			Sessions     []ScannerWorkSession `json:"sessions"`
+			WorkSessions []ScannerWorkSession `json:"work_sessions"`
+			Tasks        []ScannerWorkSession `json:"tasks"`
+		} `json:"data"`
+	}
+	err := c.request(ctx, http.MethodGet, "/api/edge/scanners/work-sessions", nil, &response)
+	if err != nil {
+		return nil, err
+	}
+
+	collections := [][]ScannerWorkSession{
+		response.Data.Items,
+		response.Data.Sessions,
+		response.Data.WorkSessions,
+		response.Data.Tasks,
+	}
+	for _, items := range collections {
+		if items != nil {
+			return items, nil
+		}
+	}
+	return []ScannerWorkSession{}, nil
+}
+
+func (c *Client) StartScannerWorkSession(ctx context.Context, payload interface{}) (ScannerWorkSession, error) {
+	var response struct {
+		Data ScannerWorkSession `json:"data"`
+	}
+	err := c.request(ctx, http.MethodPost, "/api/edge/scanners/work-sessions/start", payload, &response)
+	return response.Data, err
+}
+
+func (c *Client) EndScannerWorkSession(ctx context.Context, payload interface{}) error {
+	return c.request(ctx, http.MethodPost, "/api/edge/scanners/work-sessions/end", payload, nil)
+}
+
+func (c *Client) DispatchScanner(ctx context.Context, eventType string, payload json.RawMessage) (bool, error) {
+	path := map[string]string{
+		"scanner.release":     "/api/edge/scanners/bindings/release",
+		"scanner.scan":        "/api/edge/scanners/events/batch",
+		"scanner.device_sync": "/api/edge/scanners/devices/sync",
+	}[eventType]
+	if path == "" {
+		return true, fmt.Errorf("unsupported scanner event type %q", eventType)
+	}
+	if eventType == "scanner.scan" {
+		wrapped, _ := json.Marshal(map[string]interface{}{"events": []json.RawMessage{payload}})
+		payload = wrapped
+	}
+	err := c.request(ctx, http.MethodPost, path, payload, nil)
+	if err == nil {
+		return false, nil
+	}
+	var responseErr *ResponseError
+	if errors.As(err, &responseErr) && responseErr.StatusCode >= 400 && responseErr.StatusCode < 500 && responseErr.StatusCode != http.StatusTooManyRequests {
+		return true, err
+	}
+	return false, err
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"time"
 
 	"golang.org/x/sys/windows/svc"
@@ -50,12 +51,21 @@ func logServiceFailure(configPath string, err error) {
 	}
 }
 
+func runServiceSafely(ctx context.Context, configPath string, run func(context.Context, string) error) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("panic: %v\n%s", recovered, debug.Stack())
+		}
+	}()
+	return run(ctx, configPath)
+}
+
 func (s *edgeService) Execute(_ []string, requests <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
 	changes <- svc.Status{State: svc.StartPending}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- s.run(ctx, s.configPath) }()
+	go func() { done <- runServiceSafely(ctx, s.configPath, s.run) }()
 	changes <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
 	for {
 		select {

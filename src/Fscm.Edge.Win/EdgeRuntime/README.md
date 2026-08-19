@@ -8,4 +8,4 @@ Expected packaged files:
 
 The Windows app creates a default `edge.config.yaml` at runtime when it is missing, but a packaged build should include all files above.
 
-The installer places the service executable in `%ProgramData%\FSCM Edge\Service` and mutable configuration, SQLite data, templates, and logs in `%ProgramData%\FSCM Edge\EdgeRuntime`. Keeping the service binary separate prevents standard users from replacing an executable that runs under the Windows service account.
+The installer places the service executable in the selected application directory under `EdgeRuntime` (by default, `%ProgramFiles%\FSCM Edge\EdgeRuntime`) and mutable configuration, SQLite data, templates, and logs in `%ProgramData%\FSCM Edge\EdgeRuntime`. The application directory protects the service executable from standard-user modification while keeping operator-managed state writable in ProgramData.

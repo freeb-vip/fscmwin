@@ -42,6 +42,13 @@ if ($NoRestore) { $packageArgs.NoRestore = $true }
 
 $iscc = Resolve-InnoSetup $InnoSetupExe
 $sourceDir = Resolve-FullPath $OutputDir
+$edgeServiceExecutable = Join-Path $sourceDir "EdgeRuntime\fscm-edge.exe"
+if (-not (Test-Path -LiteralPath $edgeServiceExecutable -PathType Leaf)) {
+    throw "The edge service executable was not produced: $edgeServiceExecutable"
+}
+if ((Get-Item -LiteralPath $edgeServiceExecutable).Length -le 0) {
+    throw "The edge service executable is empty: $edgeServiceExecutable"
+}
 $scriptPath = Resolve-FullPath "installer/Fscm.Edge.Win.iss"
 & $iscc "/DMyAppVersion=$Version" "/DSourceDir=$sourceDir" $scriptPath
 if ($LASTEXITCODE -ne 0) {

@@ -116,6 +116,7 @@ public partial class MainWindow : Window
             LoadManifest();
             LoadStartupSetting();
             await StartRuntimeAsync();
+            await StartScannerCaptureAsync();
             await RefreshAllAsync();
             _timer.Start();
             _printQueueTimer.Start();
@@ -213,10 +214,17 @@ public partial class MainWindow : Window
         _printQueueTimer.Stop();
         _notifyIcon.Visible = false;
         _notifyIcon.Dispose();
-        await _runtime.StopOwnedProcessAsync();
-        _runtime.Dispose();
-        _updates.Dispose();
-        Close();
+        _scannerCapture?.Dispose();
+        try
+        {
+            await _runtime.StopForApplicationExitAsync();
+        }
+        finally
+        {
+            _runtime.Dispose();
+            _updates.Dispose();
+            Close();
+        }
     }
 
     private async void OnRefreshClick(object sender, RoutedEventArgs e)
@@ -410,6 +418,7 @@ public partial class MainWindow : Window
 
     private async void OnSaveRemoteClick(object sender, RoutedEventArgs e)
     {
+        var previousRuntimeStatus = await _runtime.GetStatusAsync();
         var settings = _runtime.LoadEdgeSettings();
         settings.CenterUrl = CenterUrlTextBox.Text.Trim();
         settings.NodeId = NodeIdTextBox.Text.Trim();
@@ -429,8 +438,37 @@ public partial class MainWindow : Window
         _runtime.SaveEdgeSettings(settings);
         ApiTokenPasswordBox.Password = string.Empty;
         LoadSettingsIntoForm();
+
+        EdgeRuntimeStatus? reloadedStatus = await ReloadRuntimeAfterRemoteSettingsChangeAsync(previousRuntimeStatus);
         await RefreshAllAsync(forceRemoteCheck: true);
-        MessageBox.Show("远端服务配置已保存。如本地服务已启动，可在高级设置页重启使后端读取最新配置。", "FSCM Edge");
+        string message = reloadedStatus is null
+            ? "远端服务配置已保存，将在下次启动后端服务时生效。"
+            : reloadedStatus.IsHealthy
+                ? "远端服务配置已保存，后端服务已重新加载配置，扫描设备已重新同步。"
+                : $"远端服务配置已保存，但后端服务重新加载失败：{reloadedStatus.Message}";
+        MessageBox.Show(
+            message,
+            "FSCM Edge",
+            MessageBoxButton.OK,
+            reloadedStatus is { IsHealthy: false } ? MessageBoxImage.Warning : MessageBoxImage.Information);
+    }
+
+    private async Task<EdgeRuntimeStatus?> ReloadRuntimeAfterRemoteSettingsChangeAsync(EdgeRuntimeStatus previousStatus)
+    {
+        if (!previousStatus.IsRunning && !previousStatus.IsHealthy)
+        {
+            return null;
+        }
+
+        EdgeRuntimeStatus status = await _runtime.RestartManagedAsync();
+        ApplyRuntimeStatus(status);
+        if (status.IsHealthy && _scannerCapture is not null)
+        {
+            await _scannerCapture.RefreshAsync();
+            RefreshScannerManagement();
+        }
+
+        return status;
     }
 
     private async void OnTestRemoteClick(object sender, RoutedEventArgs e)
@@ -442,6 +480,7 @@ public partial class MainWindow : Window
 
         try
         {
+            var previousRuntimeStatus = await _runtime.GetStatusAsync();
             var settings = _runtime.LoadEdgeSettings();
             settings.CenterUrl = CenterUrlTextBox.Text.Trim();
             settings.NodeId = NodeIdTextBox.Text.Trim();
@@ -460,16 +499,23 @@ public partial class MainWindow : Window
 
             _runtime.SaveEdgeSettings(settings);
             ApiTokenPasswordBox.Password = string.Empty;
+            EdgeRuntimeStatus? reloadedStatus = await ReloadRuntimeAfterRemoteSettingsChangeAsync(previousRuntimeStatus);
 
             _lastRemoteStatus = await _runtime.CheckRemoteCenterAsync();
             ApplyRemoteStatus(_lastRemoteStatus);
 
-            var title = _lastRemoteStatus.IsReachable ? "连接成功" : "连接失败";
+            bool reloadSucceeded = reloadedStatus is null || reloadedStatus.IsHealthy;
+            var title = _lastRemoteStatus.IsReachable && reloadSucceeded ? "连接成功" : "连接失败";
+            string reloadMessage = reloadedStatus is null
+                ? "后端服务当前未运行，配置将在下次启动时生效。"
+                : reloadedStatus.IsHealthy
+                    ? "后端服务已重新加载配置，扫描设备已重新同步。"
+                    : $"后端服务重新加载失败：{reloadedStatus.Message}";
             MessageBox.Show(
-                _lastRemoteStatus.Message,
+                $"{_lastRemoteStatus.Message}{Environment.NewLine}{Environment.NewLine}{reloadMessage}",
                 title,
                 MessageBoxButton.OK,
-                _lastRemoteStatus.IsReachable ? MessageBoxImage.Information : MessageBoxImage.Warning);
+                _lastRemoteStatus.IsReachable && reloadSucceeded ? MessageBoxImage.Information : MessageBoxImage.Warning);
         }
         finally
         {
@@ -1811,7 +1857,7 @@ public partial class MainWindow : Window
         HomeTerminalCountText.Text = terminals.Count.ToString(CultureInfo.InvariantCulture);
         if (terminals.Count > 0 && !terminals.Any(terminal => terminal.Finding))
         {
-            TerminalActionStatusText.Text = $"{terminals.Count} 台终端，{terminals.Count(terminal => terminal.CanStartFind)} 台可寻找";
+            TerminalActionStatusText.Text = $"{terminals.Count} 台终端，{terminals.Count(terminal => terminal.HealthStatus == "area_online")} 台区域在线，{terminals.Count(terminal => terminal.IsAlert)} 台异常";
         }
     }
 
@@ -3845,6 +3891,12 @@ public partial class MainWindow : Window
         PrintJobsCard.Visibility = tag == "Print" ? Visibility.Visible : Visibility.Collapsed;
         PrintConfigCard.Visibility = tag == "PrintConfig" ? Visibility.Visible : Visibility.Collapsed;
         AdvancedPage.Visibility = tag == "Advanced" ? Visibility.Visible : Visibility.Collapsed;
+        ScannerManagementPage.Visibility = tag == "ScannerManagement" ? Visibility.Visible : Visibility.Collapsed;
+        WorkStatisticsPage.Visibility = tag == "WorkStatistics" ? Visibility.Visible : Visibility.Collapsed;
+        if (tag != "WorkStatistics")
+        {
+            StopWorkStatisticsAutoRefresh();
+        }
 
         (PageTitleText.Text, PageSubtitleText.Text) = tag switch
         {
@@ -3857,6 +3909,7 @@ public partial class MainWindow : Window
             "BoxLabels" => ("箱唛管理", "离线查询箱唛关联单据，支持产品、SKU 和集运订单联合筛选及本地打印。"),
             "Storage" => ("NAS 存储", "管理监控设备使用的 SMB 录像共享、磁盘空间和循环清理。"),
             "Advanced" => ("高级设置", "配置远端服务并管理边缘后端进程、运行文件和日志。"),
+            "WorkStatistics" => ("作业统计", "查看中心返回的扫描器绑定和当前作业会话。"),
             _ => ("总览", "查看边缘节点最关键的运行状态。"),
         };
 
@@ -3878,6 +3931,14 @@ public partial class MainWindow : Window
         if (tag == "Storage")
         {
             _ = LoadStoragePageAsync(forceConfig: _storageConfig is null);
+        }
+        if (tag == "ScannerManagement")
+        {
+            RefreshScannerManagement();
+        }
+        if (tag == "WorkStatistics")
+        {
+            _ = RefreshWorkStatisticsAsync();
         }
     }
 
@@ -3930,3 +3991,4 @@ public partial class MainWindow : Window
         Error,
     }
 }
+

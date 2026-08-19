@@ -31,6 +31,7 @@ import (
 	"fscm-edge/internal/printing"
 	edgeproxy "fscm-edge/internal/proxy"
 	"fscm-edge/internal/registry"
+	"fscm-edge/internal/scanner"
 	"fscm-edge/internal/storage"
 	"fscm-edge/internal/version"
 
@@ -173,13 +174,18 @@ func runEdge(parentContext context.Context, configPath string) error {
 		}
 	}
 	availability := &printerAvailability{printers: make(map[string]struct{})}
-	capabilities := []string{"proxy", "adaptive_cache", "catalog_cache", "catalog_media_cache", "box_label_catalog", "local_print", "print_templates", "batch_print_v1"}
+	capabilities := []string{"proxy", "adaptive_cache", "catalog_cache", "catalog_media_cache", "box_label_catalog", "local_print", "print_templates", "batch_print_v1", "scanner", "hid_input", "serial_input", "account_binding", "order_statistics"}
 	if storageRuntime.Available() {
 		capabilities = append(capabilities, "nas_storage_smb_v1")
 	}
 	reg := registry.New(registry.Config{CenterURL: cfg.CenterURL, APIToken: cfg.APIToken, NodeID: cfg.NodeID, NodeName: cfg.NodeName, LANBaseURL: cfg.LANBaseURL, Version: version.Version, APIVersion: version.APIVersion, CacheMode: cfg.Cache.Mode, NamespaceID: cfg.NamespaceID, Capabilities: capabilities, Inventory: func() interface{} {
 		return printInventory(printer.Templates(), printer.Config().DefaultPrinter, availability)
 	}, HeartbeatInterval: time.Duration(cfg.HeartbeatSeconds) * time.Second, OnCatalogRevision: catalogManager.OnRemoteRevision, OnTicketPublicKey: catalogManager.SetTicketPublicKey})
+	scannerRuntime, err := scanner.New(cfg.JobsPath, reg)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = scannerRuntime.Close() }()
 	ctx, cancel := signal.NotifyContext(parentContext, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	if storageRuntime.manager != nil {
@@ -187,22 +193,25 @@ func runEdge(parentContext context.Context, configPath string) error {
 	}
 	startServiceAdvertisement(ctx, cfg)
 	reg.Start(ctx)
+	scannerRuntime.Start(ctx)
 	catalogManager.Start(ctx)
 	startRemotePrintQueue(ctx, reg, printer, availability, time.Duration(cfg.PrintPollSeconds)*time.Second)
 	startLocalPrintAuditSync(ctx, reg, printer, 5*time.Second)
 	startRemoteCompletionSync(ctx, reg, printer, availability, time.Second)
 
 	terminals := newTerminalStore()
+	terminals.setObserver(func(value registry.TerminalObservation) {
+		_ = reg.ObserveTerminals(context.Background(), []registry.TerminalObservation{value})
+	})
 	router := gin.Default()
 	router.Use(cors())
 	router.GET("/edge/health", func(c *gin.Context) {
 		catalogStatus, _ := catalogManager.Status()
 		completionStatus, _ := printer.RemoteCompletionStatus()
 		nasStatus := storageRuntime.Status(c.Request.Context())
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "mode": "proxy", "backend_version": version.Version, "backend_commit": version.Commit, "edge_api_version": version.APIVersion, "center": proxyHandler.CenterStatus(), "cache": responseCache.Status(), "catalog": catalogStatus, "catalog_media_cache": mediaCache.Status(), "catalog_ticket_key_ready": catalogManager.TicketKeyReady(), "registration": reg.Status(), "remote_print_completions": completionStatus, "nas_storage": nasStatus, "optional_components": gin.H{"nas_storage": nasStatus}})
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "mode": "proxy", "backend_version": version.Version, "backend_commit": version.Commit, "edge_api_version": version.APIVersion, "center": proxyHandler.CenterStatus(), "cache": responseCache.Status(), "catalog": catalogStatus, "catalog_media_cache": mediaCache.Status(), "catalog_ticket_key_ready": catalogManager.TicketKeyReady(), "registration": reg.Status(), "remote_print_completions": completionStatus, "scanner": scannerRuntime.Status(), "nas_storage": nasStatus, "optional_components": gin.H{"nas_storage": nasStatus}})
 	})
 	router.GET("/edge/probe", func(c *gin.Context) {
-		terminals.recordProbe(c.ClientIP(), c.Request.UserAgent(), c.GetHeader("X-Edge-Terminal-Name"))
 		catalogStatus, _ := catalogManager.Status()
 		c.JSON(http.StatusOK, gin.H{"ok": true, "node_id": cfg.NodeID, "node_name": cfg.NodeName, "lan_base_url": cfg.LANBaseURL, "capabilities": catalogCapabilities(catalogStatus), "catalog": catalogStatus, "catalog_ticket_key_ready": catalogManager.TicketKeyReady(), "direct_print_available": true, "cache_mode": cfg.Cache.Mode})
 	})
@@ -211,7 +220,6 @@ func runEdge(parentContext context.Context, configPath string) error {
 		c.JSON(http.StatusOK, gin.H{"templates": availableLabelTemplates(printer.Templates(), availability)})
 	})
 	router.GET("/edge/print-inventory", func(c *gin.Context) {
-		terminals.recordProbe(c.ClientIP(), c.Request.UserAgent(), c.GetHeader("X-Edge-Terminal-Name"))
 		c.JSON(http.StatusOK, printInventory(printer.Templates(), printer.Config().DefaultPrinter, availability))
 	})
 	router.GET("/edge/terminals/connect", func(c *gin.Context) {
@@ -258,6 +266,42 @@ func runEdge(parentContext context.Context, configPath string) error {
 
 	admin := router.Group("/edge", adminMiddleware(cfg.AdminToken))
 	registerStorageRoutes(admin, storageRuntime)
+	admin.PUT("/scanners/config", func(c *gin.Context) {
+		var payload scanner.Config
+		if err := c.ShouldBindJSON(&payload); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_SCANNER_CONFIG"})
+			return
+		}
+		c.JSON(http.StatusOK, scannerRuntime.ApplyConfig(payload))
+	})
+	admin.PUT("/scanners/devices", func(c *gin.Context) {
+		var payload struct {
+			Devices []scanner.Device `json:"devices"`
+		}
+		if err := c.ShouldBindJSON(&payload); err != nil || len(payload.Devices) > 256 {
+			c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_SCANNER_DEVICES"})
+			return
+		}
+		if err := scannerRuntime.UpdateDevices(payload.Devices); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": "SCANNER_DEVICE_SYNC_FAILED", "message": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, scannerRuntime.Status())
+	})
+	admin.POST("/scanners/input", func(c *gin.Context) {
+		var payload scanner.Input
+		if err := c.ShouldBindJSON(&payload); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_SCANNER_INPUT"})
+			return
+		}
+		result, err := scannerRuntime.Input(c.Request.Context(), payload)
+		if err != nil {
+			c.JSON(http.StatusConflict, gin.H{"code": "SCANNER_INPUT_FAILED", "message": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, result)
+	})
+	admin.GET("/scanners/status", func(c *gin.Context) { c.JSON(http.StatusOK, scannerRuntime.Status()) })
 	admin.GET("/capabilities", func(c *gin.Context) {
 		catalogStatus, _ := catalogManager.Status()
 		c.JSON(http.StatusOK, gin.H{"capabilities": catalogCapabilities(catalogStatus)})
@@ -383,7 +427,14 @@ func runEdge(parentContext context.Context, configPath string) error {
 		c.JSON(http.StatusOK, gin.H{"cache": responseCache.Status(), "center": proxyHandler.CenterStatus(), "whitelist": cfg.Cache.Whitelist})
 	})
 	admin.POST("/cache/clear", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"cleared": responseCache.Clear()}) })
-	admin.GET("/terminals", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"terminals": terminals.list()}) })
+	admin.GET("/terminals", func(c *gin.Context) {
+		snapshot, err := reg.TerminalSnapshot(c.Request.Context())
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{"terminals": terminals.list(), "center_available": false})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"terminals": terminals.listWithSnapshot(snapshot), "center_available": true})
+	})
 	admin.POST("/terminals/:terminal_id/find", func(c *gin.Context) {
 		result, err := terminals.find(c.Param("terminal_id"))
 		writeTerminalCommandResponse(c, result, err)

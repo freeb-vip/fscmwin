@@ -216,6 +216,8 @@
           <ListBoxItem Tag="PrintConfig">打印配置</ListBoxItem>
           <ListBoxItem Tag="Storage">NAS 存储</ListBoxItem>
           <ListBoxItem Tag="Advanced">高级设置</ListBoxItem>
+          <ListBoxItem Tag="ScannerManagement">扫描设备</ListBoxItem>
+          <ListBoxItem Tag="WorkStatistics">作业统计</ListBoxItem>
         </ListBox>
       </DockPanel>
     </Border>
@@ -403,6 +405,7 @@
                 </StackPanel>
               </Grid>
             </Border>
+
           </StackPanel>
         </ScrollViewer>
 
@@ -534,6 +537,7 @@
                 </DockPanel>
               </StackPanel>
             </Border>
+
           </StackPanel>
         </ScrollViewer>
 
@@ -556,6 +560,11 @@
                 <DataGrid.Columns>
                   <DataGridTextColumn Header="终端名称" Binding="{Binding Name}" Width="170" />
                   <DataGridTextColumn Header="终端 ID" Binding="{Binding TerminalId}" Width="190" />
+                  <DataGridTextColumn Header="区域状态" Binding="{Binding HealthDisplay}" Width="110" />
+                  <DataGridTextColumn Header="状态说明" Binding="{Binding HealthReason}" Width="180" />
+                  <DataGridTextColumn Header="在线时长" Binding="{Binding OnlineDurationDisplay}" Width="100" />
+                  <DataGridTextColumn Header="离线时长" Binding="{Binding OfflineDurationDisplay}" Width="100" />
+                  <DataGridTextColumn Header="当前区域" Binding="{Binding ObservedEdgeNodeName}" Width="130" />
                   <DataGridTextColumn Header="IP" Binding="{Binding Ip}" Width="140" />
                   <DataGridTextColumn Header="版本" Binding="{Binding AppVersion}" Width="90" />
                   <DataGridTextColumn Header="最后在线" Binding="{Binding LastSeenAt, StringFormat=yyyy-MM-dd HH:mm:ss}" Width="160" />
@@ -863,6 +872,7 @@
                 </DataGrid>
               </StackPanel>
             </Border>
+
           </StackPanel>
         </ScrollViewer>
 
@@ -1131,6 +1141,7 @@
                 <TextBlock x:Name="PrintConfigStatusText" Margin="0,12,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap" />
               </StackPanel>
             </Border>
+
           </StackPanel>
         </ScrollViewer>
 
@@ -1238,6 +1249,7 @@
                 </DockPanel>
               </StackPanel>
             </Border>
+
           </StackPanel>
         </ScrollViewer>
 
@@ -1504,6 +1516,7 @@
                 </StackPanel>
               </Grid>
             </Border>
+
           </StackPanel>
         </ScrollViewer>
 
@@ -1610,9 +1623,146 @@
                 </StackPanel>
               </Grid>
             </Border>
+            <Button Margin="0,18,0,0" HorizontalAlignment="Left" Click="OnOpenScannerManagementClick" Content="Scanner device management" Style="{StaticResource PrimaryButtonStyle}" />
           </StackPanel>
+        </ScrollViewer>
+        <ScrollViewer x:Name="ScannerManagementPage" Visibility="Collapsed" VerticalScrollBarVisibility="Auto">
+          <StackPanel Margin="28">
+            <TextBlock FontSize="22" FontWeight="SemiBold" Text="Scanner devices" />
+            <TextBlock Margin="0,6,0,18" Foreground="{StaticResource MutedTextBrush}" Text="Windows discovers HID and serial candidates immediately. Enable only scanners; account binding is managed in the Web console." TextWrapping="Wrap" />
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,14"><CheckBox x:Name="ScannerEnabledCheckBox" VerticalAlignment="Center" Content="Enable scanner capture" /><CheckBox x:Name="ScannerShowExcludedCheckBox" Margin="18,0,0,0" VerticalAlignment="Center" Content="显示非扫描设备" Checked="OnShowExcludedScannerDevicesChanged" Unchecked="OnShowExcludedScannerDevicesChanged" /><Button Margin="18,0,0,0" Click="OnRefreshScannerDevicesClick" Content="Refresh devices" /><Button Margin="8,0,0,0" Click="OnSaveScannerConfigurationClick" Content="Save and apply" Style="{StaticResource PrimaryButtonStyle}" /></StackPanel>
+            <TextBlock x:Name="ScannerStatusText" FontWeight="SemiBold" Margin="0,0,0,10" />
+            <UniformGrid Columns="5" Margin="0,0,0,14"><Border Style="{StaticResource CardStyle}" Margin="0,0,10,0"><StackPanel><TextBlock Foreground="{StaticResource MutedTextBrush}" Text="Discovered" /><TextBlock x:Name="ScannerCandidateCountText" FontSize="22" /></StackPanel></Border><Border Style="{StaticResource CardStyle}" Margin="0,0,10,0"><StackPanel><TextBlock Foreground="{StaticResource MutedTextBrush}" Text="Enabled" /><TextBlock x:Name="ScannerEnabledCountText" FontSize="22" /></StackPanel></Border><Border Style="{StaticResource CardStyle}" Margin="0,0,10,0"><StackPanel><TextBlock Foreground="{StaticResource MutedTextBrush}" Text="Registered" /><TextBlock x:Name="ScannerRegisteredCountText" FontSize="22" /></StackPanel></Border><Border Style="{StaticResource CardStyle}" Margin="0,0,10,0"><StackPanel><TextBlock Foreground="{StaticResource MutedTextBrush}" Text="Pending" /><TextBlock x:Name="ScannerPendingText" FontSize="22" /></StackPanel></Border><Border Style="{StaticResource CardStyle}"><StackPanel><TextBlock Foreground="{StaticResource MutedTextBrush}" Text="Dead letters" /><TextBlock x:Name="ScannerDeadLetterText" FontSize="22" /></StackPanel></Border></UniformGrid>
+            <TextBlock x:Name="ScannerLastErrorText" Margin="0,0,0,14" Foreground="#B91C1C" TextWrapping="Wrap" />
+            <DataGrid x:Name="ScannerDevicesGrid" AutoGenerateColumns="False" CanUserAddRows="False" MinHeight="260"><DataGrid.Columns><DataGridCheckBoxColumn Header="Scanner" Binding="{Binding Enabled}" Width="75" /><DataGridCheckBoxColumn Header="非扫描设备" Binding="{Binding Excluded}" Width="95" /><DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="*" /><DataGridTextColumn Header="Transport" Binding="{Binding Transport}" Width="85" /><DataGridTextColumn Header="VID/PID" Binding="{Binding VidPid}" Width="105" /><DataGridTextColumn Header="Windows" Binding="{Binding WindowsState}" Width="80" /><DataGridTextColumn Header="Identity" Binding="{Binding Identity}" Width="105" /><DataGridTextColumn Header="Registration" Binding="{Binding Registration}" Width="105" /><DataGridTextColumn Header="Bound user" Binding="{Binding BoundUser}" Width="100" /><DataGridTextColumn Header="Fingerprint" Binding="{Binding Fingerprint}" Width="2*" /></DataGrid.Columns></DataGrid>
+          </StackPanel>
+        </ScrollViewer>
+        <ScrollViewer x:Name="WorkStatisticsPage" Visibility="Collapsed" VerticalScrollBarVisibility="Auto">
+          <StackPanel Margin="28">
+            <DockPanel Margin="0,0,0,18">
+              <TextBlock VerticalAlignment="Center" FontSize="22" FontWeight="SemiBold" Text="作业统计" />
+              <Button HorizontalAlignment="Right" Click="OnRefreshWorkStatisticsClick" Content="刷新" Style="{StaticResource PrimaryButtonStyle}" />
+            </DockPanel>
+            <TextBlock x:Name="WorkStatisticsStatusText" Margin="0,0,0,14" Foreground="{StaticResource MutedTextBrush}" Text="正在加载..." TextWrapping="Wrap" />
+
+            <UniformGrid Columns="4" Margin="0,0,0,18">
+              <Border Margin="0,0,10,0" Style="{StaticResource CardStyle}">
+                <StackPanel>
+                  <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="待开始" />
+                  <TextBlock x:Name="PendingWorkJobCountText" Margin="0,4,0,0" FontSize="22" FontWeight="SemiBold" Text="-" />
+                </StackPanel>
+              </Border>
+              <Border Margin="0,0,10,0" Style="{StaticResource CardStyle}">
+                <StackPanel>
+                  <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="进行中" />
+                  <TextBlock x:Name="OpenWorkJobCountText" Margin="0,4,0,0" FontSize="22" FontWeight="SemiBold" Text="-" />
+                </StackPanel>
+              </Border>
+              <Border Margin="0,0,10,0" Style="{StaticResource CardStyle}">
+                <StackPanel>
+                  <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="已暂停" />
+                  <TextBlock x:Name="PausedWorkJobCountText" Margin="0,4,0,0" FontSize="22" FontWeight="SemiBold" Text="-" />
+                </StackPanel>
+              </Border>
+              <Border Style="{StaticResource CardStyle}">
+                <StackPanel>
+                  <TextBlock Foreground="{StaticResource MutedTextBrush}" Text="最近完成" />
+                  <TextBlock x:Name="FinishedWorkJobCountText" Margin="0,4,0,0" FontSize="22" FontWeight="SemiBold" Text="-" />
+                </StackPanel>
+              </Border>
+            </UniformGrid>
+
+            <Border Margin="0,0,0,18" Style="{StaticResource CardStyle}">
+              <StackPanel>
+                <TextBlock Margin="0,0,0,10" FontSize="18" FontWeight="SemiBold" Text="当前作业会话" />
+                <TextBlock x:Name="ActiveWorkSessionsEmptyText" Margin="0,0,0,8" Foreground="{StaticResource MutedTextBrush}" Text="暂无当前作业会话。" Visibility="Collapsed" />
+                <DataGrid x:Name="ActiveWorkSessionsGrid" AutoGenerateColumns="False" CanUserAddRows="False" MinHeight="160">
+                  <DataGrid.Columns>
+                    <DataGridTextColumn Header="作业人员" Binding="{Binding UserDisplayName}" Width="160" />
+                    <DataGridTextColumn Header="设备" Binding="{Binding DeviceDisplay}" Width="*" MinWidth="150" />
+                    <DataGridTextColumn Header="业务类型" Binding="{Binding OperationDisplay}" Width="*" MinWidth="170" />
+                    <DataGridTextColumn Header="状态" Binding="{Binding StatusDisplay}" Width="85" />
+                    <DataGridTextColumn Header="会话到期" Binding="{Binding ExpiresAt, StringFormat=yyyy-MM-dd HH:mm}" Width="145" />
+                  </DataGrid.Columns>
+                </DataGrid>
+              </StackPanel>
+            </Border>
+
+            <Border Margin="0,0,0,18" Style="{StaticResource CardStyle}">
+              <StackPanel>
+                <TextBlock Margin="0,0,0,10" FontSize="18" FontWeight="SemiBold" Text="未结束作业" />
+                <TextBlock x:Name="ActiveWorkJobsEmptyText" Margin="0,0,0,8" Foreground="{StaticResource MutedTextBrush}" Text="暂无未结束作业。" Visibility="Collapsed" />
+                <DataGrid x:Name="ActiveWorkJobsGrid" AutoGenerateColumns="False" CanUserAddRows="False" MinHeight="220">
+                  <DataGrid.Columns>
+                    <DataGridTextColumn Header="任务编号" Binding="{Binding JobNo}" Width="160" />
+                    <DataGridTextColumn Header="状态" Binding="{Binding StatusDisplay}" Width="85" />
+                    <DataGridTemplateColumn Header="业务类型（点击查看二维码）" Width="*" MinWidth="190">
+                      <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate>
+                          <Button Padding="0" HorizontalAlignment="Left" VerticalAlignment="Center" Background="Transparent" BorderThickness="0"
+                                  Cursor="Hand" Foreground="#175CD3" FontWeight="SemiBold" Content="{Binding OperationDisplay}"
+                                  Click="OnWorkOperationClick" ToolTip="查看开始和结束作业二维码" />
+                        </DataTemplate>
+                      </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                    <DataGridTextColumn Header="操作人" Binding="{Binding ActorName}" Width="120" />
+                    <DataGridTextColumn Header="设备" Binding="{Binding DeviceDisplay}" Width="*" MinWidth="140" />
+                    <DataGridTextColumn Header="成功 / 重复 / 无效" Binding="{Binding ScanCountsDisplay}" Width="155" />
+                    <DataGridTextColumn Header="最近活动" Binding="{Binding LastActivityAt, StringFormat=yyyy-MM-dd HH:mm}" Width="145" />
+                  </DataGrid.Columns>
+                </DataGrid>
+              </StackPanel>
+            </Border>
+
+            <Border Margin="0,0,0,18" Style="{StaticResource CardStyle}">
+              <StackPanel>
+                <TextBlock Margin="0,0,0,10" FontSize="18" FontWeight="SemiBold" Text="最近已结束作业" />
+                <TextBlock x:Name="FinishedWorkJobsEmptyText" Margin="0,0,0,8" Foreground="{StaticResource MutedTextBrush}" Text="暂无已结束作业。" Visibility="Collapsed" />
+                <DataGrid x:Name="FinishedWorkJobsGrid" AutoGenerateColumns="False" CanUserAddRows="False" MinHeight="220">
+                  <DataGrid.Columns>
+                    <DataGridTextColumn Header="任务编号" Binding="{Binding JobNo}" Width="160" />
+                    <DataGridTemplateColumn Header="业务类型（点击查看二维码）" Width="*" MinWidth="190">
+                      <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate>
+                          <Button Padding="0" HorizontalAlignment="Left" VerticalAlignment="Center" Background="Transparent" BorderThickness="0"
+                                  Cursor="Hand" Foreground="#175CD3" FontWeight="SemiBold" Content="{Binding OperationDisplay}"
+                                  Click="OnWorkOperationClick" ToolTip="查看开始和结束作业二维码" />
+                        </DataTemplate>
+                      </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                    <DataGridTextColumn Header="操作人" Binding="{Binding ActorName}" Width="120" />
+                    <DataGridTextColumn Header="设备" Binding="{Binding DeviceDisplay}" Width="*" MinWidth="140" />
+                    <DataGridTextColumn Header="扫描数量" Binding="{Binding TotalScanCount}" Width="90" />
+                    <DataGridTextColumn Header="结束时间" Binding="{Binding FinishedAt, StringFormat=yyyy-MM-dd HH:mm}" Width="145" />
+                  </DataGrid.Columns>
+                </DataGrid>
+              </StackPanel>
+            </Border>
+
+            <Border Style="{StaticResource CardStyle}">
+              <StackPanel>
+                <TextBlock Margin="0,0,0,10" FontSize="18" FontWeight="SemiBold" Text="扫描设备绑定" />
+                <TextBlock x:Name="WorkBindingsEmptyText" Margin="0,0,0,8" Foreground="{StaticResource MutedTextBrush}" Text="暂无扫描设备绑定。" Visibility="Collapsed" />
+                <DataGrid x:Name="WorkBindingGrid" AutoGenerateColumns="False" CanUserAddRows="False" MinHeight="190">
+                  <DataGrid.Columns>
+                    <DataGridTextColumn Header="扫描器" Binding="{Binding DeviceDisplayName}" Width="*" MinWidth="160" />
+                    <DataGridTextColumn Header="绑定用户" Binding="{Binding UserDisplayName}" Width="180" />
+                    <DataGridTemplateColumn Header="设备指纹" Width="220">
+                      <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate>
+                          <TextBlock VerticalAlignment="Center" Text="{Binding ShortFingerprint}" TextTrimming="CharacterEllipsis" ToolTip="{Binding DeviceFingerprint}" />
+                        </DataTemplate>
+                      </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                    <DataGridTextColumn Header="状态" Binding="{Binding DeviceStatus}" Width="90" />
+                  </DataGrid.Columns>
+                </DataGrid>
+              </StackPanel>
+            </Border>          </StackPanel>
         </ScrollViewer>
       </Grid>
     </Grid>
   </Grid>
 </Window>
+
+

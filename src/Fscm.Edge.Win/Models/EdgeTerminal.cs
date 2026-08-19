@@ -42,6 +42,61 @@ public sealed class EdgeTerminal
     [JsonPropertyName("status")]
     public string Status { get; set; } = string.Empty;
 
+    [JsonPropertyName("lan_status")]
+    public string LanStatus { get; set; } = string.Empty;
+
+    [JsonPropertyName("health_status")]
+    public string HealthStatus { get; set; } = string.Empty;
+
+    [JsonPropertyName("health_reason")]
+    public string HealthReason { get; set; } = string.Empty;
+
+    [JsonPropertyName("is_alert")]
+    public bool IsAlert { get; set; }
+
+    [JsonPropertyName("assigned_edge_node_name")]
+    public string AssignedEdgeNodeName { get; set; } = string.Empty;
+
+    [JsonPropertyName("observed_edge_node_name")]
+    public string ObservedEdgeNodeName { get; set; } = string.Empty;
+
+    [JsonPropertyName("lan_online_since")]
+    public DateTimeOffset? LanOnlineSince { get; set; }
+
+    [JsonPropertyName("lan_last_seen_at")]
+    public DateTimeOffset? LanLastSeenAt { get; set; }
+
+    [JsonPropertyName("online_duration_seconds")]
+    public long OnlineDurationSeconds { get; set; }
+
+    [JsonPropertyName("offline_duration_seconds")]
+    public long OfflineDurationSeconds { get; set; }
+
+    [JsonIgnore]
+    public string HealthDisplay => HealthStatus switch
+    {
+        "area_online" => "区域在线",
+        "temporarily_unreachable" => "暂不可达",
+        "terminal_alert" => "终端异常",
+        "out_of_area" => "离开本区域",
+        "monitoring_interrupted" => "检测中断",
+        "unassigned" => "未分配",
+        _ => string.IsNullOrWhiteSpace(HealthStatus) ? Status : HealthStatus,
+    };
+
+    [JsonIgnore]
+    public string OnlineDurationDisplay => FormatDuration(OnlineDurationSeconds);
+
+    [JsonIgnore]
+    public string OfflineDurationDisplay => FormatDuration(OfflineDurationSeconds);
+
+    private static string FormatDuration(long seconds)
+    {
+        if (seconds <= 0) return "-";
+        var duration = TimeSpan.FromSeconds(seconds);
+        return duration.TotalDays >= 1 ? $"{(int)duration.TotalDays}天 {duration:hh\\:mm}" : $"{(int)duration.TotalHours:00}:{duration:mm\\:ss}";
+    }
+
     [JsonPropertyName("finding")]
     public bool Finding { get; set; }
 

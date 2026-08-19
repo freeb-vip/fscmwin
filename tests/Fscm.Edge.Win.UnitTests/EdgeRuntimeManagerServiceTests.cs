@@ -26,4 +26,29 @@ public sealed class EdgeRuntimeManagerServiceTests
         Assert.Null(EdgeRuntimeManager.ParseWindowsServiceState(string.Empty));
         Assert.Null(EdgeRuntimeManager.ParseWindowsServiceState("TYPE : 10 WIN32_OWN_PROCESS"));
     }
+
+    [Theory]
+    [InlineData("PID                : 4312", 4312)]
+    [InlineData("STATE : 4 RUNNING\r\nPID : 901", 901)]
+    public void ParsesScServiceProcessId(string output, int expected)
+    {
+        Assert.Equal(expected, EdgeRuntimeManager.ParseWindowsServiceProcessId(output));
+    }
+
+    [Fact]
+    public void RejectsMissingOrStoppedServiceProcessId()
+    {
+        Assert.Null(EdgeRuntimeManager.ParseWindowsServiceProcessId(string.Empty));
+        Assert.Null(EdgeRuntimeManager.ParseWindowsServiceProcessId("PID : 0"));
+    }
+
+    [Fact]
+    public void ReturnsLastMeaningfulServiceErrorLine()
+    {
+        const string content = "first error\r\n\r\n2026-08-18 service startup failed: listen tcp :8089: bind failed\r\n";
+
+        Assert.Equal(
+            "2026-08-18 service startup failed: listen tcp :8089: bind failed",
+            EdgeRuntimeManager.LastMeaningfulLogLine(content));
+    }
 }

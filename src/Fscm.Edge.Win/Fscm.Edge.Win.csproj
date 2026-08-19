@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -9,13 +9,14 @@
     <ApplicationIcon>Assets\fscm-edge.ico</ApplicationIcon>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <NoWarn>$(NoWarn);SA1601;IDE0008;IDE2003;SA1513</NoWarn>
+    <NoWarn>$(NoWarn);SA1601;IDE0008;IDE2003;SA1513;IDE0073</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
     <Using Remove="System.Drawing" />
     <Using Remove="System.Windows.Forms" />
     <PackageReference Include="QRCoder" />
+    <PackageReference Include="System.IO.Ports" />
     <Resource Include="Assets\fscm-edge.ico" />
     <Content Include="EdgeRuntime\**\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
@@ -24,3 +25,4 @@
   </ItemGroup>
 
 </Project>
+

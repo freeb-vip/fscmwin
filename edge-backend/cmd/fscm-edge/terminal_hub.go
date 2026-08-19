@@ -3,6 +3,8 @@ package main
 import (
 	"errors"
 	"fmt"
+
+	"fscm-edge/internal/registry"
 	"sort"
 	"strings"
 	"sync"
@@ -41,8 +43,17 @@ type terminal struct {
 	Status       string    `json:"status"`
 	Finding      bool      `json:"finding"`
 	CommandID    string    `json:"command_id,omitempty"`
-}
 
+	HealthStatus           string     `json:"health_status,omitempty"`
+	HealthReason           string     `json:"health_reason,omitempty"`
+	IsAlert                bool       `json:"is_alert"`
+	AssignedEdgeNodeName   string     `json:"assigned_edge_node_name,omitempty"`
+	ObservedEdgeNodeName   string     `json:"observed_edge_node_name,omitempty"`
+	LANOnlineSince         *time.Time `json:"lan_online_since,omitempty"`
+	LANLastSeenAt          *time.Time `json:"lan_last_seen_at,omitempty"`
+	OnlineDurationSeconds  int64      `json:"online_duration_seconds"`
+	OfflineDurationSeconds int64      `json:"offline_duration_seconds"`
+}
 type terminalRegisterMessage struct {
 	Type            string   `json:"type"`
 	ProtocolVersion int      `json:"protocol_version"`
@@ -93,6 +104,7 @@ type terminalStore struct {
 	items   map[string]terminal
 	clients map[string]*terminalConnection
 	pending map[string]chan terminalCommandResult
+	observe func(registry.TerminalObservation)
 }
 
 func newTerminalStore() *terminalStore {
@@ -103,6 +115,16 @@ func newTerminalStore() *terminalStore {
 	}
 }
 
+func (s *terminalStore) setObserver(observer func(registry.TerminalObservation)) {
+	s.observe = observer
+}
+
+func (s *terminalStore) report(value terminal, state string) {
+	if s.observe == nil || value.TerminalID == "" {
+		return
+	}
+	s.observe(registry.TerminalObservation{TerminalID: value.TerminalID, State: state, LANIP: value.IP, ConnectedAt: value.ConnectedAt, LastSeenAt: value.LastSeenAt})
+}
 func (s *terminalStore) connect(ws *websocket.Conn, ip, userAgent string) {
 	defer ws.Close()
 	_ = ws.SetDeadline(time.Now().Add(10 * time.Second))
@@ -131,6 +153,7 @@ func (s *terminalStore) connect(ws *websocket.Conn, ip, userAgent string) {
 	s.clients[value.TerminalID] = client
 	s.items[value.TerminalID] = value
 	s.Unlock()
+	go s.report(value, "reachable")
 	if previous != nil {
 		_ = previous.ws.Close()
 	}
@@ -181,8 +204,8 @@ func (s *terminalStore) connect(ws *websocket.Conn, ip, userAgent string) {
 
 func (s *terminalStore) disconnect(terminalID string, client *terminalConnection) {
 	s.Lock()
-	defer s.Unlock()
 	if s.clients[terminalID] != client {
+		s.Unlock()
 		return
 	}
 	delete(s.clients, terminalID)
@@ -190,19 +213,21 @@ func (s *terminalStore) disconnect(terminalID string, client *terminalConnection
 	value.Status, value.Finding, value.CommandID = "offline", false, ""
 	value.LastSeenAt = time.Now()
 	s.items[terminalID] = value
+	s.Unlock()
+	go s.report(value, "disconnected")
 }
-
 func (s *terminalStore) markSeen(terminalID string, client *terminalConnection) {
 	s.Lock()
-	defer s.Unlock()
 	if s.clients[terminalID] != client {
+		s.Unlock()
 		return
 	}
 	value := s.items[terminalID]
 	value.LastSeenAt, value.Status = time.Now(), "online"
 	s.items[terminalID] = value
+	s.Unlock()
+	go s.report(value, "reachable")
 }
-
 func (s *terminalStore) completeCommand(terminalID string, result terminalCommandResult) {
 	if result.CommandID == "" {
 		return
@@ -284,11 +309,42 @@ func (s *terminalStore) dispatch(terminalID, action string, duration int, target
 	}
 }
 
-func (s *terminalStore) recordProbe(ip, userAgent, name string) {
-	value := terminal{Name: first(name, ip), IP: ip, UserAgent: userAgent, Source: "probe", LastSeenAt: time.Now(), Status: "online"}
-	s.Lock()
-	s.items["probe:"+ip+"|"+userAgent] = value
-	s.Unlock()
+func (s *terminalStore) listWithSnapshot(snapshot []registry.TerminalStatus) []terminal {
+	s.RLock()
+	local := make(map[string]terminal, len(s.items))
+	for id, value := range s.items {
+		local[id] = value
+	}
+	s.RUnlock()
+	result := make([]terminal, 0, len(snapshot)+len(local))
+	for _, remote := range snapshot {
+		value := terminal{TerminalID: remote.TerminalID, Name: remote.Name, IP: remote.IP, Capabilities: remote.Capabilities, LastSeenAt: remote.LastSeenAt, Status: remote.HealthStatus, Source: "center", HealthStatus: remote.HealthStatus, HealthReason: remote.HealthReason, IsAlert: remote.IsAlert, AssignedEdgeNodeName: remote.AssignedEdgeNodeName, ObservedEdgeNodeName: remote.ObservedEdgeNodeName, LANOnlineSince: remote.LANOnlineSince, LANLastSeenAt: remote.LANLastSeenAt, OnlineDurationSeconds: remote.OnlineDurationSeconds, OfflineDurationSeconds: remote.OfflineDurationSeconds}
+		if remote.LANOnlineSince != nil {
+			value.ConnectedAt = *remote.LANOnlineSince
+		}
+		if active, ok := local[remote.TerminalID]; ok {
+			value = active
+			value.Source = "websocket"
+			value.HealthStatus = remote.HealthStatus
+			value.HealthReason = remote.HealthReason
+			value.IsAlert = remote.IsAlert
+			value.AssignedEdgeNodeName = remote.AssignedEdgeNodeName
+			value.ObservedEdgeNodeName = remote.ObservedEdgeNodeName
+			value.LANOnlineSince = remote.LANOnlineSince
+			value.LANLastSeenAt = remote.LANLastSeenAt
+			value.OnlineDurationSeconds = remote.OnlineDurationSeconds
+			value.OfflineDurationSeconds = remote.OfflineDurationSeconds
+		}
+		result = append(result, value)
+		delete(local, remote.TerminalID)
+	}
+	for _, value := range local {
+		if value.TerminalID != "" {
+			result = append(result, value)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
+	return result
 }
 
 func (s *terminalStore) list() []terminal {
@@ -296,17 +352,13 @@ func (s *terminalStore) list() []terminal {
 	defer s.RUnlock()
 	result := make([]terminal, 0, len(s.items))
 	for _, value := range s.items {
-		result = append(result, value)
-	}
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].Status != result[j].Status {
-			return result[i].Status == "online"
+		if value.TerminalID != "" {
+			result = append(result, value)
 		}
-		return result[i].Name < result[j].Name
-	})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result
 }
-
 func normalizedCapabilities(values []string) []string {
 	result := make([]string, 0, len(values))
 	seen := make(map[string]struct{}, len(values))

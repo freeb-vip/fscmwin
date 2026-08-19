@@ -29,6 +29,7 @@
     <PackageVersion Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.1721" />
     <PackageVersion Include="NativeMethods" Version="0.0.3" />
     <PackageVersion Include="NSubstitute" Version="5.3.0" />
+    <PackageVersion Include="System.IO.Ports" Version="10.0.0" />
     <PackageVersion Include="PolySharp" Version="1.15.0" />
     <PackageVersion Include="QRCoder" Version="1.6.0" />
     <PackageVersion Include="ReflectionEventing.DependencyInjection" Version="5.0.0" />

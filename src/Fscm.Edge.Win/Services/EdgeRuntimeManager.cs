@@ -22,6 +22,10 @@ namespace Fscm.Edge.Win.Services;
 
 public sealed class EdgeRuntimeManager : IDisposable
 {
+    internal const string ActiveScannerBindingsPath = "/api/edge/scanners/bindings/active";
+    internal const string ScannerWorkSessionsPath = "/api/edge/scanners/work-sessions";
+    internal const string OrderScanJobsPath = "/api/edge/scanners/jobs";
+
     private const int PrintTemplatesSchemaVersion = 13;
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -44,14 +48,13 @@ public sealed class EdgeRuntimeManager : IDisposable
     {
         get
         {
-            string serviceBinary = Path.Combine(
+            string installedBinary = Path.Combine(AppContext.BaseDirectory, "EdgeRuntime", "fscm-edge.exe");
+            string legacyServiceBinary = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
                 "FSCM Edge",
                 "Service",
                 "fscm-edge.exe");
-            return File.Exists(serviceBinary)
-                ? serviceBinary
-                : Path.Combine(AppContext.BaseDirectory, "EdgeRuntime", "fscm-edge.exe");
+            return File.Exists(installedBinary) ? installedBinary : legacyServiceBinary;
         }
     }
 
@@ -143,16 +146,76 @@ public sealed class EdgeRuntimeManager : IDisposable
     {
         var port = ReadConfiguredPort();
         var healthy = await CheckHealthAsync(port).ConfigureAwait(false);
+        int? windowsServiceState = GetWindowsServiceState();
+        bool ownedProcessRunning = _process is { HasExited: false };
+        bool serviceRunning = windowsServiceState is 2 or 4;
+        string message = BuildRuntimeStatusMessage(port, healthy, serviceRunning, windowsServiceState);
         return new EdgeRuntimeStatus
         {
             BinaryExists = File.Exists(BinaryPath),
             ConfigExists = File.Exists(ConfigPath),
-            IsRunning = _process is { HasExited: false } || healthy,
+            IsRunning = ownedProcessRunning || serviceRunning || healthy,
             IsHealthy = healthy,
             Port = port,
-            ProcessId = _process is { HasExited: false } ? _process.Id : null,
-            Message = healthy ? "Edge service is healthy." : "Edge service is not ready.",
+            ProcessId = ownedProcessRunning ? _process!.Id : GetWindowsServiceProcessId(),
+            Message = message,
         };
+    }
+
+    private string BuildRuntimeStatusMessage(int port, bool healthy, bool serviceRunning, int? windowsServiceState)
+    {
+        if (healthy)
+        {
+            return "Edge service is healthy.";
+        }
+
+        string recentError = ReadLastLogMessage(StderrLogPath);
+        if (!string.IsNullOrWhiteSpace(recentError))
+        {
+            return $"后端启动失败：{recentError}";
+        }
+
+        if (!serviceRunning && !IsPortAvailable(port))
+        {
+            return $"端口 {port} 已被其他程序占用，FSCM Edge 无法启动。";
+        }
+
+        if (windowsServiceState == 1)
+        {
+            return $"FSCM Edge 后台服务已停止。请检查 {StderrLogPath}。";
+        }
+
+        return serviceRunning
+            ? $"FSCM Edge 后台服务正在启动，但端口 {port} 尚未通过健康检查。"
+            : "FSCM Edge 后台服务未运行。";
+    }
+
+    private static string ReadLastLogMessage(string path)
+    {
+        try
+        {
+            if (!File.Exists(path))
+            {
+                return string.Empty;
+            }
+
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+            return LastMeaningfulLogLine(reader.ReadToEnd());
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    internal static string LastMeaningfulLogLine(string content)
+    {
+        const int maximumLength = 500;
+        string line = content
+            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .LastOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? string.Empty;
+        return line.Length <= maximumLength ? line : line[..maximumLength] + "...";
     }
 
     public async Task<EdgeRuntimeStatus> StartAsync()
@@ -321,6 +384,24 @@ public sealed class EdgeRuntimeManager : IDisposable
     public Task<EdgeRuntimeStatus> StopOwnedProcessAsync()
     {
         return _process is { HasExited: false } ? StopAsync() : GetStatusAsync();
+    }
+
+    public async Task StopForApplicationExitAsync()
+    {
+        if (_process is { HasExited: false })
+        {
+            await StopAsync().ConfigureAwait(false);
+            return;
+        }
+
+        int? windowsServiceState = GetWindowsServiceState();
+        if (windowsServiceState is null or 1)
+        {
+            return;
+        }
+
+        await RunElevatedServiceCommandAsync("Stop-Service -Name 'FscmEdge' -Force").ConfigureAwait(false);
+        await WaitForHealthAsync(expectedHealthy: false).ConfigureAwait(false);
     }
 
     public async Task<EdgeCenterRegistrationResult> RegisterWithCenterAsync()
@@ -626,6 +707,13 @@ public sealed class EdgeRuntimeManager : IDisposable
             var registered = registration.ValueKind == JsonValueKind.Object
                 && registration.TryGetProperty("registered", out var registeredValue)
                 && registeredValue.ValueKind == JsonValueKind.True;
+            // Older edge binaries did not set registered=true after a successful
+            // heartbeat. A non-default success timestamp is equivalent evidence.
+            var hasRecentSuccess = registration.ValueKind == JsonValueKind.Object
+                && registration.TryGetProperty("last_success_at", out var successValue)
+                && successValue.ValueKind == JsonValueKind.String
+                && DateTimeOffset.TryParse(successValue.GetString(), out _);
+            registered |= hasRecentSuccess;
             var lastError = registration.ValueKind == JsonValueKind.Object
                 && registration.TryGetProperty("last_error", out var errorValue)
                 ? errorValue.GetString()
@@ -2166,7 +2254,7 @@ edge:
             using Process process = Process.Start(new ProcessStartInfo
             {
                 FileName = "sc.exe",
-                Arguments = "query FscmEdge",
+                Arguments = "queryex FscmEdge",
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardOutput = true,
@@ -2176,6 +2264,31 @@ edge:
             process.WaitForExit(3000);
             return process.HasExited && process.ExitCode == 0
                 ? ParseWindowsServiceState(output)
+                : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static int? GetWindowsServiceProcessId()
+    {
+        try
+        {
+            using Process process = Process.Start(new ProcessStartInfo
+            {
+                FileName = "sc.exe",
+                Arguments = "queryex FscmEdge",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            }) ?? throw new InvalidOperationException("Unable to query the FSCM Edge service process.");
+            string output = process.StandardOutput.ReadToEnd();
+            process.WaitForExit(3000);
+            return process.HasExited && process.ExitCode == 0
+                ? ParseWindowsServiceProcessId(output)
                 : null;
         }
         catch
@@ -2205,6 +2318,25 @@ edge:
             if (int.TryParse(number, CultureInfo.InvariantCulture, out int state) && state is >= 1 and <= 7)
             {
                 return state;
+            }
+        }
+
+        return null;
+    }
+
+    internal static int? ParseWindowsServiceProcessId(string output)
+    {
+        foreach (string line in output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (!line.Contains("PID", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            int separator = line.IndexOf(':');
+            if (separator >= 0 && int.TryParse(line[(separator + 1)..].Trim(), CultureInfo.InvariantCulture, out int processId) && processId > 0)
+            {
+                return processId;
             }
         }
 
@@ -2244,6 +2376,121 @@ edge:
         return await GetStatusAsync().ConfigureAwait(false);
     }
 
+    public async Task<WorkStatisticsResult> GetWorkStatisticsAsync(CancellationToken ct = default)
+    {
+        EdgeSettings settings = LoadEdgeSettings();
+        using var bindingsRequest = CreateCenterManagementRequest(HttpMethod.Get, ActiveScannerBindingsPath, settings);
+        using var sessionsRequest = CreateCenterManagementRequest(HttpMethod.Get, ScannerWorkSessionsPath, settings);
+        using var activeJobsRequest = CreateCenterManagementRequest(HttpMethod.Get, $"{OrderScanJobsPath}?status=pending,open,paused&page=1&page_size=50", settings);
+        using var finishedJobsRequest = CreateCenterManagementRequest(HttpMethod.Get, $"{OrderScanJobsPath}?status=finished&page=1&page_size=20", settings);
+
+        Task<HttpResponseMessage> bindingsTask = _batchHttpClient.SendAsync(bindingsRequest, ct);
+        Task<HttpResponseMessage> sessionsTask = _batchHttpClient.SendAsync(sessionsRequest, ct);
+        Task<HttpResponseMessage> activeJobsTask = _batchHttpClient.SendAsync(activeJobsRequest, ct);
+        Task<HttpResponseMessage> finishedJobsTask = _batchHttpClient.SendAsync(finishedJobsRequest, ct);
+        await Task.WhenAll(bindingsTask, sessionsTask, activeJobsTask, finishedJobsTask).ConfigureAwait(false);
+
+        using HttpResponseMessage bindingsResponse = bindingsTask.Result;
+        using HttpResponseMessage sessionsResponse = sessionsTask.Result;
+        using HttpResponseMessage activeJobsResponse = activeJobsTask.Result;
+        using HttpResponseMessage finishedJobsResponse = finishedJobsTask.Result;
+        Task<string> bindingsBodyTask = bindingsResponse.Content.ReadAsStringAsync(ct);
+        Task<string> sessionsBodyTask = sessionsResponse.Content.ReadAsStringAsync(ct);
+        Task<string> activeJobsBodyTask = activeJobsResponse.Content.ReadAsStringAsync(ct);
+        Task<string> finishedJobsBodyTask = finishedJobsResponse.Content.ReadAsStringAsync(ct);
+        await Task.WhenAll(bindingsBodyTask, sessionsBodyTask, activeJobsBodyTask, finishedJobsBodyTask).ConfigureAwait(false);
+
+        string bindingsBody = bindingsBodyTask.Result;
+        string sessionsBody = sessionsBodyTask.Result;
+        string activeJobsBody = activeJobsBodyTask.Result;
+        string finishedJobsBody = finishedJobsBodyTask.Result;
+        ThrowCenterWorkStatisticsError(bindingsResponse, bindingsBody, "读取扫描器绑定失败");
+        ThrowCenterWorkStatisticsError(sessionsResponse, sessionsBody, "读取当前作业会话失败");
+        ThrowCenterWorkStatisticsError(activeJobsResponse, activeJobsBody, "读取未结束作业任务失败");
+        ThrowCenterWorkStatisticsError(finishedJobsResponse, finishedJobsBody, "读取已结束作业任务失败");
+
+        using JsonDocument bindingsDocument = JsonDocument.Parse(bindingsBody);
+        using JsonDocument sessionsDocument = JsonDocument.Parse(sessionsBody);
+        using JsonDocument activeJobsDocument = JsonDocument.Parse(activeJobsBody);
+        using JsonDocument finishedJobsDocument = JsonDocument.Parse(finishedJobsBody);
+        JsonElement bindingData = EnvelopeData(bindingsDocument.RootElement);
+        JsonElement sessionsData = EnvelopeData(sessionsDocument.RootElement);
+        JsonElement activeJobsData = EnvelopeData(activeJobsDocument.RootElement);
+        JsonElement finishedJobsData = EnvelopeData(finishedJobsDocument.RootElement);
+        List<WorkScannerBinding> bindings = DeserializeWorkStatisticsItems<WorkScannerBinding>(bindingData, "items", "bindings", "scanner_bindings");
+        List<ActiveWorkSession> sessions = DeserializeWorkStatisticsItems<ActiveWorkSession>(sessionsData, "items", "sessions", "work_sessions", "tasks");
+        List<OrderScanJob> activeJobs = DeserializeWorkStatisticsItems<OrderScanJob>(activeJobsData, "items", "jobs", "tasks");
+        List<OrderScanJob> finishedJobs = DeserializeWorkStatisticsItems<OrderScanJob>(finishedJobsData, "items", "jobs", "tasks");
+
+        ResolveWorkSessionBindings(bindings, sessions);
+
+
+        return new WorkStatisticsResult(bindings, sessions, activeJobs, finishedJobs);
+    }
+
+    internal static void ResolveWorkSessionBindings(IReadOnlyCollection<WorkScannerBinding> bindings, IEnumerable<ActiveWorkSession> sessions)
+    {
+        Dictionary<uint, WorkScannerBinding> bindingsById = bindings
+            .Where(binding => binding.Id > 0)
+            .GroupBy(binding => binding.Id)
+            .ToDictionary(group => group.Key, group => group.First());
+        foreach (ActiveWorkSession session in sessions)
+        {
+            if (bindingsById.TryGetValue(session.BindingId, out WorkScannerBinding? binding))
+            {
+                session.DeviceFingerprint = binding.DeviceFingerprint;
+                session.DeviceName = WorkScannerBinding.FirstNonEmpty(session.DeviceName, binding.DeviceName) ?? binding.DeviceDisplayName;
+                session.ResolvedUserName = binding.UserDisplayName;
+            }
+        }
+    }
+    internal static List<T> DeserializeWorkStatisticsItems<T>(JsonElement data, params string[] collectionNames)
+    {
+        JsonElement items = data;
+        if (data.ValueKind == JsonValueKind.Object)
+        {
+            bool found = collectionNames.Any(name => data.TryGetProperty(name, out items) && items.ValueKind == JsonValueKind.Array);
+            if (!found)
+            {
+                return [];
+            }
+        }
+
+        if (items.ValueKind != JsonValueKind.Array)
+        {
+            return [];
+        }
+
+        return items.Deserialize<List<T>>(JsonOptions) ?? [];
+    }
+
+    private static void ThrowCenterWorkStatisticsError(HttpResponseMessage response, string body, string fallback)
+    {
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException(CenterBatchError(response, body, fallback));
+        }
+    }
+
+    public async Task ApplyScannerConfigurationAsync(ScannerConfiguration value, CancellationToken ct = default) { using var request = CreateLocalAdminRequest(HttpMethod.Put, "/edge/scanners/config"); request.Content = JsonContent.Create(value, options: JsonOptions); using var response = await _httpClient.SendAsync(request, ct).ConfigureAwait(false); await ThrowLocalScannerErrorAsync(response, "apply scanner configuration", ct).ConfigureAwait(false); }
+    public async Task UpdateScannerDevicesAsync(IEnumerable<ScannerDeviceSnapshot> value, CancellationToken ct = default) { using var request = CreateLocalAdminRequest(HttpMethod.Put, "/edge/scanners/devices"); request.Content = JsonContent.Create(new { devices = value.ToArray() }, options: JsonOptions); using var response = await _httpClient.SendAsync(request, ct).ConfigureAwait(false); await ThrowLocalScannerErrorAsync(response, "update scanner devices", ct).ConfigureAwait(false); }
+    public async Task<ScannerInputResult> SubmitScannerInputAsync(ScannerInputRequest value, CancellationToken ct = default) { using var request = CreateLocalAdminRequest(HttpMethod.Post, "/edge/scanners/input"); request.Content = JsonContent.Create(value, options: JsonOptions); using var response = await _httpClient.SendAsync(request, ct).ConfigureAwait(false); await ThrowLocalScannerErrorAsync(response, "submit scanner input", ct).ConfigureAwait(false); return await response.Content.ReadFromJsonAsync<ScannerInputResult>(JsonOptions, ct).ConfigureAwait(false) ?? new() { Outcome = "accepted" }; }
+    public async Task<ScannerStatus> GetScannerStatusAsync(CancellationToken ct = default) { using var request = CreateLocalAdminRequest(HttpMethod.Get, "/edge/scanners/status"); using var response = await _httpClient.SendAsync(request, ct).ConfigureAwait(false); await ThrowLocalScannerErrorAsync(response, "get scanner status", ct).ConfigureAwait(false); return await response.Content.ReadFromJsonAsync<ScannerStatus>(JsonOptions, ct).ConfigureAwait(false) ?? new(); }
+    private static async Task ThrowLocalScannerErrorAsync(HttpResponseMessage response, string action, CancellationToken ct)
+    {
+        if (response.IsSuccessStatusCode) return;
+        string detail = string.Empty;
+        try
+        {
+            using JsonDocument body = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false));
+            string code = body.RootElement.TryGetProperty("code", out JsonElement codeValue) ? codeValue.GetString() ?? string.Empty : string.Empty;
+            string message = body.RootElement.TryGetProperty("message", out JsonElement messageValue) ? messageValue.GetString() ?? string.Empty : string.Empty;
+            detail = string.Join(": ", new[] { code, message }.Where(part => !string.IsNullOrWhiteSpace(part)));
+        }
+        catch (JsonException) { }
+        throw new InvalidOperationException($"Unable to {action}: {(int)response.StatusCode}{(string.IsNullOrWhiteSpace(detail) ? string.Empty : $" ({detail})")}.");
+    }
+    public string ScannerConfigPath => Path.Combine(RuntimeDirectory, "scanner.config.json");
     private HttpRequestMessage CreateLocalAdminRequest(HttpMethod method, string path)
     {
         var request = new HttpRequestMessage(method, LocalEndpoint(path));
@@ -2292,6 +2539,11 @@ edge:
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", settings.ApiToken);
             request.Headers.TryAddWithoutValidation("X-Api-Token", settings.ApiToken);
             request.Headers.TryAddWithoutValidation("X-Edge-Token", settings.ApiToken);
+        }
+
+        if (!string.IsNullOrWhiteSpace(settings.NodeId))
+        {
+            request.Headers.TryAddWithoutValidation("X-FSCM-Edge-Node-ID", settings.NodeId.Trim());
         }
 
         if (settings.NamespaceId > 0)
@@ -2369,3 +2621,4 @@ edge:
         public List<CenterPrintBatch> Items { get; set; } = [];
     }
 }
+

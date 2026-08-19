@@ -1,9 +1,9 @@
 ﻿{
-    "edge_version":  "1.2.4",
-    "edge_commit":  "e1a68a7577907b56bd998a2d28dacd27322f6694",
+    "edge_version":  "1.2.7",
+    "edge_commit":  "eac5ee3092572971034f58576a312086c26c993b",
     "edge_api_version":  "edge.proxy.v1",
     "runtime_kind":  "independent_proxy",
     "binary":  "fscm-edge.exe",
-    "sha256":  "3c0e5295cada2cbae00d373d8a60ab6f7f5a310364fd0c52b24fd73622b1b3ce",
-    "built_at":  "2026-08-02T12:36:43.7428921Z"
+    "sha256":  "caa81a7f288fd9f7c5f9442aa20d40e9809bac75d6ab0eb3d6eb847371650a55",
+    "built_at":  "2026-08-18T16:16:28.5836238Z"
 }
